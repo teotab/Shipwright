@@ -36,6 +36,7 @@ static float sPlaySpeed = 1.0f;
 static char sFilename[64] = "path1";
 static bool sHookRegistered = false;
 static bool sShowPath = true; // draw the spline + markers in the world while the editor is open
+static int sAimDragId = -1;   // id of the keyframe whose aim handle is being dragged, or -1
 
 // Undo / redo history of the whole keyframe list.
 struct PathSnapshot {
@@ -391,6 +392,13 @@ static bool WorldToScreen(const float* world, ImVec2& out) {
     return true;
 }
 
+// World position of a keyframe's aim handle (a point a short way along its look direction).
+static void FacingHandleWorld(const CineKeyframe& k, float out[3]) {
+    out[0] = k.eye[0] + (k.at[0] - k.eye[0]) * 0.4f;
+    out[1] = k.eye[1] + (k.at[1] - k.eye[1]) * 0.4f;
+    out[2] = k.eye[2] + (k.at[2] - k.eye[2]) * 0.4f;
+}
+
 // Draw the spline, numbered keyframe markers, facing indicators and the playhead over the game view.
 static void DrawWorldOverlay() {
     if (sKeyframes.empty()) {
@@ -435,13 +443,18 @@ static void DrawWorldOverlay() {
         snprintf(num, sizeof(num), "%d", i + 1);
         dl->AddText(ImVec2(sp.x + 9.0f, sp.y - 9.0f), IM_COL32(255, 255, 255, 255), num);
 
-        // Facing indicator: a short line toward the look-at point.
-        float facing[3] = { sKeyframes[i].eye[0] + (sKeyframes[i].at[0] - sKeyframes[i].eye[0]) * 0.4f,
-                            sKeyframes[i].eye[1] + (sKeyframes[i].at[1] - sKeyframes[i].eye[1]) * 0.4f,
-                            sKeyframes[i].eye[2] + (sKeyframes[i].at[2] - sKeyframes[i].eye[2]) * 0.4f };
+        // Facing indicator: a short line toward the look-at point. The selected keyframe also gets a
+        // grabbable aim handle at the end of the line (drag it to re-aim the camera).
+        float facing[3];
+        FacingHandleWorld(sKeyframes[i], facing);
         ImVec2 fp;
         if (WorldToScreen(facing, fp)) {
             dl->AddLine(sp, fp, IM_COL32(120, 255, 120, 150), 1.5f);
+            if (selected) {
+                bool dragging = sIds[i] == sAimDragId;
+                dl->AddCircleFilled(fp, dragging ? 6.0f : 5.0f, IM_COL32(120, 255, 120, 255));
+                dl->AddCircle(fp, dragging ? 6.0f : 5.0f, IM_COL32(0, 0, 0, 200), 0, 1.5f);
+            }
         }
     }
 
@@ -452,6 +465,97 @@ static void DrawWorldOverlay() {
         if (WorldToScreen(s.eye, sp)) {
             dl->AddCircleFilled(sp, 6.0f, IM_COL32(60, 255, 90, 255));
             dl->AddCircle(sp, 6.0f, IM_COL32(0, 0, 0, 200), 0, 1.5f);
+        }
+    }
+}
+
+// Mouse interaction with the overlay: click a keyframe to select it, drag the selected keyframe's aim
+// handle to re-aim its camera (horizontal = yaw, vertical = pitch). Operates only over the game view.
+static void HandleOverlayInput() {
+    ImGuiIO& io = ImGui::GetIO();
+
+    // Continue an in-progress aim drag (ignores WantCaptureMouse so it survives passing over a window).
+    if (sAimDragId >= 0) {
+        int idx = -1;
+        for (size_t i = 0; i < sIds.size(); i++) {
+            if (sIds[i] == sAimDragId) {
+                idx = (int)i;
+                break;
+            }
+        }
+        if (idx < 0 || !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            sAimDragId = -1;
+            return;
+        }
+        if (io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f) {
+            float* eye = sKeyframes[idx].eye;
+            float* at = sKeyframes[idx].at;
+            float dx = at[0] - eye[0];
+            float dy = at[1] - eye[1];
+            float dz = at[2] - eye[2];
+            float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (dist < 1.0f) {
+                dist = 1.0f;
+            }
+            float horiz = std::sqrt(dx * dx + dz * dz);
+            float yaw = std::atan2(dx, dz);
+            float pitch = std::atan2(dy, horiz);
+
+            const float kSens = 0.005f; // radians per pixel
+            yaw += io.MouseDelta.x * kSens;
+            pitch -= io.MouseDelta.y * kSens; // drag up = look up
+            const float kPitchLimit = 1.48f;  // ~85 degrees, avoid gimbal flip
+            if (pitch > kPitchLimit) {
+                pitch = kPitchLimit;
+            }
+            if (pitch < -kPitchLimit) {
+                pitch = -kPitchLimit;
+            }
+            float ch = std::cos(pitch) * dist;
+            at[0] = eye[0] + ch * std::sin(yaw);
+            at[1] = eye[1] + dist * std::sin(pitch);
+            at[2] = eye[2] + ch * std::cos(yaw);
+        }
+        return;
+    }
+
+    // Start a new interaction on click. Bail only if an ImGui widget is actively being used, so dragging
+    // a slider or pressing a button in the editor doesn't also grab a world handle. (We deliberately do
+    // NOT gate on WantCaptureMouse: the SoH menu is a fullscreen ImGui layer, so that would block every
+    // click while the menu is open.)
+    if (ImGui::IsAnyItemActive() || !ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        return;
+    }
+
+    ImVec2 m = io.MousePos;
+    int sel = SelectedIndex();
+
+    // Grab the selected keyframe's aim handle if the click landed on it.
+    if (sel >= 0) {
+        float facing[3];
+        FacingHandleWorld(sKeyframes[sel], facing);
+        ImVec2 fp;
+        if (WorldToScreen(facing, fp)) {
+            float ax = fp.x - m.x;
+            float ay = fp.y - m.y;
+            if (ax * ax + ay * ay <= 12.0f * 12.0f) {
+                PushUndo(); // whole drag is one undo step
+                sAimDragId = sIds[sel];
+                return;
+            }
+        }
+    }
+
+    // Otherwise, select whichever keyframe marker was clicked.
+    for (int i = 0; i < (int)sKeyframes.size(); i++) {
+        ImVec2 sp;
+        if (WorldToScreen(sKeyframes[i].eye, sp)) {
+            float dxp = sp.x - m.x;
+            float dyp = sp.y - m.y;
+            if (dxp * dxp + dyp * dyp <= 11.0f * 11.0f) {
+                sSelectedId = sIds[i];
+                return;
+            }
         }
     }
 }
@@ -480,7 +584,12 @@ void CinematicCamPathWindow::DrawElement() {
     ImGui::Checkbox("Show path in world", &sShowPath);
 
     if (sShowPath) {
+        HandleOverlayInput();
         DrawWorldOverlay();
+    }
+    if (sShowPath && SelectedIndex() >= 0) {
+        ImGui::TextDisabled("Tip: drag the green handle in the world to re-aim the selected keyframe; "
+                            "click a marker to select it.");
     }
 
     ImGui::BeginDisabled(!enabled);
