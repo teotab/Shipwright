@@ -257,6 +257,11 @@ void SohMenu::AddMenuDevTools() {
         .CVar(CVAR_ENHANCEMENT("CinematicCam.LookSpeed"))
         .Options(FloatSliderOptions().Min(0.10f).Max(5.0f).DefaultValue(1.0f).Format("%.2f").Tooltip(
             "Right-stick look sensitivity multiplier."));
+    AddWidget(path, "Smoothing: %.0f%%", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.Smoothing"))
+        .Options(FloatSliderOptions().IsPercentage().Min(0.0f).Max(0.95f).DefaultValue(0.5f).Tooltip(
+            "Movement and look inertia. 0% is crisp and instant; higher values make the camera accelerate "
+            "and glide to a stop for smooth, handheld-style motion."));
     AddWidget(path, "Invert Look X", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.InvertLookX"))
         .Options(CheckboxOptions().DefaultValue(false).Tooltip("Invert horizontal (yaw) look."));

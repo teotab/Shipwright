@@ -7500,6 +7500,13 @@ typedef struct {
 
 static CameraPose sCineCam;
 
+// Smoothing state (Phase 2): velocities that ease toward the input-driven target each frame, giving the
+// camera inertia (accelerate on push, glide to a stop on release). Not part of CameraPose since keyframes
+// store a static pose, not motion.
+static Vec3f sCineCamVel;
+static f32 sCineCamYawVel;
+static f32 sCineCamPitchVel;
+
 // The controller state captured before the rest of the frame consumed it (see CinematicCam_PreUpdateInput).
 Input gCineCamInput;
 // Globals read by the actor culling code (z_actor.c) to force-draw while flying.
@@ -7536,6 +7543,11 @@ static void CinematicCam_Enable(Camera* camera) {
     sCineCam.yaw = forward.yaw;
     sCineCam.roll = 0;
     sCineCam.fov = camera->fov;
+
+    // Start at rest so the camera doesn't carry stale momentum from a previous session.
+    sCineCamVel.x = sCineCamVel.y = sCineCamVel.z = 0.0f;
+    sCineCamYawVel = 0.0f;
+    sCineCamPitchVel = 0.0f;
 }
 
 static void CinematicCam_Update(Camera* camera) {
@@ -7549,11 +7561,26 @@ static void CinematicCam_Update(Camera* camera) {
     Vec3f up;
     f32 fwdInput;
     f32 strafeInput;
+    f32 vertInput;
     f32 lookX;
     f32 lookY;
+    Vec3f desiredVel;
+    f32 smoothing;
+    f32 response;
     f32 moveSpeed = CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.MoveSpeed"), 30.0f);
     // LookSpeed is a user-facing multiplier around a sane internal base (full stick deflection ~= 7 deg/frame).
     f32 lookSpeed = CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.LookSpeed"), 1.0f) * 10.0f;
+
+    // Smoothing (Phase 2): velocities ease toward their input target by `response` each frame.
+    // 0 = crisp/instant (matches pre-smoothing behavior); higher = more inertia and glide.
+    smoothing = CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.Smoothing"), 0.5f);
+    if (smoothing < 0.0f) {
+        smoothing = 0.0f;
+    }
+    if (smoothing > 0.95f) {
+        smoothing = 0.95f;
+    }
+    response = 1.0f - smoothing;
 
     // Precision modifier: hold L to slow movement and look for fine framing.
     if (CHECK_BTN_ALL(cur->button, BTN_L)) {
@@ -7574,8 +7601,11 @@ static void CinematicCam_Update(Camera* camera) {
     if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.InvertLookY"), 0)) {
         lookY = -lookY;
     }
-    sCineCam.yaw -= (s16)lookX;
-    sCineCam.pitch += (s16)lookY;
+    // Ease angular velocity toward the look input, then integrate into the orientation.
+    sCineCamYawVel += (-lookX - sCineCamYawVel) * response;
+    sCineCamPitchVel += (lookY - sCineCamPitchVel) * response;
+    sCineCam.yaw += (s16)sCineCamYawVel;
+    sCineCam.pitch += (s16)sCineCamPitchVel;
     // Clamp pitch shy of vertical to avoid the up-vector flipping.
     if (sCineCam.pitch > 0x3C00) {
         sCineCam.pitch = 0x3C00;
@@ -7596,19 +7626,28 @@ static void CinematicCam_Update(Camera* camera) {
     OLib_VecSphGeoToVec3f(&right, &rightSph);
 
     // Move (left stick): forward/back along facing (incl. pitch) + strafe. Stick up = forward.
+    // Vertical along world Y: R = ascend, Z = descend.
     fwdInput = cur->stick_y / 127.0f;
     strafeInput = cur->stick_x / 127.0f;
-    sCineCam.eye.x += (forward.x * fwdInput + right.x * strafeInput) * moveSpeed;
-    sCineCam.eye.y += (forward.y * fwdInput + right.y * strafeInput) * moveSpeed;
-    sCineCam.eye.z += (forward.z * fwdInput + right.z * strafeInput) * moveSpeed;
-
-    // Vertical along world Y: R = ascend, Z = descend.
+    vertInput = 0.0f;
     if (CHECK_BTN_ALL(cur->button, BTN_R)) {
-        sCineCam.eye.y += moveSpeed;
+        vertInput += 1.0f;
     }
     if (CHECK_BTN_ALL(cur->button, BTN_Z)) {
-        sCineCam.eye.y -= moveSpeed;
+        vertInput -= 1.0f;
     }
+
+    desiredVel.x = (forward.x * fwdInput + right.x * strafeInput) * moveSpeed;
+    desiredVel.y = (forward.y * fwdInput + right.y * strafeInput) * moveSpeed + vertInput * moveSpeed;
+    desiredVel.z = (forward.z * fwdInput + right.z * strafeInput) * moveSpeed;
+
+    // Ease velocity toward the input target, then integrate into position (accelerate / glide).
+    sCineCamVel.x += (desiredVel.x - sCineCamVel.x) * response;
+    sCineCamVel.y += (desiredVel.y - sCineCamVel.y) * response;
+    sCineCamVel.z += (desiredVel.z - sCineCamVel.z) * response;
+    sCineCam.eye.x += sCineCamVel.x;
+    sCineCam.eye.y += sCineCamVel.y;
+    sCineCam.eye.z += sCineCamVel.z;
 
     // FOV (D-up/D-down) and roll (D-left/D-right).
     if (CHECK_BTN_ALL(cur->button, BTN_DUP)) {
