@@ -9,6 +9,13 @@ enum CineInterp {
     CINE_INTERP_LINEAR = 1, // straight line to the next keyframe
 };
 
+// How a keyframe's camera is aimed.
+enum CineAim {
+    CINE_AIM_FREE = 0,   // free orientation (stored look-at moves rigidly with the eye)
+    CINE_AIM_POINT = 1,  // look at a fixed world point (the stored look-at)
+    CINE_AIM_PLAYER = 2, // look at Link (tracked live)
+};
+
 // A single captured camera pose on the path timeline.
 struct CineKeyframe {
     float time;   // absolute position on the timeline, in seconds
@@ -27,6 +34,8 @@ struct CineKeyframe {
     // with the Bend gizmo. Like a Bezier handle; bends the curve on both sides. Independent of camera aim.
     int hasTangent;    // 0 = automatic tangent, 1 = use the custom direction below
     float tangent[3];  // unit direction
+
+    int aimMode;       // CineAim: how the camera is aimed (free / point / Link)
 };
 
 // Editor window for building and playing back cinematic camera paths.

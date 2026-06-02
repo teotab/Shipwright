@@ -7529,6 +7529,11 @@ void CinematicCam_PreUpdateInput(PlayState* play) {
     if (!CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 0) && !gCineCamPlaybackActive) {
         return;
     }
+    // During path playback with "control Link" enabled, the path drives the camera (not the controller),
+    // so leave the controller to the player and let the world keep running.
+    if (gCineCamPlaybackActive && CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.PlaybackControlsLink"), 0)) {
+        return;
+    }
 
     gCineCamInput = play->state.input[0];
 
@@ -7593,6 +7598,66 @@ void CinematicCam_SetPlayback(s32 active, f32* eye, f32* at, f32 roll, f32 fov) 
         sCinePlayRoll = roll;
         sCinePlayFov = fov;
     }
+}
+
+// Player (Link) world position for the "look at Link" aim mode, aimed a bit above the feet. Returns 0 if
+// unavailable.
+s32 CinematicCam_GetPlayerPos(f32* out) {
+    Player* player;
+
+    if (gPlayState == NULL) {
+        return 0;
+    }
+    player = GET_PLAYER(gPlayState);
+    if (player == NULL) {
+        return 0;
+    }
+    out[0] = player->actor.world.pos.x;
+    out[1] = player->actor.world.pos.y + 40.0f;
+    out[2] = player->actor.world.pos.z;
+    return 1;
+}
+
+// Current view right/up basis vectors, for dragging an aim target on the screen plane. Returns 0 if no
+// active play state.
+s32 CinematicCam_GetCameraBasis(f32* right, f32* up) {
+    f32 fx, fy, fz, rx, ry, rz, ux, uy, uz, len;
+
+    if (gPlayState == NULL) {
+        return 0;
+    }
+    fx = gPlayState->view.lookAt.x - gPlayState->view.eye.x;
+    fy = gPlayState->view.lookAt.y - gPlayState->view.eye.y;
+    fz = gPlayState->view.lookAt.z - gPlayState->view.eye.z;
+    len = sqrtf(fx * fx + fy * fy + fz * fz);
+    if (len < 0.001f) {
+        return 0;
+    }
+    fx /= len;
+    fy /= len;
+    fz /= len;
+    // right = forward x viewUp
+    rx = fy * gPlayState->view.up.z - fz * gPlayState->view.up.y;
+    ry = fz * gPlayState->view.up.x - fx * gPlayState->view.up.z;
+    rz = fx * gPlayState->view.up.y - fy * gPlayState->view.up.x;
+    len = sqrtf(rx * rx + ry * ry + rz * rz);
+    if (len < 0.001f) {
+        return 0;
+    }
+    rx /= len;
+    ry /= len;
+    rz /= len;
+    // up = right x forward
+    ux = ry * fz - rz * fy;
+    uy = rz * fx - rx * fz;
+    uz = rx * fy - ry * fx;
+    right[0] = rx;
+    right[1] = ry;
+    right[2] = rz;
+    up[0] = ux;
+    up[1] = uy;
+    up[2] = uz;
+    return 1;
 }
 
 // Project a world point to normalized device coords (-1..1, +Y up) for the path editor's in-world overlay.
@@ -7689,7 +7754,9 @@ static void CinematicCam_Update(Camera* camera) {
         } else {
             gCineCamDisableCulling = 0;
         }
-        if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.FreezeWorld"), 1)) {
+        // Freeze the world during playback, unless "control Link" is on (then let it run so Link can move).
+        if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.FreezeWorld"), 1) &&
+            !CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.PlaybackControlsLink"), 0)) {
             IREG(72) = 1;
         }
         return;

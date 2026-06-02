@@ -18,6 +18,8 @@ extern "C" {
 void CinematicCam_GetPose(float* eye, float* at, float* roll, float* fov);
 void CinematicCam_SetPlayback(int active, float* eye, float* at, float roll, float fov);
 int CinematicCam_WorldToNdc(float* world, float* outNdcX, float* outNdcY);
+int CinematicCam_GetPlayerPos(float* out);
+int CinematicCam_GetCameraBasis(float* right, float* up);
 }
 
 // ---------------------------------------------------------------------------
@@ -46,6 +48,8 @@ static int sDragKind = 0;       // 0 = translate, 1 = rotate (snapshot of mode a
 static int sDragAxis = -1;      // which axis/ring: 0=X/yaw, 1=Y/pitch, 2=Z/roll
 static float sRotPrevAngle = 0.0f;
 static float sDragPitchAxis[3] = { 1.0f, 0.0f, 0.0f }; // pitch rotation axis, captured at drag start (stable)
+static int sTargetDragId = -1;   // keyframe id whose look-at-point target is being dragged, or -1
+static int sTargetDragAxis = -1; // which world axis (0/1/2) of the target is being dragged
 
 // Undo / redo history of the whole keyframe list.
 struct PathSnapshot {
@@ -184,6 +188,24 @@ static float Hermite1(float p1, float p2, float m0, float m1, float s) {
            (s3 - s2) * m1;
 }
 
+// A keyframe's effective look-at point this frame: the stored point for free/point aim, or Link's live
+// position for player aim.
+static void EffectiveAt(int idx, float out[3]) {
+    const CineKeyframe& k = sKeyframes[idx];
+    if (k.aimMode == CINE_AIM_PLAYER) {
+        float p[3];
+        if (CinematicCam_GetPlayerPos(p)) {
+            out[0] = p[0];
+            out[1] = p[1];
+            out[2] = p[2];
+            return;
+        }
+    }
+    out[0] = k.at[0];
+    out[1] = k.at[1];
+    out[2] = k.at[2];
+}
+
 // Smooth pose at an absolute time along the timeline. When looping, the path is treated as cyclic: a
 // loop-return segment connects the last keyframe back to the first, and tangents wrap around so the seam
 // is as smooth as any other keyframe (no snap).
@@ -284,9 +306,14 @@ static CineKeyframe SampleAt(float time) {
         }
     }
 
-    // Aim (at), roll, FOV: independent per-scalar interpolation (unaffected by the spatial tangent).
+    // Aim (at): interpolate each control keyframe's EFFECTIVE target (handles look-at-point / look-at-Link).
+    float aA[3], aB[3], aC[3], aD[3];
+    EffectiveAt(i0, aA);
+    EffectiveAt(i1, aB);
+    EffectiveAt(i2, aC);
+    EffectiveAt(i3, aD);
     for (int k = 0; k < 3; k++) {
-        out.at[k] = InterpComp(a.at[k], b.at[k], c.at[k], d.at[k], b, c, lt);
+        out.at[k] = InterpComp(aA[k], aB[k], aC[k], aD[k], b, c, lt);
     }
     out.roll = InterpComp(a.roll, b.roll, c.roll, d.roll, b, c, lt);
     out.fov = InterpComp(a.fov, b.fov, c.fov, d.fov, b, c, lt);
@@ -390,7 +417,8 @@ static void SavePath() {
                       { "continuity", k.continuity },
                       { "bias", k.bias },
                       { "hasTangent", k.hasTangent },
-                      { "tangent", { k.tangent[0], k.tangent[1], k.tangent[2] } } });
+                      { "tangent", { k.tangent[0], k.tangent[1], k.tangent[2] } },
+                      { "aimMode", k.aimMode } });
     }
     std::filesystem::create_directories("cinematics");
     std::ofstream f(std::string("cinematics/") + sFilename + ".json");
@@ -436,6 +464,7 @@ static void LoadPath() {
             k.tangent[1] = 0.0f;
             k.tangent[2] = 1.0f;
         }
+        k.aimMode = e.value("aimMode", 0);
         sKeyframes.push_back(k);
         sIds.push_back(sNextId++);
     }
@@ -775,6 +804,9 @@ static void DrawGizmo(ImDrawList* dl, int idx) {
         float axesK[3][3];
         RotationAxes(k, axesK[0], axesK[1], axesK[2]);
         for (int a = 0; a < 3; a++) {
+            if (a < 2 && k.aimMode != CINE_AIM_FREE) {
+                continue; // only roll is editable when aiming at a point/Link
+            }
             bool hot = (sDragKfId == sIds[idx] && sDragKind == 1 && sDragAxis == a);
             DrawRing(dl, k.eye, axesK[a], R, hot ? IM_COL32(255, 255, 120, 255) : kRotCol[a], hot ? 3.0f : 2.0f);
         }
@@ -849,6 +881,9 @@ static bool GizmoTryStart(int idx, ImVec2 m) {
         int best = -1;
         float bestd = 8.0f;
         for (int a = 0; a < 3; a++) {
+            if (a < 2 && k.aimMode != CINE_AIM_FREE) {
+                continue; // yaw/pitch aim only meaningful in free aim; roll always allowed
+            }
             float d = RingHitDist(k.eye, axesK[a], R, m);
             if (d < bestd) {
                 bestd = d;
@@ -951,7 +986,9 @@ static void GizmoContinue() {
         float along = (io.MouseDelta.x * sx + io.MouseDelta.y * sy) / slen; // pixels along the axis
         float worldDelta = along * (L / slen);
         k.eye[sDragAxis] += worldDelta;
-        k.at[sDragAxis] += worldDelta; // move the look-at with the eye (rigid translation)
+        if (k.aimMode == CINE_AIM_FREE) {
+            k.at[sDragAxis] += worldDelta; // free aim: carry the look-at rigidly with the eye
+        }
     } else {
         ImVec2 origin;
         if (!WorldToScreen(k.eye, origin)) {
@@ -1001,6 +1038,114 @@ static void GizmoContinue() {
             k.at[2] = k.eye[2] + rot[2];
         }
     }
+}
+
+// Draw a 3-axis move gizmo at the look-at-point target.
+static void DrawTargetGizmo(ImDrawList* dl, int idx) {
+    if (sKeyframes[idx].aimMode != CINE_AIM_POINT) {
+        return;
+    }
+    float* t = sKeyframes[idx].at;
+    ImVec2 origin;
+    if (!WorldToScreen(t, origin)) {
+        return;
+    }
+    float L = GizmoScale(t, 60.0f);
+    if (L <= 0.0f) {
+        return;
+    }
+    const float axes[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
+    for (int a = 0; a < 3; a++) {
+        float end[3];
+        v3mad(t, axes[a], L, end);
+        ImVec2 ep;
+        if (!WorldToScreen(end, ep)) {
+            continue;
+        }
+        bool hot = (sTargetDragId == sIds[idx] && sTargetDragAxis == a);
+        ImU32 c = hot ? IM_COL32(255, 255, 120, 255) : kMoveCol[a];
+        dl->AddLine(origin, ep, c, hot ? 3.0f : 2.0f);
+        dl->AddCircleFilled(ep, 3.5f, c);
+    }
+}
+
+// Continue dragging the look-at-point target along its grabbed world axis.
+static void TargetContinue() {
+    int idx = -1;
+    for (size_t i = 0; i < sIds.size(); i++) {
+        if (sIds[i] == sTargetDragId) {
+            idx = (int)i;
+            break;
+        }
+    }
+    if (idx < 0 || !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        sTargetDragId = -1;
+        sTargetDragAxis = -1;
+        return;
+    }
+    float* t = sKeyframes[idx].at;
+    ImVec2 origin, ep;
+    if (!WorldToScreen(t, origin)) {
+        return;
+    }
+    float L = GizmoScale(t, 60.0f);
+    if (L <= 0.0f) {
+        return;
+    }
+    float axis[3] = { 0, 0, 0 };
+    axis[sTargetDragAxis] = 1.0f;
+    float end[3];
+    v3mad(t, axis, L, end);
+    if (!WorldToScreen(end, ep)) {
+        return;
+    }
+    float sx = ep.x - origin.x, sy = ep.y - origin.y;
+    float slen = std::sqrt(sx * sx + sy * sy);
+    if (slen < 1e-3f) {
+        return;
+    }
+    ImGuiIO& io = ImGui::GetIO();
+    float along = (io.MouseDelta.x * sx + io.MouseDelta.y * sy) / slen;
+    t[sTargetDragAxis] += along * (L / slen);
+}
+
+// Grab the look-at-point target's gizmo axis under the mouse.
+static bool TargetTryStart(int idx, ImVec2 m) {
+    if (sKeyframes[idx].aimMode != CINE_AIM_POINT) {
+        return false;
+    }
+    float* t = sKeyframes[idx].at;
+    ImVec2 origin;
+    if (!WorldToScreen(t, origin)) {
+        return false;
+    }
+    float L = GizmoScale(t, 60.0f);
+    if (L <= 0.0f) {
+        return false;
+    }
+    const float axes[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
+    int best = -1;
+    float bestd = 9.0f;
+    for (int a = 0; a < 3; a++) {
+        float end[3];
+        v3mad(t, axes[a], L, end);
+        ImVec2 ep;
+        if (!WorldToScreen(end, ep)) {
+            continue;
+        }
+        float d = DistToSegment(m, origin, ep);
+        if (d < bestd) {
+            bestd = d;
+            best = a;
+        }
+    }
+    if (best >= 0) {
+        PushUndo();
+        sTargetDragId = sIds[idx];
+        sTargetDragAxis = best;
+        return true;
+    }
+    return false;
 }
 
 // Draw the spline, numbered keyframe markers, facing indicators and the playhead over the game view.
@@ -1070,6 +1215,21 @@ static void DrawWorldOverlay() {
         // The selected keyframe gets the transform gizmo (move axes or rotate rings).
         if (selected) {
             DrawGizmo(dl, i);
+
+            // Look-at target visualization: orange marker + line for a fixed point; a line to Link.
+            float tgt[3];
+            EffectiveAt(i, tgt);
+            if (sKeyframes[i].aimMode != CINE_AIM_FREE) {
+                ImVec2 tp;
+                if (WorldToScreen(tgt, tp)) {
+                    dl->AddLine(sp, tp, IM_COL32(255, 170, 60, 160), 1.5f);
+                    if (sKeyframes[i].aimMode == CINE_AIM_POINT) {
+                        dl->AddLine(ImVec2(tp.x - 9, tp.y), ImVec2(tp.x + 9, tp.y), IM_COL32(255, 255, 255, 220), 1.0f);
+                        dl->AddLine(ImVec2(tp.x, tp.y - 9), ImVec2(tp.x, tp.y + 9), IM_COL32(255, 255, 255, 220), 1.0f);
+                        DrawTargetGizmo(dl, i); // 3-axis move gizmo for the target
+                    }
+                }
+            }
         }
     }
 
@@ -1089,9 +1249,13 @@ static void DrawWorldOverlay() {
 static void HandleOverlayInput() {
     ImGuiIO& io = ImGui::GetIO();
 
-    // Continue an in-progress gizmo drag (ignores WantCaptureMouse so it survives passing over a window).
+    // Continue an in-progress gizmo / target drag (ignores WantCaptureMouse so it survives passing over a window).
     if (sDragKfId >= 0) {
         GizmoContinue();
+        return;
+    }
+    if (sTargetDragId >= 0) {
+        TargetContinue();
         return;
     }
 
@@ -1106,7 +1270,10 @@ static void HandleOverlayInput() {
     ImVec2 m = io.MousePos;
     int sel = SelectedIndex();
 
-    // Grab the selected keyframe's gizmo if the click landed on a handle.
+    // Grab the selected keyframe's look-at target, then its gizmo, if the click landed on a handle.
+    if (sel >= 0 && TargetTryStart(sel, m)) {
+        return;
+    }
     if (sel >= 0 && GizmoTryStart(sel, m)) {
         return;
     }
@@ -1296,6 +1463,39 @@ void CinematicCamPathWindow::DrawElement() {
             }
         }
 
+        // Aim mode: how this keyframe's camera is oriented.
+        const char* aimModes[] = { "Free orientation", "Look at point", "Look at Link" };
+        int am = sKeyframes[sel].aimMode;
+        if (ImGui::Combo("Aim", &am, aimModes, 3)) {
+            PushUndo();
+            sKeyframes[sel].aimMode = am;
+        }
+        if (sKeyframes[sel].aimMode == CINE_AIM_POINT) {
+            float tgt[3] = { sKeyframes[sel].at[0], sKeyframes[sel].at[1], sKeyframes[sel].at[2] };
+            bool tch = ImGui::InputFloat3("Target", tgt, "%.1f");
+            if (ImGui::IsItemActivated()) {
+                PushUndo();
+            }
+            if (tch) {
+                sKeyframes[sel].at[0] = tgt[0];
+                sKeyframes[sel].at[1] = tgt[1];
+                sKeyframes[sel].at[2] = tgt[2];
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("To Link")) {
+                float p[3];
+                if (CinematicCam_GetPlayerPos(p)) {
+                    PushUndo();
+                    sKeyframes[sel].at[0] = p[0];
+                    sKeyframes[sel].at[1] = p[1];
+                    sKeyframes[sel].at[2] = p[2];
+                }
+            }
+            ImGui::TextDisabled("Drag the orange crosshair in the world to place the target.");
+        } else if (sKeyframes[sel].aimMode == CINE_AIM_PLAYER) {
+            ImGui::TextDisabled("Tracks Link's position (live during playback).");
+        }
+
         // Numeric fields: type exact position/orientation values for the selected keyframe.
         ImGui::Checkbox("Numeric fields", &sShowFields);
         if (sShowFields) {
@@ -1319,6 +1519,7 @@ void CinematicCamPathWindow::DrawElement() {
             float yaw, pitch, dist;
             GetYawPitch(kf, yaw, pitch, dist);
             float yaw0 = yaw, pitch0 = pitch;
+            ImGui::BeginDisabled(kf.aimMode != CINE_AIM_FREE); // yaw/pitch are target-driven otherwise
             ImGui::InputFloat("Yaw", &yaw, 1.0f, 15.0f, "%.1f");
             if (ImGui::IsItemActivated()) {
                 PushUndo();
@@ -1327,6 +1528,7 @@ void CinematicCamPathWindow::DrawElement() {
             if (ImGui::IsItemActivated()) {
                 PushUndo();
             }
+            ImGui::EndDisabled();
             if (yaw != yaw0 || pitch != pitch0) {
                 SetYawPitch(kf, yaw, pitch, dist);
             }
@@ -1392,6 +1594,15 @@ void CinematicCamPathWindow::DrawElement() {
         if (sPreview) {
             CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
         }
+    }
+
+    bool controlLink = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.PlaybackControlsLink"), 0);
+    if (ImGui::Checkbox("Control Link during playback", &controlLink)) {
+        CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.PlaybackControlsLink"), controlLink);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("While a path plays, the controller moves Link and the world keeps running "
+                          "(the camera follows the path). Pairs well with 'Look at Link'.");
     }
 
     if (sLoop) {
