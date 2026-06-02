@@ -1,5 +1,6 @@
 #include "SohMenu.h"
 #include "SohGui.hpp"
+#include "soh/OTRGlobals.h"
 
 extern "C" {
 extern PlayState* gPlayState;
@@ -231,7 +232,8 @@ void SohMenu::AddMenuDevTools() {
 
     // Cinematic Camera
     path.sidebarName = "Cinematic Cam";
-    AddSidebarEntry("Dev Tools", path.sidebarName, 1);
+    AddSidebarEntry("Dev Tools", path.sidebarName, 2);
+    path.column = SECTION_COLUMN_1;
     AddWidget(path, "Open Path Editor", WIDGET_WINDOW_BUTTON)
         .CVar(CVAR_WINDOW("CinematicCamPath"))
         .WindowName("Cinematic Camera Path")
@@ -302,6 +304,39 @@ void SohMenu::AddMenuDevTools() {
         .PreFunc([](WidgetInfo& info) {
             info.isHidden = !CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.DisableCulling"), 1);
         });
+
+    // Controls (rebindable). Movement/look use the left/right sticks (remap those in Controller Config).
+    path.column = SECTION_COLUMN_2;
+    AddWidget(path, "Controls", WIDGET_SEPARATOR_TEXT);
+    AddWidget(path, "Toggle Camera:", WIDGET_CVAR_BTN_SELECTOR)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.ToggleBtn"))
+        .Options(BtnSelectorOptions().DefaultValue(BTN_CUSTOM_MODIFIER1)
+                     .Tooltip("Toggles the cinematic camera on/off. Default is Additional Button 1 - map your "
+                              "Select/Back button to it in Controller Configuration."));
+    AddWidget(path, "Boost (faster):", WIDGET_CVAR_BTN_SELECTOR)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.BoostBtn"))
+        .Options(BtnSelectorOptions().DefaultValue(BTN_R));
+    AddWidget(path, "Precision (slower):", WIDGET_CVAR_BTN_SELECTOR)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.PrecisionBtn"))
+        .Options(BtnSelectorOptions().DefaultValue(BTN_L));
+    AddWidget(path, "Ascend:", WIDGET_CVAR_BTN_SELECTOR)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.UpBtn"))
+        .Options(BtnSelectorOptions().DefaultValue(BTN_A));
+    AddWidget(path, "Descend:", WIDGET_CVAR_BTN_SELECTOR)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.DownBtn"))
+        .Options(BtnSelectorOptions().DefaultValue(BTN_Z));
+    AddWidget(path, "FOV in:", WIDGET_CVAR_BTN_SELECTOR)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.FovInBtn"))
+        .Options(BtnSelectorOptions().DefaultValue(BTN_DUP));
+    AddWidget(path, "FOV out:", WIDGET_CVAR_BTN_SELECTOR)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.FovOutBtn"))
+        .Options(BtnSelectorOptions().DefaultValue(BTN_DDOWN));
+    AddWidget(path, "Roll left:", WIDGET_CVAR_BTN_SELECTOR)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.RollLeftBtn"))
+        .Options(BtnSelectorOptions().DefaultValue(BTN_DLEFT));
+    AddWidget(path, "Roll right:", WIDGET_CVAR_BTN_SELECTOR)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.RollRightBtn"))
+        .Options(BtnSelectorOptions().DefaultValue(BTN_DRIGHT));
 }
 
 } // namespace SohGui

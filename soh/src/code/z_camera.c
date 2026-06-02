@@ -9,6 +9,7 @@
 #include "soh/frame_interpolation.h"
 #include "soh/Enhancements/controls/Mouse.h"
 #include "soh/ActorDB.h"
+#include "soh/OTRGlobals.h"
 #include "soh/Enhancements/CinematicCam/CinematicCamBridge.h"
 
 s16 Camera_ChangeSettingFlags(Camera* camera, s16 setting, s16 flags);
@@ -7528,6 +7529,20 @@ static f32 sCinePlayFov;  // degrees
 // so the player and message systems read this too — they must see neutral input while the freecam owns it.
 // Called at the very top of Play_Update, before any actor/message update.
 void CinematicCam_PreUpdateInput(PlayState* play) {
+    static u32 sPrevToggleHeld = 0;
+    s32 toggleBtn;
+    u32 toggleHeld;
+
+    // Rebindable toggle: edge-detected on the raw controller so it works whether the camera is on or off.
+    // Default is "Additional Button 1" (map your Select/Back button to it in the controller config).
+    toggleBtn = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.ToggleBtn"), BTN_CUSTOM_MODIFIER1);
+    toggleHeld = (toggleBtn != 0 && CHECK_BTN_ALL(play->state.input[0].cur.button, toggleBtn)) ? 1 : 0;
+    if (toggleHeld && !sPrevToggleHeld) {
+        CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"),
+                       !CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 0));
+    }
+    sPrevToggleHeld = toggleHeld;
+
     if (!CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 0) && !gCineCamPlaybackActive) {
         return;
     }
@@ -7831,13 +7846,23 @@ static void CinematicCam_Update(Camera* camera) {
         return;
     }
 
-    // Precision modifier: hold L to slow movement and look for fine framing.
-    if (CHECK_BTN_ALL(cur->button, BTN_L)) {
+    // Rebindable button actions (defaults below; configurable in the menu's Cinematic Cam > Controls).
+    s32 btnPrecision = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.PrecisionBtn"), BTN_L);
+    s32 btnBoost = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.BoostBtn"), BTN_R);
+    s32 btnUp = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.UpBtn"), BTN_A);
+    s32 btnDown = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.DownBtn"), BTN_Z);
+    s32 btnFovIn = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.FovInBtn"), BTN_DUP);
+    s32 btnFovOut = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.FovOutBtn"), BTN_DDOWN);
+    s32 btnRollL = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.RollLeftBtn"), BTN_DLEFT);
+    s32 btnRollR = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.RollRightBtn"), BTN_DRIGHT);
+
+    // Precision modifier: slow movement and look for fine framing.
+    if (CHECK_BTN_ALL(cur->button, btnPrecision)) {
         moveSpeed *= 0.25f;
         lookSpeed *= 0.5f;
     }
-    // Boost modifier: hold A to speed up movement for covering large distances.
-    if (CHECK_BTN_ALL(cur->button, BTN_A)) {
+    // Boost modifier: speed up movement for covering large distances.
+    if (CHECK_BTN_ALL(cur->button, btnBoost)) {
         moveSpeed *= CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.BoostMultiplier"), 3.0f);
     }
 
@@ -7879,10 +7904,10 @@ static void CinematicCam_Update(Camera* camera) {
     fwdInput = cur->stick_y / 127.0f;
     strafeInput = cur->stick_x / 127.0f;
     vertInput = 0.0f;
-    if (CHECK_BTN_ALL(cur->button, BTN_R)) {
+    if (CHECK_BTN_ALL(cur->button, btnUp)) {
         vertInput += 1.0f;
     }
-    if (CHECK_BTN_ALL(cur->button, BTN_Z)) {
+    if (CHECK_BTN_ALL(cur->button, btnDown)) {
         vertInput -= 1.0f;
     }
 
@@ -7898,11 +7923,11 @@ static void CinematicCam_Update(Camera* camera) {
     sCineCam.eye.y += sCineCamVel.y;
     sCineCam.eye.z += sCineCamVel.z;
 
-    // FOV (D-up/D-down) and roll (D-left/D-right).
-    if (CHECK_BTN_ALL(cur->button, BTN_DUP)) {
+    // FOV and roll.
+    if (CHECK_BTN_ALL(cur->button, btnFovIn)) {
         sCineCam.fov -= 1.0f;
     }
-    if (CHECK_BTN_ALL(cur->button, BTN_DDOWN)) {
+    if (CHECK_BTN_ALL(cur->button, btnFovOut)) {
         sCineCam.fov += 1.0f;
     }
     if (sCineCam.fov < 1.0f) {
@@ -7911,10 +7936,10 @@ static void CinematicCam_Update(Camera* camera) {
     if (sCineCam.fov > 170.0f) {
         sCineCam.fov = 170.0f;
     }
-    if (CHECK_BTN_ALL(cur->button, BTN_DLEFT)) {
+    if (CHECK_BTN_ALL(cur->button, btnRollL)) {
         sCineCam.roll -= 0x80;
     }
-    if (CHECK_BTN_ALL(cur->button, BTN_DRIGHT)) {
+    if (CHECK_BTN_ALL(cur->button, btnRollR)) {
         sCineCam.roll += 0x80;
     }
 
