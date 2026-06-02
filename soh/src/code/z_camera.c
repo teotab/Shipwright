@@ -7513,12 +7513,20 @@ Input gCineCamInput;
 s32 gCinematicCamActive = 0;
 s32 gCineCamDisableCulling = 0;
 
+// Path playback (Phase 4): when active, the C++ path engine (CinematicCamPath.cpp) pushes an interpolated
+// pose here each frame via CinematicCam_SetPlayback, and CinematicCam_Update applies it instead of input.
+s32 gCineCamPlaybackActive = 0;
+static f32 sCinePlayEye[3];
+static f32 sCinePlayAt[3];
+static f32 sCinePlayRoll; // degrees
+static f32 sCinePlayFov;  // degrees
+
 // Capture the real controller input for the freecam, then blank the shared buffer so flying the camera
 // doesn't drive Link or advance textboxes. D_8015BD7C->state.input IS play->state.input (same memory),
 // so the player and message systems read this too — they must see neutral input while the freecam owns it.
 // Called at the very top of Play_Update, before any actor/message update.
 void CinematicCam_PreUpdateInput(PlayState* play) {
-    if (!CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 0)) {
+    if (!CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 0) && !gCineCamPlaybackActive) {
         return;
     }
 
@@ -7548,6 +7556,43 @@ static void CinematicCam_Enable(Camera* camera) {
     sCineCamVel.x = sCineCamVel.y = sCineCamVel.z = 0.0f;
     sCineCamYawVel = 0.0f;
     sCineCamPitchVel = 0.0f;
+}
+
+// Path engine bridge (Phase 4). Read the freecam's current pose to capture a keyframe. eye/at are world
+// positions (3 floats each), roll/fov in degrees.
+void CinematicCam_GetPose(f32* eye, f32* at, f32* roll, f32* fov) {
+    VecSph atSph;
+    Vec3f atVec;
+
+    atSph.r = 100.0f;
+    atSph.pitch = sCineCam.pitch;
+    atSph.yaw = sCineCam.yaw;
+    Camera_Vec3fVecSphGeoAdd(&atVec, &sCineCam.eye, &atSph);
+
+    eye[0] = sCineCam.eye.x;
+    eye[1] = sCineCam.eye.y;
+    eye[2] = sCineCam.eye.z;
+    at[0] = atVec.x;
+    at[1] = atVec.y;
+    at[2] = atVec.z;
+    *roll = BINANG_TO_DEGF(sCineCam.roll);
+    *fov = sCineCam.fov;
+}
+
+// Receive the interpolated playback frame from the path engine. Called each frame (from the OnCameraState
+// hook) before Camera_Update; active != 0 makes CinematicCam_Update drive the view from this pose.
+void CinematicCam_SetPlayback(s32 active, f32* eye, f32* at, f32 roll, f32 fov) {
+    gCineCamPlaybackActive = active;
+    if (active) {
+        sCinePlayEye[0] = eye[0];
+        sCinePlayEye[1] = eye[1];
+        sCinePlayEye[2] = eye[2];
+        sCinePlayAt[0] = at[0];
+        sCinePlayAt[1] = at[1];
+        sCinePlayAt[2] = at[2];
+        sCinePlayRoll = roll;
+        sCinePlayFov = fov;
+    }
 }
 
 static void CinematicCam_Update(Camera* camera) {
@@ -7581,6 +7626,52 @@ static void CinematicCam_Update(Camera* camera) {
         smoothing = 0.95f;
     }
     response = 1.0f - smoothing;
+
+    // Path playback (Phase 4): a path is driving the camera — apply its interpolated pose and skip input.
+    if (gCineCamPlaybackActive) {
+        Vec3f pbEye;
+        Vec3f pbAt;
+        Vec3f pbUp;
+        VecSph pbDir;
+        s16 pbRoll = DEGF_TO_BINANG(sCinePlayRoll);
+
+        pbEye.x = sCinePlayEye[0];
+        pbEye.y = sCinePlayEye[1];
+        pbEye.z = sCinePlayEye[2];
+        pbAt.x = sCinePlayAt[0];
+        pbAt.y = sCinePlayAt[1];
+        pbAt.z = sCinePlayAt[2];
+
+        OLib_Vec3fDiffToVecSphGeo(&pbDir, &pbEye, &pbAt); // facing direction eye -> at
+        Camera_CalcUpFromPitchYawRoll(&pbUp, pbDir.pitch, pbDir.yaw, pbRoll);
+
+        camera->eye = camera->eyeNext = pbEye;
+        camera->at = pbAt;
+        camera->fov = sCinePlayFov;
+        camera->roll = pbRoll;
+        camera->play->view.fovy = sCinePlayFov;
+        func_800AA358(&camera->play->view, &pbEye, &pbAt, &pbUp);
+
+        // Keep the freecam pose synced so manual control resumes seamlessly when playback stops.
+        sCineCam.eye = pbEye;
+        sCineCam.pitch = pbDir.pitch;
+        sCineCam.yaw = pbDir.yaw;
+        sCineCam.roll = pbRoll;
+        sCineCam.fov = sCinePlayFov;
+        sCineCamVel.x = sCineCamVel.y = sCineCamVel.z = 0.0f;
+        sCineCamYawVel = sCineCamPitchVel = 0.0f;
+
+        if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.DisableCulling"), 1)) {
+            gCineCamDisableCulling = 1;
+            camera->play->view.zFar = CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.FarPlane"), 20000.0f);
+        } else {
+            gCineCamDisableCulling = 0;
+        }
+        if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.FreezeWorld"), 1)) {
+            IREG(72) = 1;
+        }
+        return;
+    }
 
     // Precision modifier: hold L to slow movement and look for fine framing.
     if (CHECK_BTN_ALL(cur->button, BTN_L)) {
@@ -7853,7 +7944,8 @@ Vec3s Camera_Update(Camera* camera) {
     // #region SOH [Enhancement] Cinematic free camera dispatch
     {
         static s32 sCineCamWasActive = 0;
-        s32 cineEnabled = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 0);
+        // Active when manually enabled OR when a path is playing back.
+        s32 cineEnabled = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 0) || gCineCamPlaybackActive;
 
         if (cineEnabled && (camera->thisIdx == camera->play->activeCamera)) {
             if (!sCineCamWasActive) {

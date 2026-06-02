@@ -232,6 +232,11 @@ void SohMenu::AddMenuDevTools() {
     // Cinematic Camera
     path.sidebarName = "Cinematic Cam";
     AddSidebarEntry("Dev Tools", path.sidebarName, 1);
+    AddWidget(path, "Open Path Editor", WIDGET_WINDOW_BUTTON)
+        .CVar(CVAR_WINDOW("CinematicCamPath"))
+        .WindowName("Cinematic Camera Path")
+        .Options(WindowButtonOptions().Tooltip(
+            "Record camera keyframes and play back a smooth spline path through them."));
     AddWidget(path, "Enable Cinematic Camera", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.Enabled"))
         .Options(CheckboxOptions().DefaultValue(false).Tooltip(
@@ -273,16 +278,20 @@ void SohMenu::AddMenuDevTools() {
         .Options(CheckboxOptions().DefaultValue(true).Tooltip(
             "Freeze actors and physics while flying. Turn off to let the action continue (note: the controller "
             "still only drives the camera, not Link)."));
-    AddWidget(path, "Disable Culling", WIDGET_CVAR_CHECKBOX)
+    AddWidget(path, "Extend Draw Distance", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.DisableCulling"))
         .Options(CheckboxOptions().DefaultValue(true).Tooltip(
-            "Extend the actor draw distance and push out the far clip plane so objects don't pop in/out while "
-            "flying. Higher draw distances cost performance in busy scenes."));
-    AddWidget(path, "Draw Distance: %dx", WIDGET_CVAR_SLIDER_INT)
+            "While the cinematic camera is active, extend how far actors stay drawn and push out the far clip "
+            "plane so objects don't pop in/out.\n\n"
+            "This applies ONLY while flying and takes the larger of this and the global 'Increase Actor Draw "
+            "Distance' setting (Enhancements tab) - the two never stack/compound. When off, the camera uses "
+            "your normal global setting unchanged.\n\n"
+            "Drawing more actors costs performance in busy scenes, so keep the multiplier as low as looks good."));
+    AddWidget(path, "Extra Draw Distance: %dx", WIDGET_CVAR_SLIDER_INT)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.CullMultiplier"))
-        .Options(IntSliderOptions().Min(1).Max(20).DefaultValue(5).Format("%dx").Tooltip(
-            "How far beyond the normal range actors stay drawn. Raise if objects still pop out; lower if busy "
-            "scenes lag."))
+        .Options(IntSliderOptions().Min(1).Max(20).DefaultValue(3).Format("%dx").Tooltip(
+            "Cinematic-only draw distance multiplier. Raise if objects still pop out; lower if busy scenes lag. "
+            "Each step draws noticeably more actors."))
         .PreFunc([](WidgetInfo& info) {
             info.isHidden = !CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.DisableCulling"), 1);
         });

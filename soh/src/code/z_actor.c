@@ -2984,7 +2984,7 @@ s32 Ship_CalcShouldDrawAndUpdate(PlayState* play, Actor* actor, Vec3f* projected
     // SOH [Enhancement] Cinematic free camera: extend the draw distance generously (still frustum-culled,
     // so actors behind/far off the camera don't draw) instead of force-drawing the whole scene.
     if (gCineCamDisableCulling) {
-        multiplier = MAX(multiplier, CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.CullMultiplier"), 5));
+        multiplier = MAX(multiplier, CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.CullMultiplier"), 3));
     }
     multiplier = MAX(multiplier, 1);
 
