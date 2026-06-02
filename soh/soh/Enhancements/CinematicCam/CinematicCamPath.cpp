@@ -119,11 +119,33 @@ static void SortByTime() {
     sIds = std::move(ids);
 }
 
-static float CatmullRom(float p0, float p1, float p2, float p3, float t) {
-    float t2 = t * t;
-    float t3 = t2 * t;
-    return 0.5f * ((2.0f * p1) + (-p0 + p2) * t + (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 +
-                   (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
+// Kochanek-Bartels (TCB) Hermite interpolation for one scalar component over a segment p1 -> p2.
+// tcB = TCB params at p1 (segment source), tcC = TCB params at p2 (segment destination).
+// With all params 0 this reduces exactly to Catmull-Rom.
+static float TcbHermite(float p0, float p1, float p2, float p3, float tB, float cB, float bB, float tC, float cC,
+                        float bC, float s) {
+    // Outgoing tangent at p1 and incoming tangent at p2.
+    float td = ((1.0f - tB) * (1.0f + cB) * (1.0f + bB) * 0.5f) * (p1 - p0) +
+               ((1.0f - tB) * (1.0f - cB) * (1.0f - bB) * 0.5f) * (p2 - p1);
+    float ts = ((1.0f - tC) * (1.0f - cC) * (1.0f + bC) * 0.5f) * (p2 - p1) +
+               ((1.0f - tC) * (1.0f + cC) * (1.0f - bC) * 0.5f) * (p3 - p2);
+    float s2 = s * s;
+    float s3 = s2 * s;
+    float h00 = 2.0f * s3 - 3.0f * s2 + 1.0f;
+    float h10 = s3 - 2.0f * s2 + s;
+    float h01 = -2.0f * s3 + 3.0f * s2;
+    float h11 = s3 - s2;
+    return h00 * p1 + h10 * td + h01 * p2 + h11 * ts;
+}
+
+// Interpolate one component over a segment, honoring the source keyframe's per-keyframe mode.
+static float InterpComp(float p0, float p1, float p2, float p3, const CineKeyframe& kSrc, const CineKeyframe& kDst,
+                        float s) {
+    if (kSrc.interp == CINE_INTERP_LINEAR) {
+        return p1 + (p2 - p1) * s;
+    }
+    return TcbHermite(p0, p1, p2, p3, kSrc.tension, kSrc.continuity, kSrc.bias, kDst.tension, kDst.continuity,
+                      kDst.bias, s);
 }
 
 // Smooth pose at an absolute time along the timeline. When looping, the path is treated as cyclic: a
@@ -199,11 +221,11 @@ static CineKeyframe SampleAt(float time) {
     const CineKeyframe& c = sKeyframes[i2];
     const CineKeyframe& d = sKeyframes[i3];
     for (int k = 0; k < 3; k++) {
-        out.eye[k] = CatmullRom(a.eye[k], b.eye[k], c.eye[k], d.eye[k], lt);
-        out.at[k] = CatmullRom(a.at[k], b.at[k], c.at[k], d.at[k], lt);
+        out.eye[k] = InterpComp(a.eye[k], b.eye[k], c.eye[k], d.eye[k], b, c, lt);
+        out.at[k] = InterpComp(a.at[k], b.at[k], c.at[k], d.at[k], b, c, lt);
     }
-    out.roll = CatmullRom(a.roll, b.roll, c.roll, d.roll, lt);
-    out.fov = CatmullRom(a.fov, b.fov, c.fov, d.fov, lt);
+    out.roll = InterpComp(a.roll, b.roll, c.roll, d.roll, b, c, lt);
+    out.fov = InterpComp(a.fov, b.fov, c.fov, d.fov, b, c, lt);
     out.time = time;
     return out;
 }
@@ -298,7 +320,11 @@ static void SavePath() {
                       { "eye", { k.eye[0], k.eye[1], k.eye[2] } },
                       { "at", { k.at[0], k.at[1], k.at[2] } },
                       { "roll", k.roll },
-                      { "fov", k.fov } });
+                      { "fov", k.fov },
+                      { "interp", k.interp },
+                      { "tension", k.tension },
+                      { "continuity", k.continuity },
+                      { "bias", k.bias } });
     }
     std::filesystem::create_directories("cinematics");
     std::ofstream f(std::string("cinematics/") + sFilename + ".json");
@@ -330,6 +356,10 @@ static void LoadPath() {
         k.at[2] = e["at"][2];
         k.roll = e.value("roll", 0.0f);
         k.fov = e.value("fov", 60.0f);
+        k.interp = e.value("interp", 0);
+        k.tension = e.value("tension", 0.0f);
+        k.continuity = e.value("continuity", 0.0f);
+        k.bias = e.value("bias", 0.0f);
         sKeyframes.push_back(k);
         sIds.push_back(sNextId++);
     }
@@ -398,7 +428,8 @@ void CinematicCamPathWindow::DrawElement() {
     for (int i = 0; i < (int)sKeyframes.size(); i++) {
         ImGui::PushID(i);
         char label[64];
-        snprintf(label, sizeof(label), "#%d   t=%.2fs", i + 1, sKeyframes[i].time);
+        snprintf(label, sizeof(label), "#%d   t=%.2fs   %s", i + 1, sKeyframes[i].time,
+                 sKeyframes[i].interp == CINE_INTERP_LINEAR ? "[Linear]" : "");
         if (ImGui::Selectable(label, sIds[i] == sSelectedId)) {
             sSelectedId = sIds[i];
         }
@@ -427,6 +458,53 @@ void CinematicCamPathWindow::DrawElement() {
             sPlayhead = sKeyframes[sel].time;
             sPreview = true;
             CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
+        }
+
+        // Per-keyframe interpolation (shapes the segment leaving this keyframe toward the next).
+        const char* interpModes[] = { "Smooth (spline)", "Linear" };
+        int mode = sKeyframes[sel].interp;
+        if (ImGui::Combo("Interpolation", &mode, interpModes, 2)) {
+            PushUndo();
+            sKeyframes[sel].interp = mode;
+        }
+        if (sKeyframes[sel].interp == CINE_INTERP_SMOOTH) {
+            float tens = sKeyframes[sel].tension;
+            ImGui::SliderFloat("Tension", &tens, -1.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemActivated()) {
+                PushUndo();
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Higher = tighter/straighter through the keyframe; lower = rounder, wider arcs.");
+            }
+            sKeyframes[sel].tension = tens;
+
+            float cont = sKeyframes[sel].continuity;
+            ImGui::SliderFloat("Continuity", &cont, -1.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemActivated()) {
+                PushUndo();
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("0 = smooth pass-through; away from 0 sharpens the corner at the keyframe.");
+            }
+            sKeyframes[sel].continuity = cont;
+
+            float bias = sKeyframes[sel].bias;
+            ImGui::SliderFloat("Bias", &bias, -1.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemActivated()) {
+                PushUndo();
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Lean the curve toward the previous (+) or the next (-) keyframe (overshoot/undershoot).");
+            }
+            sKeyframes[sel].bias = bias;
+
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Reset")) {
+                PushUndo();
+                sKeyframes[sel].tension = 0.0f;
+                sKeyframes[sel].continuity = 0.0f;
+                sKeyframes[sel].bias = 0.0f;
+            }
         }
     }
 
