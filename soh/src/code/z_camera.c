@@ -8,6 +8,8 @@
 
 #include "soh/frame_interpolation.h"
 #include "soh/Enhancements/controls/Mouse.h"
+#include "soh/ActorDB.h"
+#include "soh/Enhancements/CinematicCam/CinematicCamBridge.h"
 
 s16 Camera_ChangeSettingFlags(Camera* camera, s16 setting, s16 flags);
 s32 Camera_ChangeModeFlags(Camera* camera, s16 mode, u8 flags);
@@ -7598,6 +7600,73 @@ void CinematicCam_SetPlayback(s32 active, f32* eye, f32* at, f32 roll, f32 fov) 
         sCinePlayRoll = roll;
         sCinePlayFov = fov;
     }
+}
+
+// Enumerate live actors for the "look at actor" picker.
+s32 CinematicCam_EnumActors(CineActorInfo* out, s32 maxCount) {
+    s32 count = 0;
+    s32 i;
+    Actor* a;
+
+    if (gPlayState == NULL) {
+        return 0;
+    }
+    for (i = 0; i < ARRAY_COUNT(gPlayState->actorCtx.actorLists) && count < maxCount; i++) {
+        a = gPlayState->actorCtx.actorLists[i].head;
+        while (a != NULL && count < maxCount) {
+            out[count].ptr = a;
+            out[count].name = ActorDB_Retrieve(a->id)->name;
+            out[count].id = a->id;
+            out[count].category = a->category;
+            out[count].pos[0] = a->world.pos.x;
+            out[count].pos[1] = a->world.pos.y;
+            out[count].pos[2] = a->world.pos.z;
+            count++;
+            a = a->next;
+        }
+    }
+    return count;
+}
+
+// Resolve an actor's aim position (a bit above its base), validating/re-acquiring by id.
+s32 CinematicCam_ResolveActor(void** ptr, s16 id, f32* out) {
+    s32 i;
+    Actor* a;
+    Actor* cached = (Actor*)*ptr;
+
+    if (gPlayState == NULL) {
+        return 0;
+    }
+    // Validate the cached pointer is still a live actor of the right id.
+    if (cached != NULL) {
+        for (i = 0; i < ARRAY_COUNT(gPlayState->actorCtx.actorLists); i++) {
+            a = gPlayState->actorCtx.actorLists[i].head;
+            while (a != NULL) {
+                if (a == cached && a->id == id) {
+                    out[0] = a->world.pos.x;
+                    out[1] = a->world.pos.y + 20.0f;
+                    out[2] = a->world.pos.z;
+                    return 1;
+                }
+                a = a->next;
+            }
+        }
+    }
+    // Re-acquire the first live actor with this id.
+    for (i = 0; i < ARRAY_COUNT(gPlayState->actorCtx.actorLists); i++) {
+        a = gPlayState->actorCtx.actorLists[i].head;
+        while (a != NULL) {
+            if (a->id == id) {
+                *ptr = a;
+                out[0] = a->world.pos.x;
+                out[1] = a->world.pos.y + 20.0f;
+                out[2] = a->world.pos.z;
+                return 1;
+            }
+            a = a->next;
+        }
+    }
+    return 0;
 }
 
 // Player (Link) world position for the "look at Link" aim mode, aimed a bit above the feet. Returns 0 if

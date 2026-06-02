@@ -12,6 +12,7 @@
 
 #include "soh/cvar_prefixes.h"
 #include "soh/Enhancements/game-interactor/GameInteractor.h"
+#include "CinematicCamBridge.h"
 
 // C bridge into the free camera (z_camera.c).
 extern "C" {
@@ -191,10 +192,18 @@ static float Hermite1(float p1, float p2, float m0, float m1, float s) {
 // A keyframe's effective look-at point this frame: the stored point for free/point aim, or Link's live
 // position for player aim.
 static void EffectiveAt(int idx, float out[3]) {
-    const CineKeyframe& k = sKeyframes[idx];
+    CineKeyframe& k = sKeyframes[idx];
     if (k.aimMode == CINE_AIM_PLAYER) {
         float p[3];
         if (CinematicCam_GetPlayerPos(p)) {
+            out[0] = p[0];
+            out[1] = p[1];
+            out[2] = p[2];
+            return;
+        }
+    } else if (k.aimMode == CINE_AIM_ACTOR) {
+        float p[3];
+        if (CinematicCam_ResolveActor(&k.aimActorPtr, (short)k.aimActorId, p)) {
             out[0] = p[0];
             out[1] = p[1];
             out[2] = p[2];
@@ -418,7 +427,8 @@ static void SavePath() {
                       { "bias", k.bias },
                       { "hasTangent", k.hasTangent },
                       { "tangent", { k.tangent[0], k.tangent[1], k.tangent[2] } },
-                      { "aimMode", k.aimMode } });
+                      { "aimMode", k.aimMode },
+                      { "aimActorId", k.aimActorId } });
     }
     std::filesystem::create_directories("cinematics");
     std::ofstream f(std::string("cinematics/") + sFilename + ".json");
@@ -465,6 +475,8 @@ static void LoadPath() {
             k.tangent[2] = 1.0f;
         }
         k.aimMode = e.value("aimMode", 0);
+        k.aimActorId = e.value("aimActorId", 0);
+        k.aimActorPtr = nullptr;
         sKeyframes.push_back(k);
         sIds.push_back(sNextId++);
     }
@@ -1464,9 +1476,9 @@ void CinematicCamPathWindow::DrawElement() {
         }
 
         // Aim mode: how this keyframe's camera is oriented.
-        const char* aimModes[] = { "Free orientation", "Look at point", "Look at Link" };
+        const char* aimModes[] = { "Free orientation", "Look at point", "Look at Link", "Look at actor" };
         int am = sKeyframes[sel].aimMode;
-        if (ImGui::Combo("Aim", &am, aimModes, 3)) {
+        if (ImGui::Combo("Aim", &am, aimModes, 4)) {
             PushUndo();
             sKeyframes[sel].aimMode = am;
         }
@@ -1494,6 +1506,43 @@ void CinematicCamPathWindow::DrawElement() {
             ImGui::TextDisabled("Drag the orange crosshair in the world to place the target.");
         } else if (sKeyframes[sel].aimMode == CINE_AIM_PLAYER) {
             ImGui::TextDisabled("Tracks Link's position (live during playback).");
+        } else if (sKeyframes[sel].aimMode == CINE_AIM_ACTOR) {
+            static CineActorInfo sActors[512];
+            // Resolve the current target's name for display.
+            const char* curName = "(pick one)";
+            int n = CinematicCam_EnumActors(sActors, 512);
+            for (int ai = 0; ai < n; ai++) {
+                if (sActors[ai].ptr == sKeyframes[sel].aimActorPtr) {
+                    curName = sActors[ai].name ? sActors[ai].name : "?";
+                    break;
+                }
+                if (sActors[ai].id == sKeyframes[sel].aimActorId) {
+                    curName = sActors[ai].name ? sActors[ai].name : "?";
+                }
+            }
+            ImGui::Text("Target: %s (id %d)", curName, sKeyframes[sel].aimActorId);
+            if (ImGui::Button("Pick actor...")) {
+                ImGui::OpenPopup("Pick actor");
+            }
+            if (ImGui::BeginPopup("Pick actor")) {
+                int pn = CinematicCam_EnumActors(sActors, 512);
+                ImGui::Text("%d actors in scene", pn);
+                ImGui::BeginChild("##actorlist", ImVec2(340, 320), true);
+                for (int ai = 0; ai < pn; ai++) {
+                    char lbl[96];
+                    snprintf(lbl, sizeof(lbl), "%s  (id %d)##%d", sActors[ai].name ? sActors[ai].name : "?",
+                             sActors[ai].id, ai);
+                    if (ImGui::Selectable(lbl)) {
+                        PushUndo();
+                        sKeyframes[sel].aimActorId = sActors[ai].id;
+                        sKeyframes[sel].aimActorPtr = sActors[ai].ptr;
+                        ImGui::CloseCurrentPopup();
+                    }
+                }
+                ImGui::EndChild();
+                ImGui::EndPopup();
+            }
+            ImGui::TextDisabled("Tracks the actor live. Saved by id (re-acquired on load).");
         }
 
         // Numeric fields: type exact position/orientation values for the selected keyframe.

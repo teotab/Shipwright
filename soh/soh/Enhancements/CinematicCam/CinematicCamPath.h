@@ -14,6 +14,7 @@ enum CineAim {
     CINE_AIM_FREE = 0,   // free orientation (stored look-at moves rigidly with the eye)
     CINE_AIM_POINT = 1,  // look at a fixed world point (the stored look-at)
     CINE_AIM_PLAYER = 2, // look at Link (tracked live)
+    CINE_AIM_ACTOR = 3,  // look at a chosen actor (tracked live by id; pointer cached at runtime)
 };
 
 // A single captured camera pose on the path timeline.
@@ -35,7 +36,9 @@ struct CineKeyframe {
     int hasTangent;    // 0 = automatic tangent, 1 = use the custom direction below
     float tangent[3];  // unit direction
 
-    int aimMode;       // CineAim: how the camera is aimed (free / point / Link)
+    int aimMode;       // CineAim: how the camera is aimed (free / point / Link / actor)
+    int aimActorId;    // for CINE_AIM_ACTOR: the actor id to track (saved)
+    void* aimActorPtr; // runtime-only cached Actor* for the tracked actor (not saved)
 };
 
 // Editor window for building and playing back cinematic camera paths.
