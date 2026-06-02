@@ -2981,6 +2981,11 @@ s32 Ship_CalcShouldDrawAndUpdate(PlayState* play, Actor* actor, Vec3f* projected
     }
 
     s32 multiplier = CVarGetInteger(CVAR_ENHANCEMENT("DisableDrawDistance"), 1);
+    // SOH [Enhancement] Cinematic free camera: extend the draw distance generously (still frustum-culled,
+    // so actors behind/far off the camera don't draw) instead of force-drawing the whole scene.
+    if (gCineCamDisableCulling) {
+        multiplier = MAX(multiplier, CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.CullMultiplier"), 5));
+    }
     multiplier = MAX(multiplier, 1);
 
     // Some actors have a really short forward value, so we need to add to it before the multiplier to increase the
@@ -3076,7 +3081,7 @@ void func_800315AC(PlayState* play, ActorContext* actorCtx) {
             bool shipShouldUpdate = false;
             if ((HREG(64) != 1) || ((HREG(65) != -1) && (HREG(65) != HREG(66))) || (HREG(70) == 0)) {
                 if (CVarGetInteger(CVAR_ENHANCEMENT("DisableDrawDistance"), 1) > 1 ||
-                    CVarGetInteger(CVAR_ENHANCEMENT("WidescreenActorCulling"), 0)) {
+                    CVarGetInteger(CVAR_ENHANCEMENT("WidescreenActorCulling"), 0) || gCineCamDisableCulling) {
                     Ship_CalcShouldDrawAndUpdate(play, actor, &actor->projectedPos, actor->projectedW, &shipShouldDraw,
                                                  &shipShouldUpdate);
 

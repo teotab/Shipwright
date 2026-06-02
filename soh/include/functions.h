@@ -731,6 +731,7 @@ void Camera_Init(Camera* camera, View* view, CollisionContext* colCtx, PlayState
 void Camera_InitPlayerSettings(Camera* camera, Player* player);
 s16 Camera_ChangeStatus(Camera* camera, s16 status);
 Vec3s Camera_Update(Camera* camera);
+void CinematicCam_PreUpdateInput(PlayState* play); // SOH [Enhancement] Cinematic free camera input isolation
 void Camera_Finish(Camera* camera);
 s32 Camera_ChangeMode(Camera* camera, s16 mode);
 s32 Camera_CheckValidMode(Camera* camera, s16 mode);

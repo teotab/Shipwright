@@ -7485,6 +7485,185 @@ void Camera_UpdateDistortion(Camera* camera) {
 }
 
 s32 sOOBTimer = 0;
+// #region SOH [Enhancement] Cinematic free camera
+// A fully detached, controller-driven camera for cinematic capture. Gated by the CVar
+// gEnhancements.CinematicCam.Enabled (toggle from the dev console: `set gEnhancements.CinematicCam.Enabled 1`).
+// Phase 1: live freecam. The CameraPose struct below is intentionally the unit a future keyframe/path
+// system will store, so spline playback can be layered on without reworking this.
+typedef struct {
+    /* */ Vec3f eye;   // world position
+    /* */ s16   pitch; // binang
+    /* */ s16   yaw;   // binang
+    /* */ s16   roll;  // binang
+    /* */ f32   fov;   // degrees
+} CameraPose;
+
+static CameraPose sCineCam;
+
+// The controller state captured before the rest of the frame consumed it (see CinematicCam_PreUpdateInput).
+Input gCineCamInput;
+// Globals read by the actor culling code (z_actor.c) to force-draw while flying.
+s32 gCinematicCamActive = 0;
+s32 gCineCamDisableCulling = 0;
+
+// Capture the real controller input for the freecam, then blank the shared buffer so flying the camera
+// doesn't drive Link or advance textboxes. D_8015BD7C->state.input IS play->state.input (same memory),
+// so the player and message systems read this too — they must see neutral input while the freecam owns it.
+// Called at the very top of Play_Update, before any actor/message update.
+void CinematicCam_PreUpdateInput(PlayState* play) {
+    if (!CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 0)) {
+        return;
+    }
+
+    gCineCamInput = play->state.input[0];
+
+    // Blank every field the game reads: cur (buttons + analog sticks), press (button edges), and rel
+    // (the relative stick that drives Link's movement via func_80077D10). Leave prev so the input system's
+    // edge detection stays correct on the frame the freecam is turned off.
+    memset(&play->state.input[0].cur, 0, sizeof(OSContPad));
+    memset(&play->state.input[0].press, 0, sizeof(OSContPad));
+    memset(&play->state.input[0].rel, 0, sizeof(OSContPad));
+}
+
+// Seed the freecam pose from the live gameplay camera so it starts exactly where the view was.
+static void CinematicCam_Enable(Camera* camera) {
+    VecSph forward;
+
+    sCineCam.eye = camera->eye;
+    // forward direction (eye -> at): Diff(out, a, b) yields the spherical of (b - a)
+    OLib_Vec3fDiffToVecSphGeo(&forward, &camera->eye, &camera->at);
+    sCineCam.pitch = forward.pitch;
+    sCineCam.yaw = forward.yaw;
+    sCineCam.roll = 0;
+    sCineCam.fov = camera->fov;
+}
+
+static void CinematicCam_Update(Camera* camera) {
+    OSContPad* cur = &gCineCamInput.cur; // captured input, isolated from the rest of the game
+    VecSph forwardSph;
+    VecSph rightSph;
+    VecSph atSph;
+    Vec3f forward;
+    Vec3f right;
+    Vec3f at;
+    Vec3f up;
+    f32 fwdInput;
+    f32 strafeInput;
+    f32 lookX;
+    f32 lookY;
+    f32 moveSpeed = CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.MoveSpeed"), 30.0f);
+    // LookSpeed is a user-facing multiplier around a sane internal base (full stick deflection ~= 7 deg/frame).
+    f32 lookSpeed = CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.LookSpeed"), 1.0f) * 10.0f;
+
+    // Precision modifier: hold L to slow movement and look for fine framing.
+    if (CHECK_BTN_ALL(cur->button, BTN_L)) {
+        moveSpeed *= 0.25f;
+        lookSpeed *= 0.5f;
+    }
+    // Boost modifier: hold A to speed up movement for covering large distances.
+    if (CHECK_BTN_ALL(cur->button, BTN_A)) {
+        moveSpeed *= CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.BoostMultiplier"), 3.0f);
+    }
+
+    // Look (right stick): yaw + pitch. Sticks are int8 (-128..127).
+    lookX = cur->right_stick_x * lookSpeed;
+    lookY = cur->right_stick_y * lookSpeed;
+    if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.InvertLookX"), 0)) {
+        lookX = -lookX;
+    }
+    if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.InvertLookY"), 0)) {
+        lookY = -lookY;
+    }
+    sCineCam.yaw -= (s16)lookX;
+    sCineCam.pitch += (s16)lookY;
+    // Clamp pitch shy of vertical to avoid the up-vector flipping.
+    if (sCineCam.pitch > 0x3C00) {
+        sCineCam.pitch = 0x3C00;
+    }
+    if (sCineCam.pitch < -0x3C00) {
+        sCineCam.pitch = -0x3C00;
+    }
+
+    // Basis vectors from the current orientation.
+    forwardSph.r = 1.0f;
+    forwardSph.pitch = sCineCam.pitch;
+    forwardSph.yaw = sCineCam.yaw;
+    OLib_VecSphGeoToVec3f(&forward, &forwardSph);
+
+    rightSph.r = 1.0f;
+    rightSph.pitch = 0;
+    rightSph.yaw = sCineCam.yaw - 0x4000; // 90 degrees right of facing, level
+    OLib_VecSphGeoToVec3f(&right, &rightSph);
+
+    // Move (left stick): forward/back along facing (incl. pitch) + strafe. Stick up = forward.
+    fwdInput = cur->stick_y / 127.0f;
+    strafeInput = cur->stick_x / 127.0f;
+    sCineCam.eye.x += (forward.x * fwdInput + right.x * strafeInput) * moveSpeed;
+    sCineCam.eye.y += (forward.y * fwdInput + right.y * strafeInput) * moveSpeed;
+    sCineCam.eye.z += (forward.z * fwdInput + right.z * strafeInput) * moveSpeed;
+
+    // Vertical along world Y: R = ascend, Z = descend.
+    if (CHECK_BTN_ALL(cur->button, BTN_R)) {
+        sCineCam.eye.y += moveSpeed;
+    }
+    if (CHECK_BTN_ALL(cur->button, BTN_Z)) {
+        sCineCam.eye.y -= moveSpeed;
+    }
+
+    // FOV (D-up/D-down) and roll (D-left/D-right).
+    if (CHECK_BTN_ALL(cur->button, BTN_DUP)) {
+        sCineCam.fov -= 1.0f;
+    }
+    if (CHECK_BTN_ALL(cur->button, BTN_DDOWN)) {
+        sCineCam.fov += 1.0f;
+    }
+    if (sCineCam.fov < 1.0f) {
+        sCineCam.fov = 1.0f;
+    }
+    if (sCineCam.fov > 170.0f) {
+        sCineCam.fov = 170.0f;
+    }
+    if (CHECK_BTN_ALL(cur->button, BTN_DLEFT)) {
+        sCineCam.roll -= 0x80;
+    }
+    if (CHECK_BTN_ALL(cur->button, BTN_DRIGHT)) {
+        sCineCam.roll += 0x80;
+    }
+
+    // Compose the view: at = eye + facing, up from pitch/yaw/roll.
+    atSph.r = 100.0f;
+    atSph.pitch = sCineCam.pitch;
+    atSph.yaw = sCineCam.yaw;
+    Camera_Vec3fVecSphGeoAdd(&at, &sCineCam.eye, &atSph);
+    Camera_CalcUpFromPitchYawRoll(&up, sCineCam.pitch, sCineCam.yaw, sCineCam.roll);
+
+    // Keep the Camera fields in sync so audio panning and actor culling follow the freecam.
+    camera->eye = camera->eyeNext = sCineCam.eye;
+    camera->at = at;
+    camera->fov = sCineCam.fov;
+    camera->roll = sCineCam.roll;
+
+    // Push straight to the view (bypasses all normal camera math).
+    camera->play->view.fovy = sCineCam.fov;
+    func_800AA358(&camera->play->view, &sCineCam.eye, &at, &up);
+
+    // Disable culling: force actors to draw (gCineCamDisableCulling, read by z_actor.c) and push the far
+    // clip plane out so distant geometry isn't clipped. Default 20000 (view default is 12800).
+    if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.DisableCulling"), 1)) {
+        gCineCamDisableCulling = 1;
+        camera->play->view.zFar = CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.FarPlane"), 20000.0f);
+    } else {
+        gCineCamDisableCulling = 0;
+    }
+
+    // Freeze the world while flying so the player doesn't react to the sticks. Takes effect next frame
+    // (actors already updated before the camera block). Toggle off via CinematicCam.FreezeWorld.
+    if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.FreezeWorld"), 1)) {
+        IREG(72) = 1;
+    }
+}
+// #endregion
+
 Vec3s Camera_Update(Camera* camera) {
     Vec3f viewAt;
     Vec3f viewEye;
@@ -7631,6 +7810,29 @@ Vec3s Camera_Update(Camera* camera) {
                      &sCameraFunctionNames[sCameraSettings[camera->setting].cameraModes[camera->mode].funcIdx],
                      sCameraSettings[camera->setting].cameraModes[camera->mode].funcIdx);
     }
+
+    // #region SOH [Enhancement] Cinematic free camera dispatch
+    {
+        static s32 sCineCamWasActive = 0;
+        s32 cineEnabled = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 0);
+
+        if (cineEnabled && (camera->thisIdx == camera->play->activeCamera)) {
+            if (!sCineCamWasActive) {
+                CinematicCam_Enable(camera);
+                sCineCamWasActive = 1;
+            }
+            gCinematicCamActive = 1;
+            CinematicCam_Update(camera);
+            return camera->inputDir;
+        } else if (!cineEnabled && sCineCamWasActive) {
+            IREG(72) = 0;                          // unfreeze the world on exit
+            gCinematicCamActive = 0;
+            gCineCamDisableCulling = 0;
+            camera->play->view.zFar = 12800.0f;    // restore default far clip plane
+            sCineCamWasActive = 0;
+        }
+    }
+    // #endregion
 
     // enable/disable debug cam
     if (CVarGetInteger(CVAR_DEVELOPER_TOOLS("DebugEnabled"), 0) &&

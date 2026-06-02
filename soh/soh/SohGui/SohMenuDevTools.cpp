@@ -228,6 +228,66 @@ void SohMenu::AddMenuDevTools() {
         .WindowName("GfxDebugger##SoH")
         .HideInSearch(true)
         .Options(WindowButtonOptions().Tooltip("Enables the separate Gfx Debugger Window."));
+
+    // Cinematic Camera
+    path.sidebarName = "Cinematic Cam";
+    AddSidebarEntry("Dev Tools", path.sidebarName, 1);
+    AddWidget(path, "Enable Cinematic Camera", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.Enabled"))
+        .Options(CheckboxOptions().DefaultValue(false).Tooltip(
+            "A fully detached, controller-driven free camera for cinematic capture.\n\n"
+            "Controls (player 1):\n"
+            "- Left stick: move / strafe (up = forward)\n"
+            "- Right stick: look\n"
+            "- R / Z: ascend / descend\n"
+            "- Hold A: boost (fast) modifier\n"
+            "- Hold L: precision (slow) modifier\n"
+            "- D-pad Up/Down: FOV\n"
+            "- D-pad Left/Right: roll\n\n"
+            "While active the controller drives only the camera — Link ignores all input."));
+    AddWidget(path, "Move Speed: %.0f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.MoveSpeed"))
+        .Options(FloatSliderOptions().Min(1.0f).Max(200.0f).DefaultValue(30.0f).Format("%.0f").Tooltip(
+            "How fast the camera moves, in world units per frame."));
+    AddWidget(path, "Boost Multiplier: %.1fx", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.BoostMultiplier"))
+        .Options(FloatSliderOptions().Min(1.5f).Max(10.0f).DefaultValue(3.0f).Format("%.1f").Tooltip(
+            "Speed multiplier while holding A."));
+    AddWidget(path, "Look Sensitivity: %.2fx", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.LookSpeed"))
+        .Options(FloatSliderOptions().Min(0.10f).Max(5.0f).DefaultValue(1.0f).Format("%.2f").Tooltip(
+            "Right-stick look sensitivity multiplier."));
+    AddWidget(path, "Invert Look X", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.InvertLookX"))
+        .Options(CheckboxOptions().DefaultValue(false).Tooltip("Invert horizontal (yaw) look."));
+    AddWidget(path, "Invert Look Y", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.InvertLookY"))
+        .Options(CheckboxOptions().DefaultValue(false).Tooltip("Invert vertical (pitch) look."));
+    AddWidget(path, "Freeze World", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.FreezeWorld"))
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "Freeze actors and physics while flying. Turn off to let the action continue (note: the controller "
+            "still only drives the camera, not Link)."));
+    AddWidget(path, "Disable Culling", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.DisableCulling"))
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "Extend the actor draw distance and push out the far clip plane so objects don't pop in/out while "
+            "flying. Higher draw distances cost performance in busy scenes."));
+    AddWidget(path, "Draw Distance: %dx", WIDGET_CVAR_SLIDER_INT)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.CullMultiplier"))
+        .Options(IntSliderOptions().Min(1).Max(20).DefaultValue(5).Format("%dx").Tooltip(
+            "How far beyond the normal range actors stay drawn. Raise if objects still pop out; lower if busy "
+            "scenes lag."))
+        .PreFunc([](WidgetInfo& info) {
+            info.isHidden = !CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.DisableCulling"), 1);
+        });
+    AddWidget(path, "Far Clip Plane: %.0f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.FarPlane"))
+        .Options(FloatSliderOptions().Min(12800.0f).Max(60000.0f).DefaultValue(20000.0f).Format("%.0f").Tooltip(
+            "Distance at which scene geometry is clipped. Raise for wide vistas."))
+        .PreFunc([](WidgetInfo& info) {
+            info.isHidden = !CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.DisableCulling"), 1);
+        });
 }
 
 } // namespace SohGui
