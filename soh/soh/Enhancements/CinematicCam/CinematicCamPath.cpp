@@ -35,8 +35,16 @@ static float sPlayhead = 0.0f;        // seconds
 static float sPlaySpeed = 1.0f;
 static char sFilename[64] = "path1";
 static bool sHookRegistered = false;
-static bool sShowPath = true; // draw the spline + markers in the world while the editor is open
-static int sAimDragId = -1;   // id of the keyframe whose aim handle is being dragged, or -1
+static bool sShowPath = true;   // draw the spline + markers in the world while the editor is open
+static bool sShowFields = false; // show numeric position/rotation fields for the selected keyframe
+
+// Transform gizmo state for the selected keyframe.
+enum GizmoMode { GIZMO_MOVE = 0, GIZMO_ROTATE = 1 };
+static int sGizmoMode = GIZMO_MOVE;
+static int sDragKfId = -1;      // keyframe id currently being manipulated by the gizmo, or -1
+static int sDragKind = 0;       // 0 = translate, 1 = rotate (snapshot of mode at grab time)
+static int sDragAxis = -1;      // which axis/ring: 0=X/yaw, 1=Y/pitch, 2=Z/roll
+static float sRotPrevAngle = 0.0f;
 
 // Undo / redo history of the whole keyframe list.
 struct PathSnapshot {
@@ -399,6 +407,383 @@ static void FacingHandleWorld(const CineKeyframe& k, float out[3]) {
     out[2] = k.eye[2] + (k.at[2] - k.eye[2]) * 0.4f;
 }
 
+// ---------------------------------------------------------------------------
+// Small float[3] vector helpers + the transform gizmo
+// ---------------------------------------------------------------------------
+static void v3sub(const float* a, const float* b, float* o) {
+    o[0] = a[0] - b[0];
+    o[1] = a[1] - b[1];
+    o[2] = a[2] - b[2];
+}
+static void v3add(const float* a, const float* b, float* o) {
+    o[0] = a[0] + b[0];
+    o[1] = a[1] + b[1];
+    o[2] = a[2] + b[2];
+}
+static void v3mad(const float* a, const float* d, float s, float* o) { // o = a + d*s
+    o[0] = a[0] + d[0] * s;
+    o[1] = a[1] + d[1] * s;
+    o[2] = a[2] + d[2] * s;
+}
+static float v3dot(const float* a, const float* b) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+static void v3cross(const float* a, const float* b, float* o) {
+    float x = a[1] * b[2] - a[2] * b[1];
+    float y = a[2] * b[0] - a[0] * b[2];
+    float z = a[0] * b[1] - a[1] * b[0];
+    o[0] = x;
+    o[1] = y;
+    o[2] = z;
+}
+static float v3len(const float* a) {
+    return std::sqrt(v3dot(a, a));
+}
+static void v3norm(float* a) {
+    float l = v3len(a);
+    if (l > 1e-6f) {
+        a[0] /= l;
+        a[1] /= l;
+        a[2] /= l;
+    }
+}
+// Rodrigues rotation of v around unit axis k by angle (radians).
+static void v3rot(const float* v, const float* k, float ang, float* o) {
+    float c = std::cos(ang);
+    float s = std::sin(ang);
+    float kv[3];
+    v3cross(k, v, kv);
+    float kd = v3dot(k, v);
+    for (int i = 0; i < 3; i++) {
+        o[i] = v[i] * c + kv[i] * s + k[i] * kd * (1.0f - c);
+    }
+}
+
+// World size that projects to roughly targetPx pixels near a point (keeps the gizmo a constant screen size).
+static float GizmoScale(const float* eye, float targetPx) {
+    ImVec2 s0;
+    if (!WorldToScreen(eye, s0)) {
+        return 0.0f;
+    }
+    const float axes[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
+    float total = 0.0f;
+    int n = 0;
+    for (int a = 0; a < 3; a++) {
+        float probe[3];
+        v3mad(eye, axes[a], 10.0f, probe);
+        ImVec2 s1;
+        if (WorldToScreen(probe, s1)) {
+            float dx = s1.x - s0.x;
+            float dy = s1.y - s0.y;
+            total += std::sqrt(dx * dx + dy * dy) / 10.0f;
+            n++;
+        }
+    }
+    if (n == 0 || total <= 1e-4f) {
+        return 0.0f;
+    }
+    return targetPx / (total / n);
+}
+
+// Distance from point p to segment ab (all ImVec2).
+static float DistToSegment(const ImVec2& p, const ImVec2& a, const ImVec2& b) {
+    float vx = b.x - a.x, vy = b.y - a.y;
+    float wx = p.x - a.x, wy = p.y - a.y;
+    float len2 = vx * vx + vy * vy;
+    float t = (len2 > 1e-6f) ? ((wx * vx + wy * vy) / len2) : 0.0f;
+    if (t < 0.0f) {
+        t = 0.0f;
+    }
+    if (t > 1.0f) {
+        t = 1.0f;
+    }
+    float cx = a.x + vx * t, cy = a.y + vy * t;
+    float dx = p.x - cx, dy = p.y - cy;
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+static const float kPi = 3.14159265f;
+
+// Read a keyframe's orientation as yaw/pitch (degrees) plus the eye->at distance.
+static void GetYawPitch(const CineKeyframe& k, float& yawDeg, float& pitchDeg, float& dist) {
+    float dx = k.at[0] - k.eye[0];
+    float dy = k.at[1] - k.eye[1];
+    float dz = k.at[2] - k.eye[2];
+    dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (dist < 1.0f) {
+        dist = 1.0f;
+    }
+    float horiz = std::sqrt(dx * dx + dz * dz);
+    yawDeg = std::atan2(dx, dz) * 180.0f / kPi;
+    pitchDeg = std::atan2(dy, horiz) * 180.0f / kPi;
+}
+
+// Write a keyframe's orientation from yaw/pitch (degrees), preserving the eye->at distance. Pitch is
+// clamped shy of vertical so the look direction can never cross straight up/down (avoids gimbal flips).
+static void SetYawPitch(CineKeyframe& k, float yawDeg, float pitchDeg, float dist) {
+    if (pitchDeg > 85.0f) {
+        pitchDeg = 85.0f;
+    }
+    if (pitchDeg < -85.0f) {
+        pitchDeg = -85.0f;
+    }
+    float y = yawDeg * kPi / 180.0f;
+    float p = pitchDeg * kPi / 180.0f;
+    float ch = std::cos(p) * dist;
+    k.at[0] = k.eye[0] + ch * std::sin(y);
+    k.at[1] = k.eye[1] + dist * std::sin(p);
+    k.at[2] = k.eye[2] + ch * std::cos(y);
+}
+
+// Build the local rotation axes (yaw/pitch/roll) for a keyframe.
+static void RotationAxes(const CineKeyframe& k, float yawAxis[3], float pitchAxis[3], float rollAxis[3]) {
+    float fwd[3];
+    v3sub(k.at, k.eye, fwd);
+    v3norm(fwd);
+    float worldUp[3] = { 0.0f, 1.0f, 0.0f };
+    float right[3];
+    v3cross(worldUp, fwd, right);
+    if (v3len(right) < 1e-3f) {
+        float altUp[3] = { 0.0f, 0.0f, 1.0f };
+        v3cross(altUp, fwd, right);
+    }
+    v3norm(right);
+    yawAxis[0] = 0.0f;
+    yawAxis[1] = 1.0f;
+    yawAxis[2] = 0.0f; // yaw around world up
+    pitchAxis[0] = right[0];
+    pitchAxis[1] = right[1];
+    pitchAxis[2] = right[2]; // pitch around camera right
+    rollAxis[0] = fwd[0];
+    rollAxis[1] = fwd[1];
+    rollAxis[2] = fwd[2]; // roll around view direction
+}
+
+static const ImU32 kMoveCol[3] = { IM_COL32(235, 80, 80, 255), IM_COL32(90, 220, 90, 255),
+                                   IM_COL32(90, 150, 255, 255) }; // X, Y, Z
+static const ImU32 kRotCol[3] = { IM_COL32(90, 220, 90, 255), IM_COL32(235, 80, 80, 255),
+                                  IM_COL32(90, 150, 255, 255) }; // yaw, pitch, roll
+
+// Compute the perpendicular ring basis (u, v) for a rotation axis.
+static void RingBasis(const float* k, float u[3], float v[3]) {
+    float ref[3] = { (std::fabs(k[0]) > 0.9f) ? 0.0f : 1.0f, (std::fabs(k[0]) > 0.9f) ? 1.0f : 0.0f, 0.0f };
+    v3cross(ref, k, u);
+    v3norm(u);
+    v3cross(k, u, v);
+}
+
+// Draw the move axes or rotate rings for one keyframe.
+static void DrawGizmo(ImDrawList* dl, int idx) {
+    const CineKeyframe& k = sKeyframes[idx];
+    ImVec2 origin;
+    if (!WorldToScreen(k.eye, origin)) {
+        return;
+    }
+
+    if (sGizmoMode == GIZMO_MOVE) {
+        float L = GizmoScale(k.eye, 70.0f);
+        if (L <= 0.0f) {
+            return;
+        }
+        const float axes[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
+        for (int a = 0; a < 3; a++) {
+            float end[3];
+            v3mad(k.eye, axes[a], L, end);
+            ImVec2 ep;
+            if (!WorldToScreen(end, ep)) {
+                continue;
+            }
+            bool hot = (sDragKfId == sIds[idx] && sDragKind == 0 && sDragAxis == a);
+            ImU32 c = hot ? IM_COL32(255, 255, 120, 255) : kMoveCol[a];
+            dl->AddLine(origin, ep, c, hot ? 3.5f : 2.5f);
+            dl->AddCircleFilled(ep, 4.0f, c);
+        }
+    } else {
+        float R = GizmoScale(k.eye, 60.0f);
+        if (R <= 0.0f) {
+            return;
+        }
+        float axesK[3][3];
+        RotationAxes(k, axesK[0], axesK[1], axesK[2]);
+        for (int a = 0; a < 3; a++) {
+            float u[3], v[3];
+            RingBasis(axesK[a], u, v);
+            bool hot = (sDragKfId == sIds[idx] && sDragKind == 1 && sDragAxis == a);
+            ImU32 c = hot ? IM_COL32(255, 255, 120, 255) : kRotCol[a];
+            const int SEG = 48;
+            ImVec2 prev;
+            bool pv = false;
+            for (int s = 0; s <= SEG; s++) {
+                float t = (float)s / SEG * 6.2831853f;
+                float cs = std::cos(t), sn = std::sin(t);
+                float p[3] = { k.eye[0] + (u[0] * cs + v[0] * sn) * R, k.eye[1] + (u[1] * cs + v[1] * sn) * R,
+                               k.eye[2] + (u[2] * cs + v[2] * sn) * R };
+                ImVec2 sp;
+                if (WorldToScreen(p, sp)) {
+                    if (pv) {
+                        dl->AddLine(prev, sp, c, hot ? 3.0f : 2.0f);
+                    }
+                    prev = sp;
+                    pv = true;
+                } else {
+                    pv = false;
+                }
+            }
+        }
+    }
+}
+
+// Hit-test the gizmo for keyframe idx against the mouse; begins a drag if a handle is grabbed.
+static bool GizmoTryStart(int idx, ImVec2 m) {
+    const CineKeyframe& k = sKeyframes[idx];
+    ImVec2 origin;
+    if (!WorldToScreen(k.eye, origin)) {
+        return false;
+    }
+    if (sGizmoMode == GIZMO_MOVE) {
+        float L = GizmoScale(k.eye, 70.0f);
+        if (L <= 0.0f) {
+            return false;
+        }
+        const float axes[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
+        int best = -1;
+        float bestd = 9.0f;
+        for (int a = 0; a < 3; a++) {
+            float end[3];
+            v3mad(k.eye, axes[a], L, end);
+            ImVec2 ep;
+            if (!WorldToScreen(end, ep)) {
+                continue;
+            }
+            float d = DistToSegment(m, origin, ep);
+            if (d < bestd) {
+                bestd = d;
+                best = a;
+            }
+        }
+        if (best >= 0) {
+            PushUndo();
+            sDragKfId = sIds[idx];
+            sDragKind = 0;
+            sDragAxis = best;
+            return true;
+        }
+    } else {
+        float R = GizmoScale(k.eye, 60.0f);
+        if (R <= 0.0f) {
+            return false;
+        }
+        float axesK[3][3];
+        RotationAxes(k, axesK[0], axesK[1], axesK[2]);
+        int best = -1;
+        float bestd = 8.0f;
+        for (int a = 0; a < 3; a++) {
+            float u[3], v[3];
+            RingBasis(axesK[a], u, v);
+            const int SEG = 48;
+            for (int s = 0; s < SEG; s++) {
+                float t = (float)s / SEG * 6.2831853f;
+                float cs = std::cos(t), sn = std::sin(t);
+                float p[3] = { k.eye[0] + (u[0] * cs + v[0] * sn) * R, k.eye[1] + (u[1] * cs + v[1] * sn) * R,
+                               k.eye[2] + (u[2] * cs + v[2] * sn) * R };
+                ImVec2 sp;
+                if (!WorldToScreen(p, sp)) {
+                    continue;
+                }
+                float dx = sp.x - m.x, dy = sp.y - m.y;
+                float d = std::sqrt(dx * dx + dy * dy);
+                if (d < bestd) {
+                    bestd = d;
+                    best = a;
+                }
+            }
+        }
+        if (best >= 0) {
+            PushUndo();
+            sDragKfId = sIds[idx];
+            sDragKind = 1;
+            sDragAxis = best;
+            sRotPrevAngle = std::atan2(m.y - origin.y, m.x - origin.x);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Apply the active gizmo drag from this frame's mouse movement.
+static void GizmoContinue() {
+    int idx = -1;
+    for (size_t i = 0; i < sIds.size(); i++) {
+        if (sIds[i] == sDragKfId) {
+            idx = (int)i;
+            break;
+        }
+    }
+    if (idx < 0 || !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        sDragKfId = -1;
+        sDragAxis = -1;
+        return;
+    }
+    ImGuiIO& io = ImGui::GetIO();
+    CineKeyframe& k = sKeyframes[idx];
+
+    if (sDragKind == 0) {
+        ImVec2 origin, ep;
+        if (!WorldToScreen(k.eye, origin)) {
+            return;
+        }
+        float L = GizmoScale(k.eye, 70.0f);
+        if (L <= 0.0f) {
+            return;
+        }
+        float axis[3] = { 0, 0, 0 };
+        axis[sDragAxis] = 1.0f;
+        float end[3];
+        v3mad(k.eye, axis, L, end);
+        if (!WorldToScreen(end, ep)) {
+            return;
+        }
+        float sx = ep.x - origin.x, sy = ep.y - origin.y;
+        float slen = std::sqrt(sx * sx + sy * sy);
+        if (slen < 1e-3f) {
+            return;
+        }
+        float along = (io.MouseDelta.x * sx + io.MouseDelta.y * sy) / slen; // pixels along the axis
+        float worldDelta = along * (L / slen);
+        k.eye[sDragAxis] += worldDelta;
+        k.at[sDragAxis] += worldDelta; // move the look-at with the eye (rigid translation)
+    } else {
+        ImVec2 origin;
+        if (!WorldToScreen(k.eye, origin)) {
+            return;
+        }
+        float ang = std::atan2(io.MousePos.y - origin.y, io.MousePos.x - origin.x);
+        float d = ang - sRotPrevAngle;
+        while (d > 3.14159265f) {
+            d -= 6.2831853f;
+        }
+        while (d < -3.14159265f) {
+            d += 6.2831853f;
+        }
+        sRotPrevAngle = ang;
+
+        if (sDragAxis == 2) {
+            k.roll += d * (180.0f / kPi); // roll in degrees
+        } else {
+            // Apply yaw/pitch in angle space so pitch can be clamped shy of vertical (no gimbal flip).
+            float yaw, pitch, dist;
+            GetYawPitch(k, yaw, pitch, dist);
+            float dDeg = d * (180.0f / kPi);
+            if (sDragAxis == 0) {
+                yaw += dDeg;
+            } else {
+                pitch += dDeg;
+            }
+            SetYawPitch(k, yaw, pitch, dist);
+        }
+    }
+}
+
 // Draw the spline, numbered keyframe markers, facing indicators and the playhead over the game view.
 static void DrawWorldOverlay() {
     if (sKeyframes.empty()) {
@@ -426,6 +811,19 @@ static void DrawWorldOverlay() {
                 prevValid = false;
             }
         }
+
+        // Orientation ticks: the interpolated facing sampled along the path, so rotating a keyframe
+        // visibly reshapes the camera orientation all along the curve (not just at the keyframe).
+        const int ticks = 16;
+        for (int i = 0; i <= ticks; i++) {
+            CineKeyframe s = SampleAt(total * (float)i / (float)ticks);
+            float tip[3] = { s.eye[0] + (s.at[0] - s.eye[0]) * 0.15f, s.eye[1] + (s.at[1] - s.eye[1]) * 0.15f,
+                             s.eye[2] + (s.at[2] - s.eye[2]) * 0.15f };
+            ImVec2 a, b;
+            if (WorldToScreen(s.eye, a) && WorldToScreen(tip, b)) {
+                dl->AddLine(a, b, IM_COL32(120, 200, 255, 130), 1.0f);
+            }
+        }
     }
 
     // Keyframe markers (numbered) with a short facing indicator.
@@ -443,18 +841,16 @@ static void DrawWorldOverlay() {
         snprintf(num, sizeof(num), "%d", i + 1);
         dl->AddText(ImVec2(sp.x + 9.0f, sp.y - 9.0f), IM_COL32(255, 255, 255, 255), num);
 
-        // Facing indicator: a short line toward the look-at point. The selected keyframe also gets a
-        // grabbable aim handle at the end of the line (drag it to re-aim the camera).
+        // Facing indicator: a short line toward the look-at point (drawn for every keyframe).
         float facing[3];
         FacingHandleWorld(sKeyframes[i], facing);
         ImVec2 fp;
         if (WorldToScreen(facing, fp)) {
             dl->AddLine(sp, fp, IM_COL32(120, 255, 120, 150), 1.5f);
-            if (selected) {
-                bool dragging = sIds[i] == sAimDragId;
-                dl->AddCircleFilled(fp, dragging ? 6.0f : 5.0f, IM_COL32(120, 255, 120, 255));
-                dl->AddCircle(fp, dragging ? 6.0f : 5.0f, IM_COL32(0, 0, 0, 200), 0, 1.5f);
-            }
+        }
+        // The selected keyframe gets the transform gizmo (move axes or rotate rings).
+        if (selected) {
+            DrawGizmo(dl, i);
         }
     }
 
@@ -469,53 +865,14 @@ static void DrawWorldOverlay() {
     }
 }
 
-// Mouse interaction with the overlay: click a keyframe to select it, drag the selected keyframe's aim
-// handle to re-aim its camera (horizontal = yaw, vertical = pitch). Operates only over the game view.
+// Mouse interaction with the overlay: click a keyframe to select it, grab the selected keyframe's gizmo
+// to move (axis handles) or rotate (rings) it. Operates over the game view, menu open or not.
 static void HandleOverlayInput() {
     ImGuiIO& io = ImGui::GetIO();
 
-    // Continue an in-progress aim drag (ignores WantCaptureMouse so it survives passing over a window).
-    if (sAimDragId >= 0) {
-        int idx = -1;
-        for (size_t i = 0; i < sIds.size(); i++) {
-            if (sIds[i] == sAimDragId) {
-                idx = (int)i;
-                break;
-            }
-        }
-        if (idx < 0 || !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-            sAimDragId = -1;
-            return;
-        }
-        if (io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f) {
-            float* eye = sKeyframes[idx].eye;
-            float* at = sKeyframes[idx].at;
-            float dx = at[0] - eye[0];
-            float dy = at[1] - eye[1];
-            float dz = at[2] - eye[2];
-            float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-            if (dist < 1.0f) {
-                dist = 1.0f;
-            }
-            float horiz = std::sqrt(dx * dx + dz * dz);
-            float yaw = std::atan2(dx, dz);
-            float pitch = std::atan2(dy, horiz);
-
-            const float kSens = 0.005f; // radians per pixel
-            yaw += io.MouseDelta.x * kSens;
-            pitch -= io.MouseDelta.y * kSens; // drag up = look up
-            const float kPitchLimit = 1.48f;  // ~85 degrees, avoid gimbal flip
-            if (pitch > kPitchLimit) {
-                pitch = kPitchLimit;
-            }
-            if (pitch < -kPitchLimit) {
-                pitch = -kPitchLimit;
-            }
-            float ch = std::cos(pitch) * dist;
-            at[0] = eye[0] + ch * std::sin(yaw);
-            at[1] = eye[1] + dist * std::sin(pitch);
-            at[2] = eye[2] + ch * std::cos(yaw);
-        }
+    // Continue an in-progress gizmo drag (ignores WantCaptureMouse so it survives passing over a window).
+    if (sDragKfId >= 0) {
+        GizmoContinue();
         return;
     }
 
@@ -530,20 +887,9 @@ static void HandleOverlayInput() {
     ImVec2 m = io.MousePos;
     int sel = SelectedIndex();
 
-    // Grab the selected keyframe's aim handle if the click landed on it.
-    if (sel >= 0) {
-        float facing[3];
-        FacingHandleWorld(sKeyframes[sel], facing);
-        ImVec2 fp;
-        if (WorldToScreen(facing, fp)) {
-            float ax = fp.x - m.x;
-            float ay = fp.y - m.y;
-            if (ax * ax + ay * ay <= 12.0f * 12.0f) {
-                PushUndo(); // whole drag is one undo step
-                sAimDragId = sIds[sel];
-                return;
-            }
-        }
+    // Grab the selected keyframe's gizmo if the click landed on a handle.
+    if (sel >= 0 && GizmoTryStart(sel, m)) {
+        return;
     }
 
     // Otherwise, select whichever keyframe marker was clicked.
@@ -588,8 +934,14 @@ void CinematicCamPathWindow::DrawElement() {
         DrawWorldOverlay();
     }
     if (sShowPath && SelectedIndex() >= 0) {
-        ImGui::TextDisabled("Tip: drag the green handle in the world to re-aim the selected keyframe; "
-                            "click a marker to select it.");
+        ImGui::TextUnformatted("Gizmo:");
+        ImGui::SameLine();
+        ImGui::RadioButton("Move", &sGizmoMode, GIZMO_MOVE);
+        ImGui::SameLine();
+        ImGui::RadioButton("Rotate", &sGizmoMode, GIZMO_ROTATE);
+        ImGui::TextDisabled(sGizmoMode == GIZMO_MOVE
+                                ? "Drag the red/green/blue axes in the world to move the keyframe. Click a marker to select."
+                                : "Drag the rings to rotate: green=yaw, red=pitch, blue=roll. Click a marker to select.");
     }
 
     ImGui::BeginDisabled(!enabled);
@@ -708,6 +1060,74 @@ void CinematicCamPathWindow::DrawElement() {
                 sKeyframes[sel].tension = 0.0f;
                 sKeyframes[sel].continuity = 0.0f;
                 sKeyframes[sel].bias = 0.0f;
+            }
+        }
+
+        // Numeric fields: type exact position/orientation values for the selected keyframe.
+        ImGui::Checkbox("Numeric fields", &sShowFields);
+        if (sShowFields) {
+            CineKeyframe& kf = sKeyframes[sel];
+
+            float pos[3] = { kf.eye[0], kf.eye[1], kf.eye[2] };
+            bool posCh = ImGui::InputFloat3("Position", pos, "%.1f");
+            if (ImGui::IsItemActivated()) {
+                PushUndo();
+            }
+            if (posCh) {
+                float dxp = pos[0] - kf.eye[0], dyp = pos[1] - kf.eye[1], dzp = pos[2] - kf.eye[2];
+                kf.eye[0] = pos[0];
+                kf.eye[1] = pos[1];
+                kf.eye[2] = pos[2];
+                kf.at[0] += dxp; // move the look-at rigidly with the eye
+                kf.at[1] += dyp;
+                kf.at[2] += dzp;
+            }
+
+            float yaw, pitch, dist;
+            GetYawPitch(kf, yaw, pitch, dist);
+            float yaw0 = yaw, pitch0 = pitch;
+            ImGui::InputFloat("Yaw", &yaw, 1.0f, 15.0f, "%.1f");
+            if (ImGui::IsItemActivated()) {
+                PushUndo();
+            }
+            ImGui::InputFloat("Pitch", &pitch, 1.0f, 15.0f, "%.1f");
+            if (ImGui::IsItemActivated()) {
+                PushUndo();
+            }
+            if (yaw != yaw0 || pitch != pitch0) {
+                SetYawPitch(kf, yaw, pitch, dist);
+            }
+
+            float roll = kf.roll;
+            ImGui::InputFloat("Roll", &roll, 1.0f, 15.0f, "%.1f");
+            if (ImGui::IsItemActivated()) {
+                PushUndo();
+            }
+            kf.roll = roll;
+
+            float fov = kf.fov;
+            ImGui::InputFloat("FOV", &fov, 1.0f, 5.0f, "%.1f");
+            if (ImGui::IsItemActivated()) {
+                PushUndo();
+            }
+            if (fov < 1.0f) {
+                fov = 1.0f;
+            }
+            if (fov > 170.0f) {
+                fov = 170.0f;
+            }
+            kf.fov = fov;
+
+            if (ImGui::SmallButton("Reset Roll")) {
+                PushUndo();
+                kf.roll = 0.0f;
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Level Pitch")) {
+                PushUndo();
+                float y2, p2, d2;
+                GetYawPitch(kf, y2, p2, d2);
+                SetYawPitch(kf, y2, 0.0f, d2);
             }
         }
     }
