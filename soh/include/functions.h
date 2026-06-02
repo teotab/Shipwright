@@ -734,6 +734,7 @@ Vec3s Camera_Update(Camera* camera);
 void CinematicCam_PreUpdateInput(PlayState* play); // SOH [Enhancement] Cinematic free camera input isolation
 void CinematicCam_GetPose(f32* eye, f32* at, f32* roll, f32* fov);          // SOH [Enhancement] path keyframe capture
 void CinematicCam_SetPlayback(s32 active, f32* eye, f32* at, f32 roll, f32 fov); // SOH [Enhancement] path playback
+s32 CinematicCam_WorldToNdc(f32* world, f32* outNdcX, f32* outNdcY);             // SOH [Enhancement] path overlay
 void Camera_Finish(Camera* camera);
 s32 Camera_ChangeMode(Camera* camera, s16 mode);
 s32 Camera_CheckValidMode(Camera* camera, s16 mode);

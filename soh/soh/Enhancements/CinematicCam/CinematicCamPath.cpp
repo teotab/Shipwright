@@ -17,6 +17,7 @@
 extern "C" {
 void CinematicCam_GetPose(float* eye, float* at, float* roll, float* fov);
 void CinematicCam_SetPlayback(int active, float* eye, float* at, float roll, float fov);
+int CinematicCam_WorldToNdc(float* world, float* outNdcX, float* outNdcY);
 }
 
 // ---------------------------------------------------------------------------
@@ -34,6 +35,7 @@ static float sPlayhead = 0.0f;        // seconds
 static float sPlaySpeed = 1.0f;
 static char sFilename[64] = "path1";
 static bool sHookRegistered = false;
+static bool sShowPath = true; // draw the spline + markers in the world while the editor is open
 
 // Undo / redo history of the whole keyframe list.
 struct PathSnapshot {
@@ -368,6 +370,93 @@ static void LoadPath() {
 }
 
 // ---------------------------------------------------------------------------
+// In-world overlay
+// ---------------------------------------------------------------------------
+static bool WorldToScreen(const float* world, ImVec2& out) {
+    float ndcX, ndcY;
+    if (!CinematicCam_WorldToNdc((float*)world, &ndcX, &ndcY)) {
+        return false;
+    }
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+
+    // viewProjectionMtxF is built with the original 4:3 aspect (game logic / culling space), but the frame
+    // is rendered at the viewport's real aspect. Correct X so markers track at any screen width.
+    float aspect = (vp->Size.y > 0.0f) ? (vp->Size.x / vp->Size.y) : (4.0f / 3.0f);
+    ndcX *= (4.0f / 3.0f) / aspect;
+
+    // Map NDC into the main viewport's pixel rect (SoH uses multi-viewport ImGui, so the game viewport
+    // is not necessarily at the screen origin).
+    out.x = vp->Pos.x + (ndcX * 0.5f + 0.5f) * vp->Size.x;
+    out.y = vp->Pos.y + (1.0f - (ndcY * 0.5f + 0.5f)) * vp->Size.y;
+    return true;
+}
+
+// Draw the spline, numbered keyframe markers, facing indicators and the playhead over the game view.
+static void DrawWorldOverlay() {
+    if (sKeyframes.empty()) {
+        return;
+    }
+    // Foreground draw list of the game's viewport so the overlay sits on top of the rendered frame.
+    ImDrawList* dl = ImGui::GetForegroundDrawList(ImGui::GetMainViewport());
+
+    // Spline curve.
+    if (sKeyframes.size() >= 2) {
+        float total = EffectiveTotal();
+        const int steps = 120;
+        ImVec2 prev;
+        bool prevValid = false;
+        for (int i = 0; i <= steps; i++) {
+            CineKeyframe s = SampleAt(total * (float)i / (float)steps);
+            ImVec2 sp;
+            if (WorldToScreen(s.eye, sp)) {
+                if (prevValid) {
+                    dl->AddLine(prev, sp, IM_COL32(255, 220, 40, 200), 2.0f);
+                }
+                prev = sp;
+                prevValid = true;
+            } else {
+                prevValid = false;
+            }
+        }
+    }
+
+    // Keyframe markers (numbered) with a short facing indicator.
+    for (int i = 0; i < (int)sKeyframes.size(); i++) {
+        ImVec2 sp;
+        if (!WorldToScreen(sKeyframes[i].eye, sp)) {
+            continue;
+        }
+        bool selected = sIds[i] == sSelectedId;
+        ImU32 col = selected ? IM_COL32(80, 200, 255, 255) : IM_COL32(255, 160, 30, 255);
+        float r = selected ? 7.0f : 5.0f;
+        dl->AddCircleFilled(sp, r, col);
+        dl->AddCircle(sp, r, IM_COL32(0, 0, 0, 200), 0, 1.5f);
+        char num[8];
+        snprintf(num, sizeof(num), "%d", i + 1);
+        dl->AddText(ImVec2(sp.x + 9.0f, sp.y - 9.0f), IM_COL32(255, 255, 255, 255), num);
+
+        // Facing indicator: a short line toward the look-at point.
+        float facing[3] = { sKeyframes[i].eye[0] + (sKeyframes[i].at[0] - sKeyframes[i].eye[0]) * 0.4f,
+                            sKeyframes[i].eye[1] + (sKeyframes[i].at[1] - sKeyframes[i].eye[1]) * 0.4f,
+                            sKeyframes[i].eye[2] + (sKeyframes[i].at[2] - sKeyframes[i].eye[2]) * 0.4f };
+        ImVec2 fp;
+        if (WorldToScreen(facing, fp)) {
+            dl->AddLine(sp, fp, IM_COL32(120, 255, 120, 150), 1.5f);
+        }
+    }
+
+    // Playhead.
+    if (sPlaying || sPreview) {
+        CineKeyframe s = SampleAt(sPlayhead);
+        ImVec2 sp;
+        if (WorldToScreen(s.eye, sp)) {
+            dl->AddCircleFilled(sp, 6.0f, IM_COL32(60, 255, 90, 255));
+            dl->AddCircle(sp, 6.0f, IM_COL32(0, 0, 0, 200), 0, 1.5f);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Window
 // ---------------------------------------------------------------------------
 void CinematicCamPathWindow::InitElement() {
@@ -386,6 +475,12 @@ void CinematicCamPathWindow::DrawElement() {
     bool enabled = FreeCamEnabled();
     if (ImGui::Checkbox("Enable Free Camera", &enabled)) {
         CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), enabled);
+    }
+    ImGui::SameLine();
+    ImGui::Checkbox("Show path in world", &sShowPath);
+
+    if (sShowPath) {
+        DrawWorldOverlay();
     }
 
     ImGui::BeginDisabled(!enabled);

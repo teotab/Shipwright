@@ -7595,6 +7595,28 @@ void CinematicCam_SetPlayback(s32 active, f32* eye, f32* at, f32 roll, f32 fov) 
     }
 }
 
+// Project a world point to normalized device coords (-1..1, +Y up) for the path editor's in-world overlay.
+// Returns 0 if there is no active play state or the point is behind the camera.
+s32 CinematicCam_WorldToNdc(f32* world, f32* outNdcX, f32* outNdcY) {
+    Vec3f w;
+    Vec3f proj;
+    f32 clipW;
+
+    if (gPlayState == NULL) {
+        return 0;
+    }
+    w.x = world[0];
+    w.y = world[1];
+    w.z = world[2];
+    SkinMatrix_Vec3fMtxFMultXYZW(&gPlayState->viewProjectionMtxF, &w, &proj, &clipW);
+    if (clipW <= 0.0f) {
+        return 0; // behind the camera
+    }
+    *outNdcX = proj.x / clipW;
+    *outNdcY = proj.y / clipW;
+    return 1;
+}
+
 static void CinematicCam_Update(Camera* camera) {
     OSContPad* cur = &gCineCamInput.cur; // captured input, isolated from the rest of the game
     VecSph forwardSph;
