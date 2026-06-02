@@ -39,12 +39,13 @@ static bool sShowPath = true;   // draw the spline + markers in the world while 
 static bool sShowFields = false; // show numeric position/rotation fields for the selected keyframe
 
 // Transform gizmo state for the selected keyframe.
-enum GizmoMode { GIZMO_MOVE = 0, GIZMO_ROTATE = 1 };
+enum GizmoMode { GIZMO_MOVE = 0, GIZMO_ROTATE = 1, GIZMO_BEND = 2 };
 static int sGizmoMode = GIZMO_MOVE;
 static int sDragKfId = -1;      // keyframe id currently being manipulated by the gizmo, or -1
 static int sDragKind = 0;       // 0 = translate, 1 = rotate (snapshot of mode at grab time)
 static int sDragAxis = -1;      // which axis/ring: 0=X/yaw, 1=Y/pitch, 2=Z/roll
 static float sRotPrevAngle = 0.0f;
+static float sDragPitchAxis[3] = { 1.0f, 0.0f, 0.0f }; // pitch rotation axis, captured at drag start (stable)
 
 // Undo / redo history of the whole keyframe list.
 struct PathSnapshot {
@@ -130,6 +131,8 @@ static void SortByTime() {
     sIds = std::move(ids);
 }
 
+static float v3len(const float* a); // defined with the gizmo vector helpers below
+
 // Kochanek-Bartels (TCB) Hermite interpolation for one scalar component over a segment p1 -> p2.
 // tcB = TCB params at p1 (segment source), tcC = TCB params at p2 (segment destination).
 // With all params 0 this reduces exactly to Catmull-Rom.
@@ -157,6 +160,28 @@ static float InterpComp(float p0, float p1, float p2, float p3, const CineKeyfra
     }
     return TcbHermite(p0, p1, p2, p3, kSrc.tension, kSrc.continuity, kSrc.bias, kDst.tension, kDst.continuity,
                       kDst.bias, s);
+}
+
+// 3D TCB outgoing tangent at p1 (start of a segment) and incoming tangent at p2 (end of a segment).
+static void TcbOutTangent3(const float* p0, const float* p1, const float* p2, float t, float c, float b, float* o) {
+    float w1 = (1.0f - t) * (1.0f + c) * (1.0f + b) * 0.5f;
+    float w2 = (1.0f - t) * (1.0f - c) * (1.0f - b) * 0.5f;
+    for (int k = 0; k < 3; k++) {
+        o[k] = w1 * (p1[k] - p0[k]) + w2 * (p2[k] - p1[k]);
+    }
+}
+static void TcbInTangent3(const float* p1, const float* p2, const float* p3, float t, float c, float b, float* o) {
+    float w1 = (1.0f - t) * (1.0f - c) * (1.0f + b) * 0.5f;
+    float w2 = (1.0f - t) * (1.0f + c) * (1.0f - b) * 0.5f;
+    for (int k = 0; k < 3; k++) {
+        o[k] = w1 * (p2[k] - p1[k]) + w2 * (p3[k] - p2[k]);
+    }
+}
+static float Hermite1(float p1, float p2, float m0, float m1, float s) {
+    float s2 = s * s;
+    float s3 = s2 * s;
+    return (2.0f * s3 - 3.0f * s2 + 1.0f) * p1 + (s3 - 2.0f * s2 + s) * m0 + (-2.0f * s3 + 3.0f * s2) * p2 +
+           (s3 - s2) * m1;
 }
 
 // Smooth pose at an absolute time along the timeline. When looping, the path is treated as cyclic: a
@@ -231,8 +256,36 @@ static CineKeyframe SampleAt(float time) {
     const CineKeyframe& b = sKeyframes[i1];
     const CineKeyframe& c = sKeyframes[i2];
     const CineKeyframe& d = sKeyframes[i3];
+
+    // Eye (spatial path): Hermite with TCB tangents, but honor any custom tangent (Bend) at either end.
+    // Linear segments stay straight.
+    if (b.interp == CINE_INTERP_LINEAR) {
+        for (int k = 0; k < 3; k++) {
+            out.eye[k] = b.eye[k] + (c.eye[k] - b.eye[k]) * lt;
+        }
+    } else {
+        float td[3], ts[3];
+        TcbOutTangent3(a.eye, b.eye, c.eye, b.tension, b.continuity, b.bias, td); // out tangent at b
+        TcbInTangent3(b.eye, c.eye, d.eye, c.tension, c.continuity, c.bias, ts);  // in tangent at c
+        if (b.hasTangent) {
+            float m = v3len(td);
+            td[0] = b.tangent[0] * m;
+            td[1] = b.tangent[1] * m;
+            td[2] = b.tangent[2] * m;
+        }
+        if (c.hasTangent) {
+            float m = v3len(ts);
+            ts[0] = c.tangent[0] * m;
+            ts[1] = c.tangent[1] * m;
+            ts[2] = c.tangent[2] * m;
+        }
+        for (int k = 0; k < 3; k++) {
+            out.eye[k] = Hermite1(b.eye[k], c.eye[k], td[k], ts[k], lt);
+        }
+    }
+
+    // Aim (at), roll, FOV: independent per-scalar interpolation (unaffected by the spatial tangent).
     for (int k = 0; k < 3; k++) {
-        out.eye[k] = InterpComp(a.eye[k], b.eye[k], c.eye[k], d.eye[k], b, c, lt);
         out.at[k] = InterpComp(a.at[k], b.at[k], c.at[k], d.at[k], b, c, lt);
     }
     out.roll = InterpComp(a.roll, b.roll, c.roll, d.roll, b, c, lt);
@@ -335,7 +388,9 @@ static void SavePath() {
                       { "interp", k.interp },
                       { "tension", k.tension },
                       { "continuity", k.continuity },
-                      { "bias", k.bias } });
+                      { "bias", k.bias },
+                      { "hasTangent", k.hasTangent },
+                      { "tangent", { k.tangent[0], k.tangent[1], k.tangent[2] } } });
     }
     std::filesystem::create_directories("cinematics");
     std::ofstream f(std::string("cinematics/") + sFilename + ".json");
@@ -371,6 +426,16 @@ static void LoadPath() {
         k.tension = e.value("tension", 0.0f);
         k.continuity = e.value("continuity", 0.0f);
         k.bias = e.value("bias", 0.0f);
+        k.hasTangent = e.value("hasTangent", 0);
+        if (e.contains("tangent")) {
+            k.tangent[0] = e["tangent"][0];
+            k.tangent[1] = e["tangent"][1];
+            k.tangent[2] = e["tangent"][2];
+        } else {
+            k.tangent[0] = 0.0f;
+            k.tangent[1] = 0.0f;
+            k.tangent[2] = 1.0f;
+        }
         sKeyframes.push_back(k);
         sIds.push_back(sNextId++);
     }
@@ -521,11 +586,13 @@ static void GetYawPitch(const CineKeyframe& k, float& yawDeg, float& pitchDeg, f
 // Write a keyframe's orientation from yaw/pitch (degrees), preserving the eye->at distance. Pitch is
 // clamped shy of vertical so the look direction can never cross straight up/down (avoids gimbal flips).
 static void SetYawPitch(CineKeyframe& k, float yawDeg, float pitchDeg, float dist) {
-    if (pitchDeg > 85.0f) {
-        pitchDeg = 85.0f;
+    // Only used by the numeric fields, where yaw/pitch is an Euler decomposition; cap just shy of vertical
+    // to avoid the yaw singularity. The gizmo rotates the look vector directly and has full range.
+    if (pitchDeg > 89.9f) {
+        pitchDeg = 89.9f;
     }
-    if (pitchDeg < -85.0f) {
-        pitchDeg = -85.0f;
+    if (pitchDeg < -89.9f) {
+        pitchDeg = -89.9f;
     }
     float y = yawDeg * kPi / 180.0f;
     float p = pitchDeg * kPi / 180.0f;
@@ -563,6 +630,108 @@ static const ImU32 kMoveCol[3] = { IM_COL32(235, 80, 80, 255), IM_COL32(90, 220,
                                    IM_COL32(90, 150, 255, 255) }; // X, Y, Z
 static const ImU32 kRotCol[3] = { IM_COL32(90, 220, 90, 255), IM_COL32(235, 80, 80, 255),
                                   IM_COL32(90, 150, 255, 255) }; // yaw, pitch, roll
+static const ImU32 kBendCol[2] = { IM_COL32(230, 130, 255, 255), IM_COL32(255, 170, 60, 255) }; // bend rings
+
+static void RingBasis(const float* k, float u[3], float v[3]); // defined below
+
+// The natural Catmull-Rom tangent direction of the spatial path at keyframe idx.
+static void AutoTangentDir(int idx, float out[3]) {
+    int n = (int)sKeyframes.size();
+    int prev = idx - 1, next = idx + 1;
+    if (sLoop) {
+        prev = (idx - 1 + n) % n;
+        next = (idx + 1) % n;
+    } else {
+        if (prev < 0) {
+            prev = idx;
+        }
+        if (next >= n) {
+            next = idx;
+        }
+    }
+    v3sub(sKeyframes[next].eye, sKeyframes[prev].eye, out);
+    if (v3len(out) < 1e-4f) {
+        out[0] = 0.0f;
+        out[1] = 0.0f;
+        out[2] = 1.0f;
+    }
+    v3norm(out);
+}
+
+// The tangent direction in use at keyframe idx (custom if set, otherwise the automatic one).
+static void BendTangentDir(int idx, float out[3]) {
+    if (sKeyframes[idx].hasTangent) {
+        out[0] = sKeyframes[idx].tangent[0];
+        out[1] = sKeyframes[idx].tangent[1];
+        out[2] = sKeyframes[idx].tangent[2];
+        v3norm(out);
+    } else {
+        AutoTangentDir(idx, out);
+    }
+}
+
+// The two ring axes used by Bend mode (rotate the tangent direction).
+static void BendAxes(const float* tdir, float yawAxis[3], float pitchAxis[3]) {
+    yawAxis[0] = 0.0f;
+    yawAxis[1] = 1.0f;
+    yawAxis[2] = 0.0f;
+    v3cross(yawAxis, tdir, pitchAxis);
+    if (v3len(pitchAxis) < 1e-3f) {
+        pitchAxis[0] = 1.0f;
+        pitchAxis[1] = 0.0f;
+        pitchAxis[2] = 0.0f;
+    }
+    v3norm(pitchAxis);
+}
+
+// Draw a world-space ring (circle in the plane perpendicular to axis) as a screen polyline.
+static void DrawRing(ImDrawList* dl, const float* center, const float* axis, float R, ImU32 col, float thick) {
+    float u[3], v[3];
+    RingBasis(axis, u, v);
+    const int SEG = 48;
+    ImVec2 prev;
+    bool pv = false;
+    for (int s = 0; s <= SEG; s++) {
+        float t = (float)s / SEG * 6.2831853f;
+        float cs = std::cos(t), sn = std::sin(t);
+        float p[3] = { center[0] + (u[0] * cs + v[0] * sn) * R, center[1] + (u[1] * cs + v[1] * sn) * R,
+                       center[2] + (u[2] * cs + v[2] * sn) * R };
+        ImVec2 sp;
+        if (WorldToScreen(p, sp)) {
+            if (pv) {
+                dl->AddLine(prev, sp, col, thick);
+            }
+            prev = sp;
+            pv = true;
+        } else {
+            pv = false;
+        }
+    }
+}
+
+// Minimum screen distance from m to a world-space ring (for hit-testing).
+static float RingHitDist(const float* center, const float* axis, float R, ImVec2 m) {
+    float u[3], v[3];
+    RingBasis(axis, u, v);
+    const int SEG = 48;
+    float best = 1e9f;
+    for (int s = 0; s < SEG; s++) {
+        float t = (float)s / SEG * 6.2831853f;
+        float cs = std::cos(t), sn = std::sin(t);
+        float p[3] = { center[0] + (u[0] * cs + v[0] * sn) * R, center[1] + (u[1] * cs + v[1] * sn) * R,
+                       center[2] + (u[2] * cs + v[2] * sn) * R };
+        ImVec2 sp;
+        if (!WorldToScreen(p, sp)) {
+            continue;
+        }
+        float dx = sp.x - m.x, dy = sp.y - m.y;
+        float d = std::sqrt(dx * dx + dy * dy);
+        if (d < best) {
+            best = d;
+        }
+    }
+    return best;
+}
 
 // Compute the perpendicular ring basis (u, v) for a rotation axis.
 static void RingBasis(const float* k, float u[3], float v[3]) {
@@ -598,7 +767,7 @@ static void DrawGizmo(ImDrawList* dl, int idx) {
             dl->AddLine(origin, ep, c, hot ? 3.5f : 2.5f);
             dl->AddCircleFilled(ep, 4.0f, c);
         }
-    } else {
+    } else if (sGizmoMode == GIZMO_ROTATE) {
         float R = GizmoScale(k.eye, 60.0f);
         if (R <= 0.0f) {
             return;
@@ -606,30 +775,32 @@ static void DrawGizmo(ImDrawList* dl, int idx) {
         float axesK[3][3];
         RotationAxes(k, axesK[0], axesK[1], axesK[2]);
         for (int a = 0; a < 3; a++) {
-            float u[3], v[3];
-            RingBasis(axesK[a], u, v);
             bool hot = (sDragKfId == sIds[idx] && sDragKind == 1 && sDragAxis == a);
-            ImU32 c = hot ? IM_COL32(255, 255, 120, 255) : kRotCol[a];
-            const int SEG = 48;
-            ImVec2 prev;
-            bool pv = false;
-            for (int s = 0; s <= SEG; s++) {
-                float t = (float)s / SEG * 6.2831853f;
-                float cs = std::cos(t), sn = std::sin(t);
-                float p[3] = { k.eye[0] + (u[0] * cs + v[0] * sn) * R, k.eye[1] + (u[1] * cs + v[1] * sn) * R,
-                               k.eye[2] + (u[2] * cs + v[2] * sn) * R };
-                ImVec2 sp;
-                if (WorldToScreen(p, sp)) {
-                    if (pv) {
-                        dl->AddLine(prev, sp, c, hot ? 3.0f : 2.0f);
-                    }
-                    prev = sp;
-                    pv = true;
-                } else {
-                    pv = false;
-                }
-            }
+            DrawRing(dl, k.eye, axesK[a], R, hot ? IM_COL32(255, 255, 120, 255) : kRotCol[a], hot ? 3.0f : 2.0f);
         }
+    } else { // GIZMO_BEND: rotate the spatial tangent (bends the curve), independent of camera aim
+        float R = GizmoScale(k.eye, 60.0f);
+        float L = GizmoScale(k.eye, 70.0f);
+        if (R <= 0.0f || L <= 0.0f) {
+            return;
+        }
+        float tdir[3];
+        BendTangentDir(idx, tdir);
+        // Tangent handle line through the keyframe (both directions), like a Bezier handle.
+        float hp[3], hn[3];
+        v3mad(k.eye, tdir, L, hp);
+        v3mad(k.eye, tdir, -L, hn);
+        ImVec2 sp, sn;
+        if (WorldToScreen(hp, sp) && WorldToScreen(hn, sn)) {
+            dl->AddLine(sn, sp, IM_COL32(230, 130, 255, 220), 2.0f);
+            dl->AddCircleFilled(sp, 4.0f, IM_COL32(230, 130, 255, 255));
+        }
+        float yawAxis[3], pitchAxis[3];
+        BendAxes(tdir, yawAxis, pitchAxis);
+        bool hot0 = (sDragKfId == sIds[idx] && sDragKind == 2 && sDragAxis == 0);
+        bool hot1 = (sDragKfId == sIds[idx] && sDragKind == 2 && sDragAxis == 1);
+        DrawRing(dl, k.eye, yawAxis, R, hot0 ? IM_COL32(255, 255, 120, 255) : kBendCol[0], hot0 ? 3.0f : 2.0f);
+        DrawRing(dl, k.eye, pitchAxis, R, hot1 ? IM_COL32(255, 255, 120, 255) : kBendCol[1], hot1 ? 3.0f : 2.0f);
     }
 }
 
@@ -668,7 +839,7 @@ static bool GizmoTryStart(int idx, ImVec2 m) {
             sDragAxis = best;
             return true;
         }
-    } else {
+    } else if (sGizmoMode == GIZMO_ROTATE) {
         float R = GizmoScale(k.eye, 60.0f);
         if (R <= 0.0f) {
             return false;
@@ -678,24 +849,10 @@ static bool GizmoTryStart(int idx, ImVec2 m) {
         int best = -1;
         float bestd = 8.0f;
         for (int a = 0; a < 3; a++) {
-            float u[3], v[3];
-            RingBasis(axesK[a], u, v);
-            const int SEG = 48;
-            for (int s = 0; s < SEG; s++) {
-                float t = (float)s / SEG * 6.2831853f;
-                float cs = std::cos(t), sn = std::sin(t);
-                float p[3] = { k.eye[0] + (u[0] * cs + v[0] * sn) * R, k.eye[1] + (u[1] * cs + v[1] * sn) * R,
-                               k.eye[2] + (u[2] * cs + v[2] * sn) * R };
-                ImVec2 sp;
-                if (!WorldToScreen(p, sp)) {
-                    continue;
-                }
-                float dx = sp.x - m.x, dy = sp.y - m.y;
-                float d = std::sqrt(dx * dx + dy * dy);
-                if (d < bestd) {
-                    bestd = d;
-                    best = a;
-                }
+            float d = RingHitDist(k.eye, axesK[a], R, m);
+            if (d < bestd) {
+                bestd = d;
+                best = a;
             }
         }
         if (best >= 0) {
@@ -704,6 +861,49 @@ static bool GizmoTryStart(int idx, ImVec2 m) {
             sDragKind = 1;
             sDragAxis = best;
             sRotPrevAngle = std::atan2(m.y - origin.y, m.x - origin.x);
+            // Capture a stable pitch axis now; recomputing it each frame degenerates near vertical.
+            sDragPitchAxis[0] = axesK[1][0];
+            sDragPitchAxis[1] = axesK[1][1];
+            sDragPitchAxis[2] = axesK[1][2];
+            return true;
+        }
+    } else { // GIZMO_BEND
+        float R = GizmoScale(k.eye, 60.0f);
+        if (R <= 0.0f) {
+            return false;
+        }
+        float tdir[3];
+        BendTangentDir(idx, tdir);
+        float yawAxis[3], pitchAxis[3];
+        BendAxes(tdir, yawAxis, pitchAxis);
+        int best = -1;
+        float bestd = 8.0f;
+        float d0 = RingHitDist(k.eye, yawAxis, R, m);
+        float d1 = RingHitDist(k.eye, pitchAxis, R, m);
+        if (d0 < bestd) {
+            bestd = d0;
+            best = 0;
+        }
+        if (d1 < bestd) {
+            bestd = d1;
+            best = 1;
+        }
+        if (best >= 0) {
+            PushUndo();
+            CineKeyframe& kf = sKeyframes[idx];
+            if (!kf.hasTangent) { // lock in the current (auto) tangent so rotation starts from it
+                kf.tangent[0] = tdir[0];
+                kf.tangent[1] = tdir[1];
+                kf.tangent[2] = tdir[2];
+                kf.hasTangent = 1;
+            }
+            sDragKfId = sIds[idx];
+            sDragKind = 2;
+            sDragAxis = best;
+            sRotPrevAngle = std::atan2(m.y - origin.y, m.x - origin.x);
+            sDragPitchAxis[0] = pitchAxis[0];
+            sDragPitchAxis[1] = pitchAxis[1];
+            sDragPitchAxis[2] = pitchAxis[2];
             return true;
         }
     }
@@ -767,19 +967,38 @@ static void GizmoContinue() {
         }
         sRotPrevAngle = ang;
 
-        if (sDragAxis == 2) {
-            k.roll += d * (180.0f / kPi); // roll in degrees
+        // Rotation axis: yaw around world up, pitch around the stable axis captured at drag start
+        // (recomputing it each frame degenerates near vertical).
+        float axis[3];
+        if (sDragAxis == 0) {
+            axis[0] = 0.0f;
+            axis[1] = 1.0f;
+            axis[2] = 0.0f;
         } else {
-            // Apply yaw/pitch in angle space so pitch can be clamped shy of vertical (no gimbal flip).
-            float yaw, pitch, dist;
-            GetYawPitch(k, yaw, pitch, dist);
-            float dDeg = d * (180.0f / kPi);
-            if (sDragAxis == 0) {
-                yaw += dDeg;
-            } else {
-                pitch += dDeg;
-            }
-            SetYawPitch(k, yaw, pitch, dist);
+            axis[0] = sDragPitchAxis[0];
+            axis[1] = sDragPitchAxis[1];
+            axis[2] = sDragPitchAxis[2];
+        }
+
+        if (sDragKind == 2) {
+            // Bend: rotate the spatial tangent (reshapes the curve; no effect on aim).
+            float rot[3];
+            v3rot(k.tangent, axis, d, rot);
+            v3norm(rot);
+            k.tangent[0] = rot[0];
+            k.tangent[1] = rot[1];
+            k.tangent[2] = rot[2];
+        } else if (sDragAxis == 2) {
+            k.roll += d * (180.0f / kPi); // aim roll in degrees
+        } else {
+            // Aim: rotate the look vector directly (full pitch range, no clamp, no gimbal).
+            float fwd[3];
+            v3sub(k.at, k.eye, fwd);
+            float rot[3];
+            v3rot(fwd, axis, d, rot);
+            k.at[0] = k.eye[0] + rot[0];
+            k.at[1] = k.eye[1] + rot[1];
+            k.at[2] = k.eye[2] + rot[2];
         }
     }
 }
@@ -938,10 +1157,24 @@ void CinematicCamPathWindow::DrawElement() {
         ImGui::SameLine();
         ImGui::RadioButton("Move", &sGizmoMode, GIZMO_MOVE);
         ImGui::SameLine();
-        ImGui::RadioButton("Rotate", &sGizmoMode, GIZMO_ROTATE);
-        ImGui::TextDisabled(sGizmoMode == GIZMO_MOVE
-                                ? "Drag the red/green/blue axes in the world to move the keyframe. Click a marker to select."
-                                : "Drag the rings to rotate: green=yaw, red=pitch, blue=roll. Click a marker to select.");
+        ImGui::RadioButton("Rotate (aim)", &sGizmoMode, GIZMO_ROTATE);
+        ImGui::SameLine();
+        ImGui::RadioButton("Bend (path)", &sGizmoMode, GIZMO_BEND);
+        if (sGizmoMode == GIZMO_MOVE) {
+            ImGui::TextDisabled("Drag the red/green/blue axes to move the keyframe. Click a marker to select.");
+        } else if (sGizmoMode == GIZMO_ROTATE) {
+            ImGui::TextDisabled("Drag the rings to aim the camera: green=yaw, red=pitch, blue=roll.");
+        } else {
+            ImGui::TextDisabled("Drag the rings to bend the path through this point (spline tangent). "
+                                "Does not affect camera aim.");
+            int si = SelectedIndex();
+            if (si >= 0 && sKeyframes[si].hasTangent) {
+                if (ImGui::SmallButton("Reset tangent")) {
+                    PushUndo();
+                    sKeyframes[si].hasTangent = 0;
+                }
+            }
+        }
     }
 
     ImGui::BeginDisabled(!enabled);

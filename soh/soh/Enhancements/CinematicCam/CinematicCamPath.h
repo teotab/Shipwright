@@ -22,6 +22,11 @@ struct CineKeyframe {
     float tension;     // -1..1: -1 rounder/looser, +1 tighter/straighter
     float continuity;  // -1..1: sharpness of the corner through the keyframe
     float bias;        // -1..1: lean the curve toward the previous (+) or next (-) keyframe
+
+    // Optional custom spline tangent (the direction the spatial curve passes through this point), edited
+    // with the Bend gizmo. Like a Bezier handle; bends the curve on both sides. Independent of camera aim.
+    int hasTangent;    // 0 = automatic tangent, 1 = use the custom direction below
+    float tangent[3];  // unit direction
 };
 
 // Editor window for building and playing back cinematic camera paths.
