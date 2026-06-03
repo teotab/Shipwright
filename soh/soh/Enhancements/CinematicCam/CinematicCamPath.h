@@ -50,7 +50,7 @@ class CinematicCamPathWindow final : public Ship::GuiWindow {
   protected:
     void InitElement() override;
     void DrawElement() override;
-    void UpdateElement() override {};
+    void UpdateElement() override; // draws the always-on letterbox
 };
 
 #endif // CINEMATIC_CAM_PATH_H

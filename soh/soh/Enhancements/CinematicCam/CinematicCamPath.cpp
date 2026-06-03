@@ -40,6 +40,21 @@ static float sPlaySpeed = 1.0f;
 static char sFilename[64] = "path1";
 static char sSpectateName[64] = ""; // display name of the spectated actor
 static bool sHookRegistered = false;
+
+static int sEaseMode = 1;     // playback timing easing: 0 none, 1 in/out, 2 in, 3 out
+static float sEaseAmount = 0.5f; // 0 = linear, 1 = full ease
+static float sPlayU = 0.0f;   // linear play progress 0..1, eased into the playhead
+
+// Path-level aim override: when set, every keyframe aims at this target instead of its own.
+static int sAimOverride = 0;             // 0 none, 1 Link, 2 point, 3 actor
+static float sAimOverridePoint[3] = { 0.0f, 0.0f, 0.0f };
+static int sAimOverrideActorId = 0;
+static void* sAimOverrideActorPtr = nullptr;
+
+static bool sRecording = false; // recording the live freecam into keyframes
+static float sRecordTime = 0.0f;
+static float sRecordLast = 0.0f;
+static float sRecordInterval = 0.2f; // seconds between recorded keyframes
 static bool sShowPath = true;   // draw the spline + markers in the world while the editor is open
 static bool sShowFields = false; // show numeric position/rotation fields for the selected keyframe
 
@@ -194,6 +209,30 @@ static float Hermite1(float p1, float p2, float m0, float m1, float s) {
 // A keyframe's effective look-at point this frame: the stored point for free/point aim, or Link's live
 // position for player aim.
 static void EffectiveAt(int idx, float out[3]) {
+    // Path-level override aims every keyframe at one target (great for fixing up recorded paths at once).
+    if (sAimOverride == 1) {
+        float p[3];
+        if (CinematicCam_GetPlayerPos(p)) {
+            out[0] = p[0];
+            out[1] = p[1];
+            out[2] = p[2];
+            return;
+        }
+    } else if (sAimOverride == 2) {
+        out[0] = sAimOverridePoint[0];
+        out[1] = sAimOverridePoint[1];
+        out[2] = sAimOverridePoint[2];
+        return;
+    } else if (sAimOverride == 3) {
+        float p[3];
+        if (CinematicCam_ResolveActor(&sAimOverrideActorPtr, (short)sAimOverrideActorId, p)) {
+            out[0] = p[0];
+            out[1] = p[1];
+            out[2] = p[2];
+            return;
+        }
+    }
+
     CineKeyframe& k = sKeyframes[idx];
     if (k.aimMode == CINE_AIM_PLAYER) {
         float p[3];
@@ -332,25 +371,76 @@ static CineKeyframe SampleAt(float time) {
     return out;
 }
 
+// Playback timing easing applied to the 0..1 progress.
+static float ApplyEase(float u, int mode) {
+    if (u < 0.0f) {
+        u = 0.0f;
+    }
+    if (u > 1.0f) {
+        u = 1.0f;
+    }
+    switch (mode) {
+        case 1:
+            return u * u * (3.0f - 2.0f * u); // smoothstep (ease in + out)
+        case 2:
+            return u * u; // ease in
+        case 3:
+            return 1.0f - (1.0f - u) * (1.0f - u); // ease out
+        default:
+            return u; // none
+    }
+}
+
+// Append a keyframe capturing the current live freecam pose at time t (used by recording).
+static void RecordKeyframe(float t) {
+    CineKeyframe kf{};
+    CinematicCam_GetPose(kf.eye, kf.at, &kf.roll, &kf.fov);
+    if (kf.fov < 1.0f) {
+        kf.fov = 60.0f;
+    }
+    kf.time = t;
+    sKeyframes.push_back(kf);
+    sIds.push_back(sNextId++);
+}
+
 // Runs every game frame (OnCameraState hook), just before Camera_Update.
 static void PlaybackTick() {
     static bool wasActive = false;
+
+    // Recording: lay down keyframes from the live freecam at a fixed interval.
+    if (sRecording) {
+        sRecordTime += kTickSeconds;
+        if (sRecordTime - sRecordLast >= sRecordInterval) {
+            RecordKeyframe(sRecordTime);
+            sRecordLast = sRecordTime;
+        }
+    }
 
     if (sPlaying) {
         if (sKeyframes.size() < 2) {
             sPlaying = false;
         } else {
-            sPlayhead += kTickSeconds * sPlaySpeed;
             float total = EffectiveTotal();
-            if (sPlayhead >= total) {
-                if (sLoop && total > 0.0f) {
-                    sPlayhead = std::fmod(sPlayhead, total);
+            float denom = (total > 0.0f) ? total : 1.0f;
+            sPlayU += (kTickSeconds * sPlaySpeed) / denom;
+            if (sPlayU >= 1.0f) {
+                if (sLoop) {
+                    sPlayU = std::fmod(sPlayU, 1.0f);
                 } else {
-                    sPlayhead = TotalTime();
+                    sPlayU = 1.0f;
                     sPlaying = false;
                 }
             }
+            float eu = ApplyEase(sPlayU, sEaseMode);
+            eu = sPlayU + (eu - sPlayU) * sEaseAmount; // blend toward linear by the ease amount
+            sPlayhead = eu * total;
         }
+    }
+
+    // Pushing the movement stick while previewing (and not letting Link drive) drops back to manual flying.
+    if (sPreview && !sPlaying && !CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.PlaybackControlsLink"), 0) &&
+        CinematicCam_GetMoveStickActive()) {
+        sPreview = false;
     }
 
     bool active = (sPlaying || sPreview) && !sKeyframes.empty();
@@ -362,6 +452,19 @@ static void PlaybackTick() {
         float z[3] = { 0.0f, 0.0f, 0.0f };
         CinematicCam_SetPlayback(0, z, z, 0.0f, 0.0f);
         wasActive = false;
+    }
+
+    // Hide the HUD while the cinematic camera is active (reuses SoH's NoUI state). Only clear what we set,
+    // so an independently-enabled "no UI" isn't disturbed.
+    static bool sWeHidHud = false;
+    bool camActive = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 0) || active;
+    bool hideHud = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.HideHud"), 1) != 0;
+    if (camActive && hideHud) {
+        GameInteractor::State::NoUIActive = 1;
+        sWeHidHud = true;
+    } else if (sWeHidHud) {
+        GameInteractor::State::NoUIActive = 0;
+        sWeHidHud = false;
     }
 }
 
@@ -1354,6 +1457,149 @@ static int DrawActorPickerList(CineActorInfo* buf, int n) {
     return picked;
 }
 
+// A timeline track: keyframe markers (drag to retime, click to select), a draggable playhead, and the
+// loop-return region shaded. Replaces the plain slider.
+static void DrawTimeline() {
+    int n = (int)sKeyframes.size();
+    float total = EffectiveTotal();
+    if (total <= 0.0f) {
+        total = 1.0f;
+    }
+
+    ImVec2 size = ImVec2(ImGui::GetContentRegionAvail().x, 46.0f);
+    if (size.x < 60.0f) {
+        size.x = 60.0f;
+    }
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##timeline", size);
+    ImVec2 p1 = ImVec2(p0.x + size.x, p0.y + size.y);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p0, p1, IM_COL32(35, 35, 38, 255), 4.0f);
+    dl->AddRect(p0, p1, IM_COL32(90, 90, 95, 255), 4.0f);
+
+    auto timeToX = [&](float t) { return p0.x + (t / total) * size.x; };
+    auto xToTime = [&](float x) {
+        float u = (x - p0.x) / size.x;
+        if (u < 0.0f) {
+            u = 0.0f;
+        }
+        if (u > 1.0f) {
+            u = 1.0f;
+        }
+        return u * total;
+    };
+
+    if (sLoop && n >= 2) { // shade the loop-return tail
+        float lx = timeToX(TotalTime());
+        dl->AddRectFilled(ImVec2(lx, p0.y + 1), ImVec2(p1.x - 1, p1.y - 1), IM_COL32(80, 60, 30, 90), 4.0f);
+    }
+
+    float cy = (p0.y + p1.y) * 0.5f;
+    for (int i = 0; i < n; i++) {
+        float kx = timeToX(sKeyframes[i].time);
+        bool sel = sIds[i] == sSelectedId;
+        ImU32 c = sel ? IM_COL32(80, 200, 255, 255) : IM_COL32(255, 160, 30, 255);
+        dl->AddLine(ImVec2(kx, p0.y + 4), ImVec2(kx, p1.y - 4), c, sel ? 2.0f : 1.0f);
+        dl->AddCircleFilled(ImVec2(kx, cy), sel ? 6.0f : 5.0f, c);
+        dl->AddCircle(ImVec2(kx, cy), sel ? 6.0f : 5.0f, IM_COL32(0, 0, 0, 180), 0, 1.0f);
+    }
+
+    float px = timeToX(sPlayhead);
+    dl->AddLine(ImVec2(px, p0.y), ImVec2(px, p1.y), IM_COL32(60, 255, 90, 255), 2.0f);
+    dl->AddTriangleFilled(ImVec2(px - 5, p0.y + 1), ImVec2(px + 5, p0.y + 1), ImVec2(px, p0.y + 9),
+                          IM_COL32(60, 255, 90, 255));
+
+    // Interaction: grab a nearby marker to retime it, otherwise scrub the playhead.
+    static int sTlDragKfId = -1;
+    static bool sTlScrub = false;
+    static float sTlGrabOffset = 0.0f; // marker time minus grab time, so a click doesn't snap the marker
+    float mx = ImGui::GetIO().MousePos.x;
+    if (ImGui::IsItemActivated()) {
+        int hit = -1;
+        float hitd = 8.0f;
+        for (int i = 0; i < n; i++) {
+            float d = std::fabs(timeToX(sKeyframes[i].time) - mx);
+            if (d < hitd) {
+                hitd = d;
+                hit = i;
+            }
+        }
+        if (hit >= 0) {
+            PushUndo();
+            sTlDragKfId = sIds[hit];
+            sSelectedId = sIds[hit];
+            sTlGrabOffset = sKeyframes[hit].time - xToTime(mx);
+            sTlScrub = false;
+        } else {
+            sTlScrub = true;
+            sPreview = true;
+            CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
+        }
+    }
+    if (ImGui::IsItemActive()) {
+        if (sTlDragKfId >= 0) {
+            float t = xToTime(mx) + sTlGrabOffset; // preserve the grab point (no jump on click)
+            for (int i = 0; i < n; i++) {
+                if (sIds[i] == sTlDragKfId) {
+                    sKeyframes[i].time = (t < 0.0f) ? 0.0f : t;
+                    SortByTime();
+                    break;
+                }
+            }
+        } else if (sTlScrub) {
+            sPlayhead = xToTime(mx);
+            sPreview = true;
+            CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
+        }
+    }
+    if (ImGui::IsItemDeactivated()) {
+        sTlDragKfId = -1;
+        sTlScrub = false;
+    }
+
+    // Step controls: prev keyframe, -1 tick, +1 tick, next keyframe.
+    auto setPlayhead = [&](float t) {
+        if (t < 0.0f) {
+            t = 0.0f;
+        }
+        if (t > total) {
+            t = total;
+        }
+        sPlayhead = t;
+        sPreview = true;
+        CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
+    };
+    if (ImGui::SmallButton("|<")) {
+        float best = 0.0f;
+        for (int i = 0; i < n; i++) {
+            if (sKeyframes[i].time < sPlayhead - 1e-3f && sKeyframes[i].time > best) {
+                best = sKeyframes[i].time;
+            }
+        }
+        setPlayhead(best);
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("< tick")) {
+        setPlayhead(sPlayhead - kTickSeconds);
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("tick >")) {
+        setPlayhead(sPlayhead + kTickSeconds);
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton(">|")) {
+        float best = total;
+        for (int i = 0; i < n; i++) {
+            if (sKeyframes[i].time > sPlayhead + 1e-3f && sKeyframes[i].time < best) {
+                best = sKeyframes[i].time;
+            }
+        }
+        setPlayhead(best);
+    }
+    ImGui::SameLine();
+    ImGui::Text("%.2fs / %.2fs%s", sPlayhead, total, sLoop ? " (loop)" : "");
+}
+
 // ---------------------------------------------------------------------------
 // Window
 // ---------------------------------------------------------------------------
@@ -1468,6 +1714,41 @@ void CinematicCamPathWindow::DrawElement() {
     ImGui::SameLine();
     if (ImGui::Button("Clear")) {
         ClearPath();
+    }
+
+    // Record the live freecam motion into keyframes.
+    if (!sRecording) {
+        ImGui::BeginDisabled(!enabled);
+        if (ImGui::Button("Record")) {
+            PushUndo();
+            sKeyframes.clear();
+            sIds.clear();
+            sSelectedId = -1;
+            sPlayhead = 0.0f;
+            sPlaying = false;
+            sPreview = false;
+            sRecording = true;
+            sRecordTime = 0.0f;
+            sRecordLast = 0.0f;
+            CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
+            RecordKeyframe(0.0f); // first keyframe at t=0
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered() && !enabled) {
+            ImGui::SetTooltip("Enable the free camera first.");
+        }
+    } else {
+        if (ImGui::Button("Stop recording")) {
+            sRecording = false;
+            sSelectedId = sIds.empty() ? -1 : sIds[0];
+        }
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(150.0f);
+    ImGui::SliderFloat("Rec interval", &sRecordInterval, 0.05f, 1.0f, "%.2fs");
+    if (sRecording) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "REC %.1fs (%d)", sRecordTime, (int)sKeyframes.size());
     }
 
     ImGui::BeginDisabled(sUndo.empty());
@@ -1712,9 +1993,11 @@ void CinematicCamPathWindow::DrawElement() {
         }
     } else {
         if (ImGui::Button("Play")) {
-            if (sPlayhead >= total) {
+            float pt = EffectiveTotal();
+            if (sPlayhead >= pt) {
                 sPlayhead = 0.0f;
             }
+            sPlayU = (pt > 0.0f) ? (sPlayhead / pt) : 0.0f; // seed eased progress from the current playhead
             sPlaying = true;
             sPreview = false;
             CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
@@ -1747,13 +2030,51 @@ void CinematicCamPathWindow::DrawElement() {
     }
 
     ImGui::SliderFloat("Speed", &sPlaySpeed, 0.1f, 4.0f, "%.2fx");
-    float effTotal = EffectiveTotal();
-    if (ImGui::SliderFloat("Timeline", &sPlayhead, 0.0f, effTotal > 0.0f ? effTotal : 1.0f, "%.2fs")) {
-        // Scrubbing implies previewing so the camera follows the playhead.
-        sPreview = true;
-        CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
+    const char* easeModes[] = { "None", "Ease in/out", "Ease in", "Ease out" };
+    ImGui::SetNextItemWidth(160.0f);
+    ImGui::Combo("Easing", &sEaseMode, easeModes, 4);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Playback timing: accelerate/decelerate the whole move instead of moving at a "
+                          "constant rate. Affects Play only, not scrubbing.");
     }
-    ImGui::Text("Total: %.2fs%s", effTotal, sLoop ? " (incl. loop return)" : "");
+    if (sEaseMode != 0) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::SliderFloat("Amount##ease", &sEaseAmount, 0.0f, 1.0f, "%.2f");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("How strong the easing is (0 = linear, 1 = full).");
+        }
+    }
+
+    // Path-level aim override: aim every keyframe at one target (fixes up recorded paths at once).
+    const char* aimOv[] = { "Per-keyframe (off)", "All look at Link", "All look at point", "All look at actor" };
+    ImGui::SetNextItemWidth(200.0f);
+    ImGui::Combo("Aim override", &sAimOverride, aimOv, 4);
+    if (sAimOverride == 2) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(220.0f);
+        ImGui::InputFloat3("##aimovpt", sAimOverridePoint, "%.0f");
+    } else if (sAimOverride == 3) {
+        ImGui::SameLine();
+        if (ImGui::Button("Pick##aimov")) {
+            ImGui::OpenPopup("Pick override actor");
+        }
+        if (ImGui::BeginPopup("Pick override actor")) {
+            static CineActorInfo oa[512];
+            int pn = CinematicCam_EnumActors(oa, 512);
+            int pick = DrawActorPickerList(oa, pn);
+            if (pick >= 0) {
+                sAimOverrideActorId = oa[pick].id;
+                sAimOverrideActorPtr = oa[pick].ptr;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+        ImGui::SameLine();
+        ImGui::Text("id %d", sAimOverrideActorId);
+    }
+
+    DrawTimeline();
 
     ImGui::Separator();
 
@@ -1785,5 +2106,39 @@ void CinematicCamPathWindow::DrawElement() {
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
+    }
+}
+
+// Called every frame (even when the window is hidden): draw the cinematic letterbox bars and grid overlay.
+void CinematicCamPathWindow::UpdateElement() {
+    bool camActive = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 0) || sPlaying || sPreview;
+    if (!camActive) {
+        return;
+    }
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImDrawList* dl = ImGui::GetForegroundDrawList(vp);
+
+    // Letterbox bars.
+    if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Letterbox"), 0)) {
+        float amount = CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.LetterboxAmount"), 0.12f);
+        if (amount > 0.0f) {
+            float barH = vp->Size.y * amount;
+            dl->AddRectFilled(vp->Pos, ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + barH), IM_COL32(0, 0, 0, 255));
+            dl->AddRectFilled(ImVec2(vp->Pos.x, vp->Pos.y + vp->Size.y - barH),
+                              ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y), IM_COL32(0, 0, 0, 255));
+        }
+    }
+
+    // Composition grid (0=off, 1=3x3, 2=4x4, 3=5x5).
+    int gi = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Grid"), 0);
+    if (gi > 0) {
+        int div = gi + 2; // 1->3, 2->4, 3->5
+        ImU32 col = IM_COL32(255, 255, 255, 70);
+        for (int i = 1; i < div; i++) {
+            float x = vp->Pos.x + vp->Size.x * (float)i / (float)div;
+            float y = vp->Pos.y + vp->Size.y * (float)i / (float)div;
+            dl->AddLine(ImVec2(x, vp->Pos.y), ImVec2(x, vp->Pos.y + vp->Size.y), col, 1.0f);
+            dl->AddLine(ImVec2(vp->Pos.x, y), ImVec2(vp->Pos.x + vp->Size.x, y), col, 1.0f);
+        }
     }
 }

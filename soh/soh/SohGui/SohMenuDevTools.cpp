@@ -264,7 +264,7 @@ void SohMenu::AddMenuDevTools() {
         .CVar(CVAR_ENHANCEMENT("CinematicCam.LookSpeed"))
         .Options(FloatSliderOptions().Min(0.10f).Max(5.0f).DefaultValue(1.0f).Format("%.2f").Tooltip(
             "Right-stick look sensitivity multiplier."));
-    AddWidget(path, "Smoothing: %.0f%%", WIDGET_CVAR_SLIDER_FLOAT)
+    AddWidget(path, "Smoothing", WIDGET_CVAR_SLIDER_FLOAT)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.Smoothing"))
         .Options(FloatSliderOptions().IsPercentage().Min(0.0f).Max(0.95f).DefaultValue(0.5f).Tooltip(
             "Movement and look inertia. 0% is crisp and instant; higher values make the camera accelerate "
@@ -280,6 +280,26 @@ void SohMenu::AddMenuDevTools() {
         .Options(CheckboxOptions().DefaultValue(true).Tooltip(
             "Freeze actors and physics while flying. Turn off to let the action continue (note: the controller "
             "still only drives the camera, not Link)."));
+    AddWidget(path, "Hide HUD", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.HideHud"))
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "Hide the in-game HUD/interface while the cinematic camera is active, for clean shots."));
+    AddWidget(path, "Letterbox bars", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.Letterbox"))
+        .Options(CheckboxOptions().DefaultValue(false).Tooltip(
+            "Draw cinematic black bars at the top and bottom while the cinematic camera is active."));
+    AddWidget(path, "Bar size: %.2f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.LetterboxAmount"))
+        .Options(FloatSliderOptions().Min(0.02f).Max(0.30f).DefaultValue(0.12f).Format("%.2f").Tooltip(
+            "Height of each letterbox bar as a fraction of the screen (0.12 ~= 2.39:1 from 16:9)."))
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Letterbox"), 0); });
+    static const std::map<int32_t, const char*> cineGridModes = {
+        { 0, "Off" }, { 1, "3 x 3 (thirds)" }, { 2, "4 x 4" }, { 3, "5 x 5" }
+    };
+    AddWidget(path, "Composition grid", WIDGET_CVAR_COMBOBOX)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.Grid"))
+        .Options(ComboboxOptions().ComboMap(cineGridModes).DefaultIndex(0).Tooltip(
+            "Overlay a framing grid while the cinematic camera is active (rule-of-thirds and finer)."));
     AddWidget(path, "Extend Draw Distance", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.DisableCulling"))
         .Options(CheckboxOptions().DefaultValue(true).Tooltip(

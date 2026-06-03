@@ -30,6 +30,9 @@ void CinematicCam_SetSpectateActor(void* ptr, int id);
 // Current camera eye position, for distance-sorting the actor pickers. Returns 1 if available.
 int CinematicCam_GetViewEye(float* out);
 
+// Returns 1 if the movement stick is pushed (to drop the editor out of preview into manual flying).
+int CinematicCam_GetMoveStickActive(void);
+
 #ifdef __cplusplus
 }
 #endif

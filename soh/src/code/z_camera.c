@@ -7783,6 +7783,14 @@ s32 CinematicCam_GetPlayerPos(f32* out) {
     return 1;
 }
 
+// Returns 1 if the movement (left) stick is pushed past a deadzone on the captured freecam input. Used to
+// let the stick drop the editor out of preview/scrub back into manual flying.
+s32 CinematicCam_GetMoveStickActive(void) {
+    s32 x = gCineCamInput.cur.stick_x;
+    s32 y = gCineCamInput.cur.stick_y;
+    return (x > 24 || x < -24 || y > 24 || y < -24) ? 1 : 0;
+}
+
 // Current camera eye position (for distance-sorting the actor pickers). Returns 0 if no play state.
 s32 CinematicCam_GetViewEye(f32* out) {
     if (gPlayState == NULL) {
