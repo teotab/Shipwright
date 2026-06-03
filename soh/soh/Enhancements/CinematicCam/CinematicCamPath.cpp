@@ -55,6 +55,9 @@ static bool sRecording = false; // recording the live freecam into keyframes
 static float sRecordTime = 0.0f;
 static float sRecordLast = 0.0f;
 static float sRecordInterval = 0.2f; // seconds between recorded keyframes
+
+static CineKeyframe sClipboard;       // copied keyframe
+static bool sClipboardValid = false;
 static bool sShowPath = true;   // draw the spline + markers in the world while the editor is open
 static bool sShowFields = false; // show numeric position/rotation fields for the selected keyframe
 
@@ -516,6 +519,46 @@ static void ClearPath() {
     sPlayhead = 0.0f;
     sPlaying = false;
     sPreview = false;
+}
+
+static void CopySelected() {
+    int idx = SelectedIndex();
+    if (idx < 0) {
+        return;
+    }
+    sClipboard = sKeyframes[idx];
+    sClipboardValid = true;
+}
+
+// Add a new keyframe at the playhead, either from the clipboard (paste) or sampled from the existing
+// path / live freecam (insert).
+static void AddKeyframeAtPlayhead(const CineKeyframe& kf) {
+    PushUndo();
+    CineKeyframe k = kf;
+    k.time = sPlayhead;
+    k.aimActorPtr = nullptr; // runtime pointer is not copied
+    sKeyframes.push_back(k);
+    sIds.push_back(sNextId);
+    sSelectedId = sNextId;
+    sNextId++;
+    SortByTime();
+}
+
+static void PasteAtPlayhead() {
+    if (!sClipboardValid) {
+        return;
+    }
+    AddKeyframeAtPlayhead(sClipboard);
+}
+
+static void InsertAtPlayhead() {
+    CineKeyframe kf{};
+    if (sKeyframes.size() >= 2) {
+        kf = SampleAt(sPlayhead); // a control point on the existing curve (shape preserved)
+    } else {
+        CinematicCam_GetPose(kf.eye, kf.at, &kf.roll, &kf.fov);
+    }
+    AddKeyframeAtPlayhead(kf);
 }
 
 static void SavePath() {
@@ -1694,6 +1737,7 @@ void CinematicCamPathWindow::DrawElement() {
         }
     }
 
+    ImGui::SeparatorText("Keyframes");
     ImGui::BeginDisabled(!enabled);
     if (ImGui::Button("Add Keyframe")) {
         AddKeyframe();
@@ -1714,6 +1758,30 @@ void CinematicCamPathWindow::DrawElement() {
     ImGui::SameLine();
     if (ImGui::Button("Clear")) {
         ClearPath();
+    }
+
+    // Copy / paste / insert at the playhead.
+    ImGui::BeginDisabled(SelectedIndex() < 0);
+    if (ImGui::Button("Copy")) {
+        CopySelected();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!sClipboardValid);
+    if (ImGui::Button("Paste @ playhead")) {
+        PasteAtPlayhead();
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered() && !sClipboardValid) {
+        ImGui::SetTooltip("Copy a keyframe first.");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Insert @ playhead")) {
+        InsertAtPlayhead();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Add a keyframe at the current playhead time (on the existing curve, or the live "
+                          "freecam pose if there's no path yet).");
     }
 
     // Record the live freecam motion into keyframes.
@@ -1778,9 +1846,9 @@ void CinematicCamPathWindow::DrawElement() {
     }
     ImGui::EndChild();
 
-    // Per-keyframe time edit
     int sel = SelectedIndex();
     if (sel >= 0) {
+        ImGui::SeparatorText("Selected keyframe");
         float t = sKeyframes[sel].time;
         bool changed = ImGui::InputFloat("Keyframe time (s)", &t, 0.1f, 1.0f, "%.2f");
         if (ImGui::IsItemActivated()) {
@@ -1982,9 +2050,8 @@ void CinematicCamPathWindow::DrawElement() {
         }
     }
 
-    ImGui::Separator();
+    ImGui::SeparatorText("Playback");
 
-    // Playback
     float total = TotalTime();
     ImGui::BeginDisabled(sKeyframes.size() < 2);
     if (sPlaying) {
@@ -2076,9 +2143,7 @@ void CinematicCamPathWindow::DrawElement() {
 
     DrawTimeline();
 
-    ImGui::Separator();
-
-    // Save / Load
+    ImGui::SeparatorText("Save / Load");
     ImGui::InputText("Name", sFilename, sizeof(sFilename));
     if (ImGui::Button("Save")) {
         std::string p = std::string("cinematics/") + sFilename + ".json";
