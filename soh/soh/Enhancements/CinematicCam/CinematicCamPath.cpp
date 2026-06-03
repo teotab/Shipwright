@@ -21,7 +21,6 @@ void CinematicCam_GetPose(float* eye, float* at, float* roll, float* fov);
 void CinematicCam_SetPlayback(int active, float* eye, float* at, float roll, float fov);
 int CinematicCam_WorldToNdc(float* world, float* outNdcX, float* outNdcY);
 int CinematicCam_GetPlayerPos(float* out);
-int CinematicCam_GetCameraBasis(float* right, float* up);
 }
 
 // ---------------------------------------------------------------------------

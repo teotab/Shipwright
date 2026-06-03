@@ -7802,48 +7802,6 @@ s32 CinematicCam_GetViewEye(f32* out) {
     return 1;
 }
 
-// Current view right/up basis vectors, for dragging an aim target on the screen plane. Returns 0 if no
-// active play state.
-s32 CinematicCam_GetCameraBasis(f32* right, f32* up) {
-    f32 fx, fy, fz, rx, ry, rz, ux, uy, uz, len;
-
-    if (gPlayState == NULL) {
-        return 0;
-    }
-    fx = gPlayState->view.lookAt.x - gPlayState->view.eye.x;
-    fy = gPlayState->view.lookAt.y - gPlayState->view.eye.y;
-    fz = gPlayState->view.lookAt.z - gPlayState->view.eye.z;
-    len = sqrtf(fx * fx + fy * fy + fz * fz);
-    if (len < 0.001f) {
-        return 0;
-    }
-    fx /= len;
-    fy /= len;
-    fz /= len;
-    // right = forward x viewUp
-    rx = fy * gPlayState->view.up.z - fz * gPlayState->view.up.y;
-    ry = fz * gPlayState->view.up.x - fx * gPlayState->view.up.z;
-    rz = fx * gPlayState->view.up.y - fy * gPlayState->view.up.x;
-    len = sqrtf(rx * rx + ry * ry + rz * rz);
-    if (len < 0.001f) {
-        return 0;
-    }
-    rx /= len;
-    ry /= len;
-    rz /= len;
-    // up = right x forward
-    ux = ry * fz - rz * fy;
-    uy = rz * fx - rx * fz;
-    uz = rx * fy - ry * fx;
-    right[0] = rx;
-    right[1] = ry;
-    right[2] = rz;
-    up[0] = ux;
-    up[1] = uy;
-    up[2] = uz;
-    return 1;
-}
-
 // Project a world point to normalized device coords (-1..1, +Y up) for the path editor's in-world overlay.
 // Returns 0 if there is no active play state or the point is behind the camera.
 s32 CinematicCam_WorldToNdc(f32* world, f32* outNdcX, f32* outNdcY) {
