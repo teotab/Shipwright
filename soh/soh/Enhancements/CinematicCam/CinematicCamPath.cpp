@@ -1621,13 +1621,22 @@ static void DrawTimeline() {
         }
         setPlayhead(best);
     }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Jump to the previous keyframe");
+    }
     ImGui::SameLine();
     if (ImGui::SmallButton("< tick")) {
         setPlayhead(sPlayhead - kTickSeconds);
     }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Step back one tick (1/20 s)");
+    }
     ImGui::SameLine();
     if (ImGui::SmallButton("tick >")) {
         setPlayhead(sPlayhead + kTickSeconds);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Step forward one tick (1/20 s)");
     }
     ImGui::SameLine();
     if (ImGui::SmallButton(">|")) {
@@ -1638,6 +1647,9 @@ static void DrawTimeline() {
             }
         }
         setPlayhead(best);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Jump to the next keyframe");
     }
     ImGui::SameLine();
     ImGui::Text("%.2fs / %.2fs%s", sPlayhead, total, sLoop ? " (loop)" : "");
@@ -1655,16 +1667,24 @@ void CinematicCamPathWindow::InitElement() {
 }
 
 void CinematicCamPathWindow::DrawElement() {
-    ImGui::TextWrapped("Fly the free camera to a shot, then Add Keyframe. Build several, then Play to travel "
-                       "smoothly through them.");
+    ImGui::TextWrapped("Fly the free camera to a shot and Add Keyframe (or Record a live flight). Build a few, "
+                       "then Play to glide through them. Click a marker in the world or on the timeline to "
+                       "select it; drag to reposition / retime.");
     ImGui::Separator();
 
     bool enabled = FreeCamEnabled();
     if (ImGui::Checkbox("Enable Free Camera", &enabled)) {
         CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), enabled);
     }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Detached free camera. Left stick: move; right stick: look; plus rebindable "
+                          "ascend/descend/boost/FOV/roll. Bindings are in Dev Tools > Cinematic Cam > Controls.");
+    }
     ImGui::SameLine();
     ImGui::Checkbox("Show path in world", &sShowPath);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Draw the spline, keyframe markers, and the editing gizmo over the game view.");
+    }
 
     if (sShowPath) {
         HandleOverlayInput();
@@ -1712,31 +1732,6 @@ void CinematicCamPathWindow::DrawElement() {
         ImGui::TextDisabled("Locks the camera to the actor's viewpoint (aimed along its facing). "
                             "The world keeps running so you see what it sees.");
     }
-    if (sShowPath && SelectedIndex() >= 0) {
-        ImGui::TextUnformatted("Gizmo:");
-        ImGui::SameLine();
-        ImGui::RadioButton("Move", &sGizmoMode, GIZMO_MOVE);
-        ImGui::SameLine();
-        ImGui::RadioButton("Rotate (aim)", &sGizmoMode, GIZMO_ROTATE);
-        ImGui::SameLine();
-        ImGui::RadioButton("Bend (path)", &sGizmoMode, GIZMO_BEND);
-        if (sGizmoMode == GIZMO_MOVE) {
-            ImGui::TextDisabled("Drag the red/green/blue axes to move the keyframe. Click a marker to select.");
-        } else if (sGizmoMode == GIZMO_ROTATE) {
-            ImGui::TextDisabled("Drag the rings to aim the camera: green=yaw, red=pitch, blue=roll.");
-        } else {
-            ImGui::TextDisabled("Drag the rings to bend the path through this point (spline tangent). "
-                                "Does not affect camera aim.");
-            int si = SelectedIndex();
-            if (si >= 0 && sKeyframes[si].hasTangent) {
-                if (ImGui::SmallButton("Reset tangent")) {
-                    PushUndo();
-                    sKeyframes[si].hasTangent = 0;
-                }
-            }
-        }
-    }
-
     ImGui::SeparatorText("Keyframes");
     ImGui::BeginDisabled(!enabled);
     if (ImGui::Button("Add Keyframe")) {
@@ -1849,6 +1844,31 @@ void CinematicCamPathWindow::DrawElement() {
     int sel = SelectedIndex();
     if (sel >= 0) {
         ImGui::SeparatorText("Selected keyframe");
+
+        // World gizmo for this keyframe (only meaningful while the in-world path is shown).
+        if (sShowPath) {
+            ImGui::TextUnformatted("Gizmo:");
+            ImGui::SameLine();
+            ImGui::RadioButton("Move", &sGizmoMode, GIZMO_MOVE);
+            ImGui::SameLine();
+            ImGui::RadioButton("Rotate (aim)", &sGizmoMode, GIZMO_ROTATE);
+            ImGui::SameLine();
+            ImGui::RadioButton("Bend (path)", &sGizmoMode, GIZMO_BEND);
+            if (sGizmoMode == GIZMO_MOVE) {
+                ImGui::TextDisabled("Drag the red/green/blue axes in the world to move this keyframe.");
+            } else if (sGizmoMode == GIZMO_ROTATE) {
+                ImGui::TextDisabled("Drag the rings to aim the camera: green=yaw, red=pitch, blue=roll.");
+            } else {
+                ImGui::TextDisabled("Drag the rings to bend the path's curve through this point (no effect on aim).");
+                if (sKeyframes[sel].hasTangent && ImGui::SmallButton("Reset tangent")) {
+                    PushUndo();
+                    sKeyframes[sel].hasTangent = 0;
+                }
+            }
+        } else {
+            ImGui::TextDisabled("Enable 'Show path in world' to use the move/rotate/bend gizmo.");
+        }
+
         float t = sKeyframes[sel].time;
         bool changed = ImGui::InputFloat("Keyframe time (s)", &t, 0.1f, 1.0f, "%.2f");
         if (ImGui::IsItemActivated()) {
@@ -2117,6 +2137,10 @@ void CinematicCamPathWindow::DrawElement() {
     const char* aimOv[] = { "Per-keyframe (off)", "All look at Link", "All look at point", "All look at actor" };
     ImGui::SetNextItemWidth(200.0f);
     ImGui::Combo("Aim override", &sAimOverride, aimOv, 4);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Ignore each keyframe's own aim and point the whole path at one target. Handy for "
+                          "re-aiming a recorded flight at Link or an actor in one step.");
+    }
     if (sAimOverride == 2) {
         ImGui::SameLine();
         ImGui::SetNextItemWidth(220.0f);
