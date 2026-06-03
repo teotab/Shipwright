@@ -5,6 +5,7 @@
 #include <string>
 #include <algorithm>
 #include <cmath>
+#include <cctype>
 #include <cstring>
 #include <fstream>
 #include <filesystem>
@@ -37,6 +38,7 @@ static float sLoopReturnTime = 2.0f; // seconds to glide from the last keyframe 
 static float sPlayhead = 0.0f;        // seconds
 static float sPlaySpeed = 1.0f;
 static char sFilename[64] = "path1";
+static char sSpectateName[64] = ""; // display name of the spectated actor
 static bool sHookRegistered = false;
 static bool sShowPath = true;   // draw the spline + markers in the world while the editor is open
 static bool sShowFields = false; // show numeric position/rotation fields for the selected keyframe
@@ -1304,6 +1306,54 @@ static void HandleOverlayInput() {
     }
 }
 
+// Draw a distance-sorted actor list (nearest the camera first) with id + position so identical-named
+// actors are distinguishable. Returns the picked index into buf, or -1.
+static int DrawActorPickerList(CineActorInfo* buf, int n) {
+    float eye[3];
+    bool haveEye = CinematicCam_GetViewEye(eye) != 0;
+
+    static std::vector<int> order;
+    order.resize(n);
+    for (int i = 0; i < n; i++) {
+        order[i] = i;
+    }
+    auto dist2 = [&](int k) {
+        float dx = buf[k].pos[0] - eye[0], dy = buf[k].pos[1] - eye[1], dz = buf[k].pos[2] - eye[2];
+        return dx * dx + dy * dy + dz * dz;
+    };
+    if (haveEye) {
+        std::sort(order.begin(), order.end(), [&](int a, int b) { return dist2(a) < dist2(b); });
+    }
+
+    ImGui::Text("%d actors%s", n, haveEye ? " (nearest first)" : "");
+    static char filter[32] = "";
+    ImGui::InputTextWithHint("##actorfilter", "filter by name...", filter, sizeof(filter));
+
+    int picked = -1;
+    ImGui::BeginChild("##actorlist", ImVec2(390, 340), true);
+    for (int oi = 0; oi < n; oi++) {
+        int i = order[oi];
+        const char* nm = buf[i].name ? buf[i].name : "?";
+        if (filter[0]) {
+            std::string h = nm, f = filter;
+            std::transform(h.begin(), h.end(), h.begin(), [](unsigned char ch) { return (char)std::tolower(ch); });
+            std::transform(f.begin(), f.end(), f.begin(), [](unsigned char ch) { return (char)std::tolower(ch); });
+            if (h.find(f) == std::string::npos) {
+                continue;
+            }
+        }
+        float d = haveEye ? std::sqrt(dist2(i)) : 0.0f;
+        char lbl[128];
+        snprintf(lbl, sizeof(lbl), "%s  (id %d)  %.0fu  @ %.0f, %.0f, %.0f##ap%d", nm, buf[i].id, d, buf[i].pos[0],
+                 buf[i].pos[1], buf[i].pos[2], i);
+        if (ImGui::Selectable(lbl)) {
+            picked = i;
+        }
+    }
+    ImGui::EndChild();
+    return picked;
+}
+
 // ---------------------------------------------------------------------------
 // Window
 // ---------------------------------------------------------------------------
@@ -1330,6 +1380,48 @@ void CinematicCamPathWindow::DrawElement() {
     if (sShowPath) {
         HandleOverlayInput();
         DrawWorldOverlay();
+    }
+
+    // Actor POV spectate: lock the camera to an actor's viewpoint, live.
+    if (ImGui::CollapsingHeader("Actor POV (spectate)")) {
+        bool spec = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.SpectateEnabled"), 0);
+        if (ImGui::Checkbox("Spectate actor POV", &spec)) {
+            CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.SpectateEnabled"), spec);
+            if (spec) {
+                CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
+            }
+        }
+        ImGui::Text("Actor: %s", sSpectateName[0] ? sSpectateName : "(none picked)");
+        if (ImGui::Button("Pick actor##spectate")) {
+            ImGui::OpenPopup("Pick spectate actor");
+        }
+        if (ImGui::BeginPopup("Pick spectate actor")) {
+            static CineActorInfo sa[512];
+            int pn = CinematicCam_EnumActors(sa, 512);
+            int pick = DrawActorPickerList(sa, pn);
+            if (pick >= 0) {
+                CinematicCam_SetSpectateActor(sa[pick].ptr, sa[pick].id);
+                strncpy(sSpectateName, sa[pick].name ? sa[pick].name : "?", sizeof(sSpectateName) - 1);
+                sSpectateName[sizeof(sSpectateName) - 1] = '\0';
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+        bool useFocus = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.SpectateUseFocus"), 1);
+        if (ImGui::Checkbox("Track head / focus point", &useFocus)) {
+            CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.SpectateUseFocus"), useFocus);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Ride the actor's animated focus point (its head) so head bob/turn shows in the POV. "
+                              "Falls back to the actor's base position for actors that don't set a focus point. "
+                              "With this on, you'll usually want a lower Eye height.");
+        }
+        float h = CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.SpectateHeight"), 40.0f);
+        if (ImGui::SliderFloat("Eye height", &h, -100.0f, 200.0f, "%.0f")) {
+            CVarSetFloat(CVAR_ENHANCEMENT("CinematicCam.SpectateHeight"), h);
+        }
+        ImGui::TextDisabled("Locks the camera to the actor's viewpoint (aimed along its facing). "
+                            "The world keeps running so you see what it sees.");
     }
     if (sShowPath && SelectedIndex() >= 0) {
         ImGui::TextUnformatted("Gizmo:");
@@ -1526,20 +1618,13 @@ void CinematicCamPathWindow::DrawElement() {
             }
             if (ImGui::BeginPopup("Pick actor")) {
                 int pn = CinematicCam_EnumActors(sActors, 512);
-                ImGui::Text("%d actors in scene", pn);
-                ImGui::BeginChild("##actorlist", ImVec2(340, 320), true);
-                for (int ai = 0; ai < pn; ai++) {
-                    char lbl[96];
-                    snprintf(lbl, sizeof(lbl), "%s  (id %d)##%d", sActors[ai].name ? sActors[ai].name : "?",
-                             sActors[ai].id, ai);
-                    if (ImGui::Selectable(lbl)) {
-                        PushUndo();
-                        sKeyframes[sel].aimActorId = sActors[ai].id;
-                        sKeyframes[sel].aimActorPtr = sActors[ai].ptr;
-                        ImGui::CloseCurrentPopup();
-                    }
+                int pick = DrawActorPickerList(sActors, pn);
+                if (pick >= 0) {
+                    PushUndo();
+                    sKeyframes[sel].aimActorId = sActors[pick].id;
+                    sKeyframes[sel].aimActorPtr = sActors[pick].ptr;
+                    ImGui::CloseCurrentPopup();
                 }
-                ImGui::EndChild();
                 ImGui::EndPopup();
             }
             ImGui::TextDisabled("Tracks the actor live. Saved by id (re-acquired on load).");

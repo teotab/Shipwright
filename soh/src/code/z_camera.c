@@ -7684,6 +7684,87 @@ s32 CinematicCam_ResolveActor(void** ptr, s16 id, f32* out) {
     return 0;
 }
 
+// Actor whose point of view the camera spectates (set from the path editor).
+static void* sCineSpectatePtr = NULL;
+static s16 sCineSpectateId = 0;
+
+void CinematicCam_SetSpectateActor(void* ptr, s32 id) {
+    sCineSpectatePtr = ptr;
+    sCineSpectateId = (s16)id;
+}
+
+// Resolve the spectated actor's viewpoint. With useFocus, the eye rides the actor's animated focus point
+// (its head/look point, which most actors update from a head limb each frame, capturing head bob/turn);
+// orientation comes from focus.rot. Falls back to the root position + facing yaw when no usable focus.
+static s32 CinematicCam_ResolveSpectatePov(f32 height, s32 useFocus, Vec3f* eyeOut, Vec3f* atOut) {
+    s32 i;
+    Actor* a;
+    Actor* found = NULL;
+    Actor* cached = (Actor*)sCineSpectatePtr;
+    s16 yaw;
+    s16 pitch;
+    f32 cp;
+
+    if (gPlayState == NULL || sCineSpectateId == 0) {
+        return 0;
+    }
+    for (i = 0; i < ARRAY_COUNT(gPlayState->actorCtx.actorLists) && found == NULL; i++) {
+        a = gPlayState->actorCtx.actorLists[i].head;
+        while (a != NULL) {
+            if (a == cached && a->id == sCineSpectateId) {
+                found = a;
+                break;
+            }
+            a = a->next;
+        }
+    }
+    if (found == NULL) { // re-acquire by id
+        for (i = 0; i < ARRAY_COUNT(gPlayState->actorCtx.actorLists) && found == NULL; i++) {
+            a = gPlayState->actorCtx.actorLists[i].head;
+            while (a != NULL) {
+                if (a->id == sCineSpectateId) {
+                    found = a;
+                    sCineSpectatePtr = a;
+                    break;
+                }
+                a = a->next;
+            }
+        }
+    }
+    if (found == NULL) {
+        return 0;
+    }
+
+    yaw = found->shape.rot.y;
+    pitch = 0;
+    eyeOut->x = found->world.pos.x;
+    eyeOut->y = found->world.pos.y + height;
+    eyeOut->z = found->world.pos.z;
+
+    if (useFocus) {
+        f32 dx = found->focus.pos.x - found->world.pos.x;
+        f32 dy = found->focus.pos.y - found->world.pos.y;
+        f32 dz = found->focus.pos.z - found->world.pos.z;
+        f32 d2 = (dx * dx) + (dy * dy) + (dz * dz);
+        // Use the focus point only if it is set and a sane offset from the actor (not uninitialized/garbage).
+        if (d2 > 0.01f && d2 < (400.0f * 400.0f)) {
+            eyeOut->x = found->focus.pos.x;
+            eyeOut->y = found->focus.pos.y + height;
+            eyeOut->z = found->focus.pos.z;
+            if (found->focus.rot.x != 0 || found->focus.rot.y != 0) {
+                yaw = found->focus.rot.y;
+                pitch = found->focus.rot.x;
+            }
+        }
+    }
+
+    cp = Math_CosS(pitch);
+    atOut->x = eyeOut->x + Math_SinS(yaw) * cp * 100.0f;
+    atOut->y = eyeOut->y + Math_SinS(pitch) * 100.0f;
+    atOut->z = eyeOut->z + Math_CosS(yaw) * cp * 100.0f;
+    return 1;
+}
+
 // Player (Link) world position for the "look at Link" aim mode, aimed a bit above the feet. Returns 0 if
 // unavailable.
 s32 CinematicCam_GetPlayerPos(f32* out) {
@@ -7699,6 +7780,17 @@ s32 CinematicCam_GetPlayerPos(f32* out) {
     out[0] = player->actor.world.pos.x;
     out[1] = player->actor.world.pos.y + 40.0f;
     out[2] = player->actor.world.pos.z;
+    return 1;
+}
+
+// Current camera eye position (for distance-sorting the actor pickers). Returns 0 if no play state.
+s32 CinematicCam_GetViewEye(f32* out) {
+    if (gPlayState == NULL) {
+        return 0;
+    }
+    out[0] = gPlayState->view.eye.x;
+    out[1] = gPlayState->view.eye.y;
+    out[2] = gPlayState->view.eye.z;
     return 1;
 }
 
@@ -7844,6 +7936,41 @@ static void CinematicCam_Update(Camera* camera) {
             IREG(72) = 1;
         }
         return;
+    }
+
+    // Actor POV spectate: lock the camera to a chosen actor's viewpoint (live, world keeps running).
+    if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.SpectateEnabled"), 0)) {
+        Vec3f spEye;
+        Vec3f spAt;
+        Vec3f spUp;
+        VecSph spDir;
+        f32 spHeight = CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.SpectateHeight"), 40.0f);
+        s32 spUseFocus = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.SpectateUseFocus"), 1);
+
+        if (CinematicCam_ResolveSpectatePov(spHeight, spUseFocus, &spEye, &spAt)) {
+            OLib_Vec3fDiffToVecSphGeo(&spDir, &spEye, &spAt);
+            Camera_CalcUpFromPitchYawRoll(&spUp, spDir.pitch, spDir.yaw, 0);
+            camera->eye = camera->eyeNext = spEye;
+            camera->at = spAt;
+            camera->play->view.fovy = sCineCam.fov;
+            func_800AA358(&camera->play->view, &spEye, &spAt, &spUp);
+
+            // Sync the freecam pose so manual control resumes from here when spectate ends.
+            sCineCam.eye = spEye;
+            sCineCam.pitch = spDir.pitch;
+            sCineCam.yaw = spDir.yaw;
+            sCineCamVel.x = sCineCamVel.y = sCineCamVel.z = 0.0f;
+            sCineCamYawVel = sCineCamPitchVel = 0.0f;
+
+            if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.DisableCulling"), 1)) {
+                gCineCamDisableCulling = 1;
+                camera->play->view.zFar = CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.FarPlane"), 20000.0f);
+            } else {
+                gCineCamDisableCulling = 0;
+            }
+            // Intentionally not freezing the world: let the spectated actor (and the scene) keep moving.
+            return;
+        }
     }
 
     // Rebindable button actions (defaults below; configurable in the menu's Cinematic Cam > Controls).

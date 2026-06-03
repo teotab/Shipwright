@@ -24,6 +24,12 @@ int CinematicCam_EnumActors(CineActorInfo* out, int maxCount);
 // live actor with that id and updates *ptr. Writes pos to out[3]. Returns 1 if found, 0 otherwise.
 int CinematicCam_ResolveActor(void** ptr, short id, float* out);
 
+// Set the actor whose point of view the camera should spectate (pass id 0 to clear).
+void CinematicCam_SetSpectateActor(void* ptr, int id);
+
+// Current camera eye position, for distance-sorting the actor pickers. Returns 1 if available.
+int CinematicCam_GetViewEye(float* out);
+
 #ifdef __cplusplus
 }
 #endif
