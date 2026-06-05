@@ -26,15 +26,15 @@ struct CineKeyframe {
     float fov;    // degrees
 
     // Per-keyframe curve shaping. Defaults (Smooth, all 0) reproduce a standard Catmull-Rom spline.
-    int interp;        // CineInterp
-    float tension;     // -1..1: -1 rounder/looser, +1 tighter/straighter
-    float continuity;  // -1..1: sharpness of the corner through the keyframe
-    float bias;        // -1..1: lean the curve toward the previous (+) or next (-) keyframe
+    int interp;       // CineInterp
+    float tension;    // -1..1: -1 rounder/looser, +1 tighter/straighter
+    float continuity; // -1..1: sharpness of the corner through the keyframe
+    float bias;       // -1..1: lean the curve toward the previous (+) or next (-) keyframe
 
     // Optional custom spline tangent (the direction the spatial curve passes through this point), edited
     // with the Bend gizmo. Like a Bezier handle; bends the curve on both sides. Independent of camera aim.
-    int hasTangent;    // 0 = automatic tangent, 1 = use the custom direction below
-    float tangent[3];  // unit direction
+    int hasTangent;   // 0 = automatic tangent, 1 = use the custom direction below
+    float tangent[3]; // unit direction
 
     int aimMode;       // CineAim: how the camera is aimed (free / point / Link / actor)
     int aimActorId;    // for CINE_AIM_ACTOR: the actor id to track (saved)

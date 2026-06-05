@@ -9,11 +9,11 @@ extern "C" {
 #endif
 
 typedef struct {
-    void* ptr;         // opaque Actor* (stable only within the current scene/session)
-    const char* name;  // ActorDB name (static string)
-    short id;           // actor id
-    short category;     // ACTORCAT_*
-    float pos[3];       // world position
+    void* ptr;        // opaque Actor* (stable only within the current scene/session)
+    const char* name; // ActorDB name (static string)
+    short id;         // actor id
+    short category;   // ACTORCAT_*
+    float pos[3];     // world position
 } CineActorInfo;
 
 // Fill out[] with up to maxCount live actors; returns the count.

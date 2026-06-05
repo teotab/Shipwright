@@ -20,7 +20,7 @@ s32 Camera_UpdateWater(Camera* camera);
 #define RELOAD_PARAMS \
     (camera->animState == 0 || camera->animState == 0xA || camera->animState == 0x14 || R_RELOAD_CAM_PARAMS)
 
-#define PCT(x) ((x)*0.01f)
+#define PCT(x) ((x) * 0.01f)
 #define NEXTSETTING ((values++)->val)
 #define NEXTPCT PCT(NEXTSETTING)
 
@@ -7494,11 +7494,11 @@ s32 sOOBTimer = 0;
 // Phase 1: live freecam. The CameraPose struct below is intentionally the unit a future keyframe/path
 // system will store, so spline playback can be layered on without reworking this.
 typedef struct {
-    /* */ Vec3f eye;   // world position
-    /* */ s16   pitch; // binang
-    /* */ s16   yaw;   // binang
-    /* */ s16   roll;  // binang
-    /* */ f32   fov;   // degrees
+    /* */ Vec3f eye; // world position
+    /* */ s16 pitch; // binang
+    /* */ s16 yaw;   // binang
+    /* */ s16 roll;  // binang
+    /* */ f32 fov;   // degrees
 } CameraPose;
 
 static CameraPose sCineCam;
@@ -8232,10 +8232,10 @@ Vec3s Camera_Update(Camera* camera) {
             CinematicCam_Update(camera);
             return camera->inputDir;
         } else if (!cineEnabled && sCineCamWasActive) {
-            IREG(72) = 0;                          // unfreeze the world on exit
+            IREG(72) = 0; // unfreeze the world on exit
             gCinematicCamActive = 0;
             gCineCamDisableCulling = 0;
-            camera->play->view.zFar = 12800.0f;    // restore default far clip plane
+            camera->play->view.zFar = 12800.0f; // restore default far clip plane
             sCineCamWasActive = 0;
         }
     }

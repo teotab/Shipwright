@@ -34,18 +34,18 @@ static bool sPlaying = false;
 static bool sPreview = false;
 static bool sLoop = false;
 static float sLoopReturnTime = 2.0f; // seconds to glide from the last keyframe back to the first when looping
-static float sPlayhead = 0.0f;        // seconds
+static float sPlayhead = 0.0f;       // seconds
 static float sPlaySpeed = 1.0f;
 static char sFilename[64] = "path1";
 static char sSpectateName[64] = ""; // display name of the spectated actor
 static bool sHookRegistered = false;
 
-static int sEaseMode = 1;     // playback timing easing: 0 none, 1 in/out, 2 in, 3 out
+static int sEaseMode = 1;        // playback timing easing: 0 none, 1 in/out, 2 in, 3 out
 static float sEaseAmount = 0.5f; // 0 = linear, 1 = full ease
-static float sPlayU = 0.0f;   // linear play progress 0..1, eased into the playhead
+static float sPlayU = 0.0f;      // linear play progress 0..1, eased into the playhead
 
 // Path-level aim override: when set, every keyframe aims at this target instead of its own.
-static int sAimOverride = 0;             // 0 none, 1 Link, 2 point, 3 actor
+static int sAimOverride = 0; // 0 none, 1 Link, 2 point, 3 actor
 static float sAimOverridePoint[3] = { 0.0f, 0.0f, 0.0f };
 static int sAimOverrideActorId = 0;
 static void* sAimOverrideActorPtr = nullptr;
@@ -55,21 +55,21 @@ static float sRecordTime = 0.0f;
 static float sRecordLast = 0.0f;
 static float sRecordInterval = 0.2f; // seconds between recorded keyframes
 
-static CineKeyframe sClipboard;       // copied keyframe
+static CineKeyframe sClipboard; // copied keyframe
 static bool sClipboardValid = false;
-static bool sShowPath = true;   // draw the spline + markers in the world while the editor is open
+static bool sShowPath = true;    // draw the spline + markers in the world while the editor is open
 static bool sShowFields = false; // show numeric position/rotation fields for the selected keyframe
 
 // Transform gizmo state for the selected keyframe.
 enum GizmoMode { GIZMO_MOVE = 0, GIZMO_ROTATE = 1, GIZMO_BEND = 2 };
 static int sGizmoMode = GIZMO_MOVE;
-static int sDragKfId = -1;      // keyframe id currently being manipulated by the gizmo, or -1
-static int sDragKind = 0;       // 0 = translate, 1 = rotate (snapshot of mode at grab time)
-static int sDragAxis = -1;      // which axis/ring: 0=X/yaw, 1=Y/pitch, 2=Z/roll
+static int sDragKfId = -1; // keyframe id currently being manipulated by the gizmo, or -1
+static int sDragKind = 0;  // 0 = translate, 1 = rotate (snapshot of mode at grab time)
+static int sDragAxis = -1; // which axis/ring: 0=X/yaw, 1=Y/pitch, 2=Z/roll
 static float sRotPrevAngle = 0.0f;
 static float sDragPitchAxis[3] = { 1.0f, 0.0f, 0.0f }; // pitch rotation axis, captured at drag start (stable)
-static int sTargetDragId = -1;   // keyframe id whose look-at-point target is being dragged, or -1
-static int sTargetDragAxis = -1; // which world axis (0/1/2) of the target is being dragged
+static int sTargetDragId = -1;                         // keyframe id whose look-at-point target is being dragged, or -1
+static int sTargetDragAxis = -1;                       // which world axis (0/1/2) of the target is being dragged
 
 // Undo / redo history of the whole keyframe list.
 struct PathSnapshot {
@@ -592,9 +592,7 @@ static void LoadPath() {
     nlohmann::json j;
     try {
         f >> j;
-    } catch (...) {
-        return;
-    }
+    } catch (...) { return; }
     ClearPath();
     for (auto& e : j) {
         CineKeyframe k{};
@@ -817,7 +815,7 @@ static void RotationAxes(const CineKeyframe& k, float yawAxis[3], float pitchAxi
 static const ImU32 kMoveCol[3] = { IM_COL32(235, 80, 80, 255), IM_COL32(90, 220, 90, 255),
                                    IM_COL32(90, 150, 255, 255) }; // X, Y, Z
 static const ImU32 kRotCol[3] = { IM_COL32(90, 220, 90, 255), IM_COL32(235, 80, 80, 255),
-                                  IM_COL32(90, 150, 255, 255) }; // yaw, pitch, roll
+                                  IM_COL32(90, 150, 255, 255) };                                // yaw, pitch, roll
 static const ImU32 kBendCol[2] = { IM_COL32(230, 130, 255, 255), IM_COL32(255, 170, 60, 255) }; // bend rings
 
 static void RingBasis(const float* k, float u[3], float v[3]); // defined below
@@ -1922,7 +1920,8 @@ void CinematicCamPathWindow::DrawElement() {
                 PushUndo();
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Lean the curve toward the previous (+) or the next (-) keyframe (overshoot/undershoot).");
+                ImGui::SetTooltip(
+                    "Lean the curve toward the previous (+) or the next (-) keyframe (overshoot/undershoot).");
             }
             sKeyframes[sel].bias = bias;
 

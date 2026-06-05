@@ -237,8 +237,8 @@ void SohMenu::AddMenuDevTools() {
     AddWidget(path, "Open Path Editor", WIDGET_WINDOW_BUTTON)
         .CVar(CVAR_WINDOW("CinematicCamPath"))
         .WindowName("Cinematic Camera Path")
-        .Options(WindowButtonOptions().Tooltip(
-            "Record camera keyframes and play back a smooth spline path through them."));
+        .Options(
+            WindowButtonOptions().Tooltip("Record camera keyframes and play back a smooth spline path through them."));
     AddWidget(path, "Enable Cinematic Camera", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.Enabled"))
         .Options(CheckboxOptions().DefaultValue(false).Tooltip(
@@ -292,14 +292,18 @@ void SohMenu::AddMenuDevTools() {
         .CVar(CVAR_ENHANCEMENT("CinematicCam.LetterboxAmount"))
         .Options(FloatSliderOptions().Min(0.02f).Max(0.30f).DefaultValue(0.12f).Format("%.2f").Tooltip(
             "Height of each letterbox bar as a fraction of the screen (0.12 ~= 2.39:1 from 16:9)."))
-        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Letterbox"), 0); });
+        .PreFunc(
+            [](WidgetInfo& info) { info.isHidden = !CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Letterbox"), 0); });
     static const std::map<int32_t, const char*> cineGridModes = {
         { 0, "Off" }, { 1, "3 x 3 (thirds)" }, { 2, "4 x 4" }, { 3, "5 x 5" }
     };
     AddWidget(path, "Composition grid", WIDGET_CVAR_COMBOBOX)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.Grid"))
-        .Options(ComboboxOptions().ComboMap(cineGridModes).DefaultIndex(0).Tooltip(
-            "Overlay a framing grid while the cinematic camera is active (rule-of-thirds and finer)."));
+        .Options(
+            ComboboxOptions()
+                .ComboMap(cineGridModes)
+                .DefaultIndex(0)
+                .Tooltip("Overlay a framing grid while the cinematic camera is active (rule-of-thirds and finer)."));
     AddWidget(path, "Extend Draw Distance", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.DisableCulling"))
         .Options(CheckboxOptions().DefaultValue(true).Tooltip(
@@ -330,7 +334,8 @@ void SohMenu::AddMenuDevTools() {
     AddWidget(path, "Controls", WIDGET_SEPARATOR_TEXT);
     AddWidget(path, "Toggle Camera:", WIDGET_CVAR_BTN_SELECTOR)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.ToggleBtn"))
-        .Options(BtnSelectorOptions().DefaultValue(BTN_CUSTOM_MODIFIER1)
+        .Options(BtnSelectorOptions()
+                     .DefaultValue(BTN_CUSTOM_MODIFIER1)
                      .Tooltip("Toggles the cinematic camera on/off. Default is Additional Button 1 - map your "
                               "Select/Back button to it in Controller Configuration."));
     AddWidget(path, "Boost (faster):", WIDGET_CVAR_BTN_SELECTOR)
