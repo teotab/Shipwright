@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cctype>
 #include <cstring>
+#include <clocale>
 #include <fstream>
 #include <filesystem>
 #include <nlohmann/json.hpp>
@@ -30,25 +31,113 @@ static std::vector<CineKeyframe> sKeyframes;
 static int sNextId = 1;
 static std::vector<int> sIds; // parallel to sKeyframes, stable identity for selection across re-sorts
 static int sSelectedId = -1;
+static std::vector<int> sSelection; // all selected keyframe ids (sSelectedId is the "primary" of these)
 static bool sPlaying = false;
 static bool sPreview = false;
 static bool sLoop = false;
-static float sLoopReturnTime = 2.0f; // seconds to glide from the last keyframe back to the first when looping
-static float sPlayhead = 0.0f;       // seconds
+static int sLoopMode = 0;             // 0 = forward (wrap back to start), 1 = ping-pong (reverse each pass)
+static int sPlayDir = 1;              // current ping-pong direction (+1 forward, -1 reverse)
+static bool sLoopMarkerFrame = false; // true for the one frame the loop restarts (drives the GIF loop marker)
+static float sLoopReturnTime = 2.0f;  // seconds to glide from the last keyframe back to the first when looping
+static float sPlayhead = 0.0f;        // seconds
 static float sPlaySpeed = 1.0f;
 static char sFilename[64] = "path1";
+static int sPathEntrance = -1;      // entrance (scene + spawn) bound to the loaded path, or -1 = none
+static bool sBindLocation = true;   // capture the current location into the file when saving
+static bool sTeleportOnLoad = true; // warp to the bound location when loading a path
 static char sSpectateName[64] = ""; // display name of the spectated actor
 static bool sHookRegistered = false;
+
+// --- Parameter automation tracks -----------------------------------------------------------------------------
+// A track holds keyframes for one exposed parameter on its own sub-timeline. To add another keyframable
+// parameter later: declare a CineParamTrack, evaluate it in PlaybackTick, save/load it, and draw it in the
+// Automation section (DrawParamTrackEditor does the generic key-list UI).
+struct CineParamTrack {
+    const char* id;                 // stable key for save/load
+    int interp;                     // CineTrackInterp (step for discrete params)
+    bool enabled;                   // when true, the track drives its parameter during playback/preview
+    std::vector<CineParamKey> keys; // sorted ascending by time
+};
+
+// Green screen: 0 = off, 1 = green, 2 = blue (matches the CinematicCam.GreenScreen CVar). Stepped (discrete).
+static CineParamTrack sGreenScreenTrack = { "greenScreen", CINE_TRACK_STEP, false, {} };
+static int sGreenScreenOverride = -1; // value forced by the track this frame, or -1 = none (CVar applies)
+
+// Evaluate a track at a time. Returns false (no value) when the track is disabled or empty. Step tracks hold
+// the most recent key (and clamp before the first / after the last); linear tracks blend between neighbors.
+static bool EvalParamTrack(const CineParamTrack& t, float time, float& out) {
+    if (!t.enabled || t.keys.empty()) {
+        return false;
+    }
+    if (time <= t.keys.front().time) {
+        out = t.keys.front().value;
+        return true;
+    }
+    if (time >= t.keys.back().time) {
+        out = t.keys.back().value;
+        return true;
+    }
+    size_t i = 0;
+    while (i + 1 < t.keys.size() && t.keys[i + 1].time <= time) {
+        i++;
+    }
+    if (t.interp == CINE_TRACK_LINEAR && i + 1 < t.keys.size()) {
+        const CineParamKey& a = t.keys[i];
+        const CineParamKey& b = t.keys[i + 1];
+        float d = b.time - a.time;
+        float s = (d > 1e-5f) ? (time - a.time) / d : 0.0f;
+        out = a.value + (b.value - a.value) * s;
+    } else {
+        out = t.keys[i].value; // step / hold
+    }
+    return true;
+}
+
+// Insert (or overwrite a near-coincident) key, keeping the track sorted by time.
+static void TrackAddKey(CineParamTrack& t, float time, float value) {
+    for (CineParamKey& k : t.keys) {
+        if (std::fabs(k.time - time) < 1e-3f) {
+            k.value = value;
+            return;
+        }
+    }
+    t.keys.push_back({ time, value });
+    std::sort(t.keys.begin(), t.keys.end(),
+              [](const CineParamKey& a, const CineParamKey& b) { return a.time < b.time; });
+}
+
+// Bridge for z_play.c: the green screen mode to actually render this frame - the track's value while a cinematic
+// drives it, otherwise the manual CVar (the editor dropdown).
+extern "C" int CinematicCam_GetGreenScreen(void) {
+    if (sGreenScreenOverride >= 0) {
+        return sGreenScreenOverride;
+    }
+    return CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.GreenScreen"), 0);
+}
 
 static int sEaseMode = 1;        // playback timing easing: 0 none, 1 in/out, 2 in, 3 out
 static float sEaseAmount = 0.5f; // 0 = linear, 1 = full ease
 static float sPlayU = 0.0f;      // linear play progress 0..1, eased into the playhead
+
+// Camera shake / handheld: smooth pseudo-noise applied to the played-back pose for organic motion.
+static bool sShakeEnabled = false;
+static float sShakePosAmp = 3.0f;   // world units of positional jitter
+static float sShakeRotAmp = 0.6f;   // degrees of aim jitter
+static float sShakeFreq = 6.0f;     // wobbles per second
+static bool sShakeOnPreview = true; // also shake while scrubbing/previewing (not just Play)
 
 // Path-level aim override: when set, every keyframe aims at this target instead of its own.
 static int sAimOverride = 0; // 0 none, 1 Link, 2 point, 3 actor
 static float sAimOverridePoint[3] = { 0.0f, 0.0f, 0.0f };
 static int sAimOverrideActorId = 0;
 static void* sAimOverrideActorPtr = nullptr;
+
+// Path follow: translate the whole played-back path so it tracks a moving target (Link or an actor). The eye
+// and look-at are offset by how far the target has moved from where the path was built around it.
+static int sFollowMode = 0; // 0 off, 1 Link, 2 actor
+static int sFollowActorId = 0;
+static void* sFollowActorPtr = nullptr;
+static float sFollowOrigin[3] = { 0.0f, 0.0f, 0.0f }; // target position the path was authored around
 
 static bool sRecording = false; // recording the live freecam into keyframes
 static float sRecordTime = 0.0f;
@@ -71,11 +160,13 @@ static float sDragPitchAxis[3] = { 1.0f, 0.0f, 0.0f }; // pitch rotation axis, c
 static int sTargetDragId = -1;                         // keyframe id whose look-at-point target is being dragged, or -1
 static int sTargetDragAxis = -1;                       // which world axis (0/1/2) of the target is being dragged
 
-// Undo / redo history of the whole keyframe list.
+// Undo / redo history of the whole keyframe list plus the automation tracks.
 struct PathSnapshot {
     std::vector<CineKeyframe> kf;
     std::vector<int> ids;
     int selectedId;
+    std::vector<int> selection;
+    std::vector<CineParamKey> gsKeys; // green-screen automation track keys
 };
 static std::vector<PathSnapshot> sUndo;
 static std::vector<PathSnapshot> sRedo;
@@ -87,17 +178,23 @@ static float TotalTime() {
     return sKeyframes.empty() ? 0.0f : sKeyframes.back().time;
 }
 
-// Total timeline length including the loop-return segment when looping.
+// True when the path is treated as a cycle (forward loop with a return segment). Ping-pong is NOT cyclic:
+// it bounces within [0, TotalTime()] instead of wrapping, so it samples with clamped ends.
+static bool LoopCyclic() {
+    return sLoop && sLoopMode == 0;
+}
+
+// Total timeline length including the loop-return segment when forward-looping.
 static float EffectiveTotal() {
     float t = TotalTime();
-    if (sLoop && sKeyframes.size() >= 2) {
+    if (LoopCyclic() && sKeyframes.size() >= 2) {
         t += sLoopReturnTime;
     }
     return t;
 }
 
 static void PushUndo() {
-    sUndo.push_back({ sKeyframes, sIds, sSelectedId });
+    sUndo.push_back({ sKeyframes, sIds, sSelectedId, sSelection, sGreenScreenTrack.keys });
     if (sUndo.size() > 64) {
         sUndo.erase(sUndo.begin());
     }
@@ -108,24 +205,28 @@ static void Undo() {
     if (sUndo.empty()) {
         return;
     }
-    sRedo.push_back({ sKeyframes, sIds, sSelectedId });
+    sRedo.push_back({ sKeyframes, sIds, sSelectedId, sSelection, sGreenScreenTrack.keys });
     PathSnapshot s = sUndo.back();
     sUndo.pop_back();
     sKeyframes = s.kf;
     sIds = s.ids;
     sSelectedId = s.selectedId;
+    sSelection = s.selection;
+    sGreenScreenTrack.keys = s.gsKeys;
 }
 
 static void Redo() {
     if (sRedo.empty()) {
         return;
     }
-    sUndo.push_back({ sKeyframes, sIds, sSelectedId });
+    sUndo.push_back({ sKeyframes, sIds, sSelectedId, sSelection, sGreenScreenTrack.keys });
     PathSnapshot s = sRedo.back();
     sRedo.pop_back();
     sKeyframes = s.kf;
     sIds = s.ids;
     sSelectedId = s.selectedId;
+    sSelection = s.selection;
+    sGreenScreenTrack.keys = s.gsKeys;
 }
 
 static int SelectedIndex() {
@@ -135,6 +236,40 @@ static int SelectedIndex() {
         }
     }
     return -1;
+}
+
+// --- Multi-selection helpers (sSelection holds ids; sSelectedId is the primary/last-clicked) ---
+static bool IsSelected(int id) {
+    return std::find(sSelection.begin(), sSelection.end(), id) != sSelection.end();
+}
+static int SelectionCount() {
+    return (int)sSelection.size();
+}
+static void SelectOnly(int id) {
+    sSelection.clear();
+    if (id >= 0) {
+        sSelection.push_back(id);
+    }
+    sSelectedId = id;
+}
+static void ToggleSelect(int id) {
+    auto it = std::find(sSelection.begin(), sSelection.end(), id);
+    if (it != sSelection.end()) {
+        sSelection.erase(it);
+        sSelectedId = sSelection.empty() ? -1 : sSelection.back();
+    } else {
+        sSelection.push_back(id);
+        sSelectedId = id;
+    }
+}
+// Drop ids that no longer exist (after deletes/loads) so selection stays valid.
+static void PruneSelection() {
+    sSelection.erase(std::remove_if(sSelection.begin(), sSelection.end(),
+                                    [](int id) { return std::find(sIds.begin(), sIds.end(), id) == sIds.end(); }),
+                     sSelection.end());
+    if (std::find(sIds.begin(), sIds.end(), sSelectedId) == sIds.end()) {
+        sSelectedId = sSelection.empty() ? -1 : sSelection.back();
+    }
 }
 
 // Keep keyframes sorted by time, carrying their ids along.
@@ -160,52 +295,131 @@ static float v3len(const float* a); // defined with the gizmo vector helpers bel
 // Kochanek-Bartels (TCB) Hermite interpolation for one scalar component over a segment p1 -> p2.
 // tcB = TCB params at p1 (segment source), tcC = TCB params at p2 (segment destination).
 // With all params 0 this reduces exactly to Catmull-Rom.
-static float TcbHermite(float p0, float p1, float p2, float p3, float tB, float cB, float bB, float tC, float cC,
-                        float bC, float s) {
-    // Outgoing tangent at p1 and incoming tangent at p2.
-    float td = ((1.0f - tB) * (1.0f + cB) * (1.0f + bB) * 0.5f) * (p1 - p0) +
-               ((1.0f - tB) * (1.0f - cB) * (1.0f - bB) * 0.5f) * (p2 - p1);
-    float ts = ((1.0f - tC) * (1.0f - cC) * (1.0f + bC) * 0.5f) * (p2 - p1) +
-               ((1.0f - tC) * (1.0f + cC) * (1.0f - bC) * 0.5f) * (p3 - p2);
-    float s2 = s * s;
-    float s3 = s2 * s;
-    float h00 = 2.0f * s3 - 3.0f * s2 + 1.0f;
-    float h10 = s3 - 2.0f * s2 + s;
-    float h01 = -2.0f * s3 + 3.0f * s2;
-    float h11 = s3 - s2;
-    return h00 * p1 + h10 * td + h01 * p2 + h11 * ts;
-}
-
-// Interpolate one component over a segment, honoring the source keyframe's per-keyframe mode.
-static float InterpComp(float p0, float p1, float p2, float p3, const CineKeyframe& kSrc, const CineKeyframe& kDst,
-                        float s) {
-    if (kSrc.interp == CINE_INTERP_LINEAR) {
-        return p1 + (p2 - p1) * s;
-    }
-    return TcbHermite(p0, p1, p2, p3, kSrc.tension, kSrc.continuity, kSrc.bias, kDst.tension, kDst.continuity,
-                      kDst.bias, s);
-}
-
-// 3D TCB outgoing tangent at p1 (start of a segment) and incoming tangent at p2 (end of a segment).
-static void TcbOutTangent3(const float* p0, const float* p1, const float* p2, float t, float c, float b, float* o) {
-    float w1 = (1.0f - t) * (1.0f + c) * (1.0f + b) * 0.5f;
-    float w2 = (1.0f - t) * (1.0f - c) * (1.0f - b) * 0.5f;
-    for (int k = 0; k < 3; k++) {
-        o[k] = w1 * (p1[k] - p0[k]) + w2 * (p2[k] - p1[k]);
-    }
-}
-static void TcbInTangent3(const float* p1, const float* p2, const float* p3, float t, float c, float b, float* o) {
-    float w1 = (1.0f - t) * (1.0f - c) * (1.0f + b) * 0.5f;
-    float w2 = (1.0f - t) * (1.0f + c) * (1.0f - b) * 0.5f;
-    for (int k = 0; k < 3; k++) {
-        o[k] = w1 * (p2[k] - p1[k]) + w2 * (p3[k] - p2[k]);
-    }
-}
 static float Hermite1(float p1, float p2, float m0, float m1, float s) {
     float s2 = s * s;
     float s3 = s2 * s;
     return (2.0f * s3 - 3.0f * s2 + 1.0f) * p1 + (s3 - 2.0f * s2 + s) * m0 + (-2.0f * s3 + 3.0f * s2) * p2 +
            (s3 - s2) * m1;
+}
+
+// Spline parameterization for the eye path:
+//   0 = even velocity (knots = segment durations) - velocity-continuous: the camera (and therefore the view
+//       direction) moves at a smooth, time-coherent rate with no speed dip/jolt at the keyframes, while
+//       keyframe spacing on the timeline still controls pacing. The cinematic default.
+//   1 = uniform Catmull-Rom (equal knot spacing) - the classic, snappier look; can overshoot on unevenly
+//       spaced points (tame it with per-keyframe Tension or the Smooth tool).
+// NOTE: centripetal/chordal (chord^alpha knots) were removed. They give the smoothest spatial SHAPE, but
+// because the tangent magnitudes scale with chord length (not time) the eye speeds up and slows down within
+// each segment in a way that's decoupled from the timeline - so the view appears to hang toward the next
+// keyframe and then snap. "Even velocity" gives smooth motion; Tension/Smooth cover overshoot.
+static int sSplineParam = 0;
+
+// Non-uniform Kochanek-Bartels tangents for the segment p1->p2 (mOut at p1, mIn at p2), given the three knot
+// intervals t01,t12,t23 (the "parameter distances" between the four control points; chord^alpha for
+// uniform/centripetal/chordal, or keyframe-time differences for velocity-continuous motion). tB/cB/bB are the
+// Tension/Continuity/Bias at p1 (out-tangent), tC/cC/bC at p2 (in-tangent). With all TCB params 0 this is
+// exactly non-uniform Catmull-Rom, so dialing TCB away from 0 changes the curve continuously in any
+// parameterization (no jump to a different uniform formula). Tangents are scaled to the [0,1] Hermite param.
+static void NuKbTangents(const float* p0, const float* p1, const float* p2, const float* p3, float t01, float t12,
+                         float t23, float tB, float cB, float bB, float tC, float cC, float bC, float* mOut,
+                         float* mIn) {
+    if (t01 < 1e-5f) {
+        t01 = 1e-5f;
+    }
+    if (t12 < 1e-5f) {
+        t12 = 1e-5f;
+    }
+    if (t23 < 1e-5f) {
+        t23 = 1e-5f;
+    }
+    float wInO = t12 / (t01 + t12), wOutO = t01 / (t01 + t12);  // interval weights, out-tangent at p1
+    float wMidI = t23 / (t12 + t23), wFarI = t12 / (t12 + t23); // interval weights, in-tangent at p2
+    for (int k = 0; k < 3; k++) {
+        float sIn = (p1[k] - p0[k]) / t01; // one-sided secant velocities
+        float sOut = (p2[k] - p1[k]) / t12;
+        float sFar = (p3[k] - p2[k]) / t23;
+        float vOut = (1.0f - tB) * (wInO * (1.0f + cB) * (1.0f + bB) * sIn + wOutO * (1.0f - cB) * (1.0f - bB) * sOut);
+        float vIn = (1.0f - tC) * (wMidI * (1.0f - cC) * (1.0f + bC) * sOut + wFarI * (1.0f + cC) * (1.0f - bC) * sFar);
+        mOut[k] = vOut * t12;
+        mIn[k] = vIn * t12;
+    }
+}
+
+// Scalar form of the non-uniform Kochanek-Bartels evaluation (for the aim point components, roll and FOV), so
+// they interpolate as smoothly as the eye path - no stiff/quick swing when a turn and an aim change coincide.
+static float NuKbScalar(float p0, float p1, float p2, float p3, float t01, float t12, float t23, float tB, float cB,
+                        float bB, float tC, float cC, float bC, float s, bool monotone, bool zeroOut, bool zeroIn) {
+    if (t01 < 1e-5f) {
+        t01 = 1e-5f;
+    }
+    if (t12 < 1e-5f) {
+        t12 = 1e-5f;
+    }
+    if (t23 < 1e-5f) {
+        t23 = 1e-5f;
+    }
+    float wInO = t12 / (t01 + t12), wOutO = t01 / (t01 + t12);
+    float wMidI = t23 / (t12 + t23), wFarI = t12 / (t12 + t23);
+    float sIn = (p1 - p0) / t01, sOut = (p2 - p1) / t12, sFar = (p3 - p2) / t23;
+    float vOut = (1.0f - tB) * (wInO * (1.0f + cB) * (1.0f + bB) * sIn + wOutO * (1.0f - cB) * (1.0f - bB) * sOut);
+    float vIn = (1.0f - tC) * (wMidI * (1.0f - cC) * (1.0f + bC) * sOut + wFarI * (1.0f + cC) * (1.0f - bC) * sFar);
+
+    // Monotone limiting (Fritsch-Carlson): clamp each endpoint slope to the local secants so a 1D channel (roll,
+    // FOV) never overshoots or bleeds past its adjacent keyframes - a big roll spike on one keyframe stays in its
+    // two neighboring segments instead of rippling two keyframes out on each side. Only for scalar channels: doing
+    // this per-axis on the 3D aim point puts kinks in its trajectory (each axis zeros its slope at a different
+    // moment), which reads as the aim twitching left/right at keyframes - so the aim passes monotone = false.
+    if (monotone) {
+        if (sIn * sOut <= 0.0f) {
+            vOut = 0.0f;
+        } else {
+            float lim = 3.0f * std::min(std::fabs(sIn), std::fabs(sOut));
+            vOut = std::min(std::max(vOut, -lim), lim);
+        }
+        if (sOut * sFar <= 0.0f) {
+            vIn = 0.0f;
+        } else {
+            float lim = 3.0f * std::min(std::fabs(sOut), std::fabs(sFar));
+            vIn = std::min(std::max(vIn, -lim), lim);
+        }
+    }
+    // Boundary easing: force an endpoint slope to zero so this channel meets a "held" (constant) neighbor with
+    // matching velocity. Used by the aim where a free segment borders a locked-on-target segment - otherwise the
+    // free side arrives moving while the locked side sits still, which reads as a small jerk at the keyframe.
+    if (zeroOut) {
+        vOut = 0.0f;
+    }
+    if (zeroIn) {
+        vIn = 0.0f;
+    }
+    return Hermite1(p1, p2, vOut * t12, vIn * t12, s);
+}
+
+// Interpolate one component over a segment with the given knot intervals, honoring the source keyframe's mode.
+static float InterpComp(float p0, float p1, float p2, float p3, const CineKeyframe& kSrc, const CineKeyframe& kDst,
+                        float t01, float t12, float t23, float s) {
+    if (kSrc.interp == CINE_INTERP_LINEAR) {
+        return p1 + (p2 - p1) * s;
+    }
+    return NuKbScalar(p0, p1, p2, p3, t01, t12, t23, kSrc.tension, kSrc.continuity, kSrc.bias, kDst.tension,
+                      kDst.continuity, kDst.bias, s, true, false, false);
+}
+
+// Duration (seconds) of the path segment that starts at keyframe index j and runs to the next one cyclically.
+// The loop-return segment (last -> first) uses sLoopReturnTime. Clamped to a small positive value. Used as the
+// knot intervals for time-based (velocity-continuous) interpolation.
+static float SegDurAt(int j) {
+    int n = (int)sKeyframes.size();
+    if (n < 2) {
+        return 1.0f;
+    }
+    float d;
+    if (j >= n - 1) {
+        d = LoopCyclic() ? sLoopReturnTime : (sKeyframes[n - 1].time - sKeyframes[n - 2].time);
+    } else {
+        d = sKeyframes[j + 1].time - sKeyframes[j].time;
+    }
+    return d < 1e-4f ? 1e-4f : d;
 }
 
 // A keyframe's effective look-at point this frame: the stored point for free/point aim, or Link's live
@@ -227,7 +441,7 @@ static void EffectiveAt(int idx, float out[3]) {
         return;
     } else if (sAimOverride == 3) {
         float p[3];
-        if (CinematicCam_ResolveActor(&sAimOverrideActorPtr, (short)sAimOverrideActorId, p)) {
+        if (CinematicCam_ResolveActor(&sAimOverrideActorPtr, (short)sAimOverrideActorId, nullptr, p)) {
             out[0] = p[0];
             out[1] = p[1];
             out[2] = p[2];
@@ -246,16 +460,48 @@ static void EffectiveAt(int idx, float out[3]) {
         }
     } else if (k.aimMode == CINE_AIM_ACTOR) {
         float p[3];
-        if (CinematicCam_ResolveActor(&k.aimActorPtr, (short)k.aimActorId, p)) {
+        // Use the saved pick position as a hint so reload re-acquires the nearest matching actor (skip the hint
+        // for old keyframes that never stored one - all-zero - to preserve the previous first-match behavior).
+        bool hasHint = (k.aimActorPos[0] != 0.0f) || (k.aimActorPos[1] != 0.0f) || (k.aimActorPos[2] != 0.0f);
+        if (CinematicCam_ResolveActor(&k.aimActorPtr, (short)k.aimActorId, hasHint ? k.aimActorPos : nullptr, p)) {
             out[0] = p[0];
             out[1] = p[1];
             out[2] = p[2];
             return;
         }
+    } else if (k.aimMode == CINE_AIM_TARGET) {
+        out[0] = sAimOverridePoint[0]; // shared movable aim target
+        out[1] = sAimOverridePoint[1];
+        out[2] = sAimOverridePoint[2];
+        return;
     }
     out[0] = k.at[0];
     out[1] = k.at[1];
     out[2] = k.at[2];
+}
+
+// Two keyframes "lock" onto a single live/shared aim source when both track the same thing (the same actor,
+// both Link, both the movable target) - or whenever a path-level aim override is active. While locked, the
+// camera looks straight at that live point across the whole segment instead of interpolating a look-at
+// position, so a moving (or off-axis) actor/target stays perfectly centered between keyframes. Without this the
+// look-at spline only touches the target AT each keyframe and bows away from it in between (pulled by the
+// neighboring keyframes' tangents). Free/point keyframes are authored static look-at points, so they still blend.
+static bool AimLockedBetween(const CineKeyframe& b, const CineKeyframe& c) {
+    if (sAimOverride != 0) {
+        return true;
+    }
+    if (b.aimMode != c.aimMode) {
+        return false;
+    }
+    switch (b.aimMode) {
+        case CINE_AIM_PLAYER:
+        case CINE_AIM_TARGET:
+            return true;
+        case CINE_AIM_ACTOR:
+            return b.aimActorId == c.aimActorId;
+        default:
+            return false;
+    }
 }
 
 // Smooth pose at an absolute time along the timeline. When looping, the path is treated as cyclic: a
@@ -275,7 +521,7 @@ static CineKeyframe SampleAt(float time) {
     int i1, i2;
     float lt;
 
-    if (!sLoop) {
+    if (!LoopCyclic()) {
         if (time <= sKeyframes[0].time) {
             return sKeyframes[0];
         }
@@ -318,7 +564,7 @@ static CineKeyframe SampleAt(float time) {
 
     // Tangent neighbors: clamp at the ends normally, wrap around when looping.
     int i0, i3;
-    if (sLoop) {
+    if (LoopCyclic()) {
         i0 = ((i1 - 1) % n + n) % n;
         i3 = (i2 + 1) % n;
     } else {
@@ -331,16 +577,37 @@ static CineKeyframe SampleAt(float time) {
     const CineKeyframe& c = sKeyframes[i2];
     const CineKeyframe& d = sKeyframes[i3];
 
-    // Eye (spatial path): Hermite with TCB tangents, but honor any custom tangent (Bend) at either end.
-    // Linear segments stay straight.
+    // Per-keyframe timing ease: reparametrize the segment so the camera slows leaving b (b.easeOut) and/or
+    // slows arriving at c (c.easeIn). A cubic with adjustable start/end slopes; slope 0 = fully eased (hold).
+    if (b.easeOut > 0.0f || c.easeIn > 0.0f) {
+        float m0 = 1.0f - std::min(std::max(b.easeOut, 0.0f), 1.0f);
+        float m1 = 1.0f - std::min(std::max(c.easeIn, 0.0f), 1.0f);
+        lt = Hermite1(0.0f, 1.0f, m0, m1, lt);
+        lt = std::min(std::max(lt, 0.0f), 1.0f);
+    }
+
+    // Eye (spatial path): one unified non-uniform Kochanek-Bartels evaluation. The chosen parameterization
+    // sets the knot intervals (centripetal/chordal/uniform from chord length, or time-based from the segment
+    // durations); Tension/Continuity/Bias shape on top continuously; a manual Bend tangent overrides direction.
     if (b.interp == CINE_INTERP_LINEAR) {
         for (int k = 0; k < 3; k++) {
             out.eye[k] = b.eye[k] + (c.eye[k] - b.eye[k]) * lt;
         }
     } else {
+        float t01, t12, t23;
+        if (sSplineParam == 0) {
+            // Even velocity: knots = the segment durations, so the velocity matches on both sides of every
+            // keyframe (no dip/jolt) while timeline spacing still sets the pacing.
+            t12 = SegDurAt(i1);
+            t01 = (i0 != i1) ? SegDurAt(i0) : t12;
+            t23 = (i2 != i3) ? SegDurAt(i2) : t12;
+        } else {
+            // Uniform Catmull-Rom: equal knot spacing.
+            t01 = t12 = t23 = 1.0f;
+        }
         float td[3], ts[3];
-        TcbOutTangent3(a.eye, b.eye, c.eye, b.tension, b.continuity, b.bias, td); // out tangent at b
-        TcbInTangent3(b.eye, c.eye, d.eye, c.tension, c.continuity, c.bias, ts);  // in tangent at c
+        NuKbTangents(a.eye, b.eye, c.eye, d.eye, t01, t12, t23, b.tension, b.continuity, b.bias, c.tension,
+                     c.continuity, c.bias, td, ts);
         if (b.hasTangent) {
             float m = v3len(td);
             td[0] = b.tangent[0] * m;
@@ -358,17 +625,39 @@ static CineKeyframe SampleAt(float time) {
         }
     }
 
+    // Aim / roll / FOV: always interpolate with TIME-based knots so these change at a smooth, continuous rate
+    // (no stiff angular swing where a turn and an aim change land on the same keyframe). The keyframe times
+    // already encode pacing; spatial overshoot isn't a concern for a look-at point the way it is for the path.
+    float at12 = SegDurAt(i1);
+    float at01 = (i0 != i1) ? SegDurAt(i0) : at12;
+    float at23 = (i2 != i3) ? SegDurAt(i2) : at12;
+
     // Aim (at): interpolate each control keyframe's EFFECTIVE target (handles look-at-point / look-at-Link).
+    // When both ends track the same live/shared source, lock straight onto it so it stays centered between
+    // keyframes (the look-at spline would otherwise bow off a tracked actor/target).
     float aA[3], aB[3], aC[3], aD[3];
     EffectiveAt(i0, aA);
     EffectiveAt(i1, aB);
     EffectiveAt(i2, aC);
     EffectiveAt(i3, aD);
+    // Where a free (interpolated) aim segment borders a locked one, ease the free side's slope to zero at that
+    // boundary so the aim meets the held target with matching velocity rather than jerking. (i0==i1 / i2==i3 are
+    // clamped path ends, so there is no real neighbor segment to match there.)
+    bool aimLocked = AimLockedBetween(b, c);
+    bool prevLocked = (i0 != i1) && AimLockedBetween(a, b);
+    bool nextLocked = (i2 != i3) && AimLockedBetween(c, d);
     for (int k = 0; k < 3; k++) {
-        out.at[k] = InterpComp(aA[k], aB[k], aC[k], aD[k], b, c, lt);
+        if (aimLocked) {
+            out.at[k] = aB[k];
+        } else if (b.interp == CINE_INTERP_LINEAR) {
+            out.at[k] = aB[k] + (aC[k] - aB[k]) * lt;
+        } else {
+            out.at[k] = NuKbScalar(aA[k], aB[k], aC[k], aD[k], at01, at12, at23, b.tension, b.continuity, b.bias,
+                                   c.tension, c.continuity, c.bias, lt, false, prevLocked, nextLocked);
+        }
     }
-    out.roll = InterpComp(a.roll, b.roll, c.roll, d.roll, b, c, lt);
-    out.fov = InterpComp(a.fov, b.fov, c.fov, d.fov, b, c, lt);
+    out.roll = InterpComp(a.roll, b.roll, c.roll, d.roll, b, c, at01, at12, at23, lt);
+    out.fov = InterpComp(a.fov, b.fov, c.fov, d.fov, b, c, at01, at12, at23, lt);
     out.time = time;
     return out;
 }
@@ -393,6 +682,105 @@ static float ApplyEase(float u, int mode) {
     }
 }
 
+// The eased progress the playhead actually uses (ApplyEase blended toward linear by sEaseAmount).
+static float EasedProgress(float u) {
+    float e = ApplyEase(u, sEaseMode);
+    return u + (e - u) * sEaseAmount;
+}
+
+// Inverse of EasedProgress: given the eased progress (playhead / total), find the linear progress u that maps
+// to it. The mapping is monotonic, so bisection converges. Used so Play resumes EXACTLY at the playhead
+// instead of jumping (seeding the linear progress straight from the eased playhead double-applies the ease).
+static float InvertEasedProgress(float target) {
+    if (target <= 0.0f) {
+        return 0.0f;
+    }
+    if (target >= 1.0f) {
+        return 1.0f;
+    }
+    float lo = 0.0f, hi = 1.0f;
+    for (int it = 0; it < 24; it++) {
+        float mid = (lo + hi) * 0.5f;
+        if (EasedProgress(mid) < target) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return (lo + hi) * 0.5f;
+}
+
+// Smooth sum-of-sines pseudo-noise in roughly [-1, 1] for one shake channel (phase separates channels).
+static float ShakeNoise(float t, float phase) {
+    return std::sin(t * 1.00f + phase) * 0.55f + std::sin(t * 2.13f + phase * 1.7f) * 0.30f +
+           std::sin(t * 4.31f + phase * 2.3f) * 0.15f;
+}
+
+// Seamlessly-looping variant: integer harmonics of the loop, so the value at u=0 and u=1 is identical.
+static float ShakeNoiseLoop(float u, int h, float phase) {
+    const float TAU = 6.2831853f;
+    return std::sin(TAU * (float)h * u + phase) * 0.55f + std::sin(TAU * (float)(2 * h) * u + phase * 1.7f) * 0.30f +
+           std::sin(TAU * (float)(4 * h) * u + phase * 2.3f) * 0.15f;
+}
+
+// Apply handheld shake to a pose. Driven by play time so it's deterministic (same wobble when you scrub). When
+// the path forward-loops, the noise is made periodic over the loop length so the seam doesn't jump.
+static void ApplyShake(float playTime, float* eye, float* at, float* roll) {
+    float n[6];
+    if (sLoop && sLoopMode == 0) {
+        float L = EffectiveTotal();
+        if (L < 1e-3f) {
+            L = 1.0f;
+        }
+        float u = playTime / L;
+        u -= std::floor(u);
+        int h = (int)std::lround(sShakeFreq * L); // whole number of wobbles across the loop
+        if (h < 1) {
+            h = 1;
+        }
+        for (int i = 0; i < 6; i++) {
+            n[i] = ShakeNoiseLoop(u, h, i * 10.0f);
+        }
+    } else {
+        // Free-running (no loop, or ping-pong which is already continuous because the playhead reflects).
+        float t = playTime * sShakeFreq;
+        for (int i = 0; i < 6; i++) {
+            n[i] = ShakeNoise(t, i * 10.0f);
+        }
+    }
+    float px = n[0] * sShakePosAmp;
+    float py = n[1] * sShakePosAmp;
+    float pz = n[2] * sShakePosAmp;
+    // Translate eye and look-at together so the aim direction is preserved...
+    eye[0] += px;
+    eye[1] += py;
+    eye[2] += pz;
+    at[0] += px;
+    at[1] += py;
+    at[2] += pz;
+    // ...then add a little angular wobble by nudging the look-at perpendicular, scaled to the aim distance.
+    float dx = at[0] - eye[0], dy = at[1] - eye[1], dz = at[2] - eye[2];
+    float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (dist < 1.0f) {
+        dist = 1.0f;
+    }
+    float k = dist * std::tan(sShakeRotAmp * 3.14159265f / 180.0f);
+    at[0] += n[3] * k;
+    at[1] += n[4] * k;
+    *roll += n[5] * sShakeRotAmp * 0.5f;
+}
+
+// Live position of the follow target (Link or actor). Returns false if follow is off or unavailable.
+static bool FollowCenter(float* out) {
+    if (sFollowMode == 1) {
+        return CinematicCam_GetPlayerPos(out) != 0;
+    }
+    if (sFollowMode == 2) {
+        return CinematicCam_ResolveActor(&sFollowActorPtr, (short)sFollowActorId, nullptr, out) != 0;
+    }
+    return false;
+}
+
 // Append a keyframe capturing the current live freecam pose at time t (used by recording).
 static void RecordKeyframe(float t) {
     CineKeyframe kf{};
@@ -408,6 +796,16 @@ static void RecordKeyframe(float t) {
 // Runs every game frame (OnCameraState hook), just before Camera_Update.
 static void PlaybackTick() {
     static bool wasActive = false;
+    sLoopMarkerFrame = false; // only true for the single frame a loop restarts (set below)
+
+    // If the user left camera mode (toggled it off), stop any playback/preview/recording so the normal game
+    // camera returns to Link. Without this, a still-running (e.g. looping) cinematic keeps gCineCamPlaybackActive
+    // set, which keeps the camera dispatch active even though "Enabled" is off - so the view never returns.
+    if (!CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 0)) {
+        sPlaying = false;
+        sPreview = false;
+        sRecording = false;
+    }
 
     // Recording: lay down keyframes from the live freecam at a fixed interval.
     if (sRecording) {
@@ -424,19 +822,44 @@ static void PlaybackTick() {
         } else {
             float total = EffectiveTotal();
             float denom = (total > 0.0f) ? total : 1.0f;
-            sPlayU += (kTickSeconds * sPlaySpeed) / denom;
-            if (sPlayU >= 1.0f) {
-                if (sLoop) {
-                    sPlayU = std::fmod(sPlayU, 1.0f);
-                } else {
+            float step = (kTickSeconds * sPlaySpeed) / denom;
+            if (sLoop && sLoopMode == 1) {
+                // Ping-pong: advance in the current direction and reflect off each end.
+                sPlayU += step * (float)sPlayDir;
+                if (sPlayU >= 1.0f) {
+                    sPlayU = 1.0f - (sPlayU - 1.0f);
+                    sPlayDir = -1;
+                } else if (sPlayU <= 0.0f) {
+                    sPlayU = -sPlayU;
+                    sPlayDir = 1;
+                    sLoopMarkerFrame = true; // back to the start of a ping-pong cycle
+                }
+                if (sPlayU < 0.0f) {
+                    sPlayU = 0.0f;
+                }
+                if (sPlayU > 1.0f) {
                     sPlayU = 1.0f;
-                    sPlaying = false;
+                }
+            } else {
+                sPlayU += step;
+                if (sPlayU >= 1.0f) {
+                    if (sLoop) {
+                        sPlayU = std::fmod(sPlayU, 1.0f);
+                        sLoopMarkerFrame = true; // wrapped back to the start of a forward loop
+                    } else {
+                        sPlayU = 1.0f;
+                        sPlaying = false;
+                    }
                 }
             }
-            float eu = ApplyEase(sPlayU, sEaseMode);
-            eu = sPlayU + (eu - sPlayU) * sEaseAmount; // blend toward linear by the ease amount
-            sPlayhead = eu * total;
+            sPlayhead = EasedProgress(sPlayU) * total;
         }
+    }
+
+    // Cinematic: re-anchor Link's idle (breathing/head-bob) animation to the start of each loop, so a looping
+    // GIF whose length is a whole number of idle cycles stays perfectly seamless.
+    if (sLoopMarkerFrame && CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.SyncIdleAnim"), 0)) {
+        CinematicCam_SyncLinkIdleAnim();
     }
 
     // Pushing the movement stick while previewing (and not letting Link drive) drops back to manual flying.
@@ -448,12 +871,37 @@ static void PlaybackTick() {
     bool active = (sPlaying || sPreview) && !sKeyframes.empty();
     if (active) {
         CineKeyframe s = SampleAt(sPlayhead);
+        // Path follow: shift the whole rig by how far the tracked target has moved since authoring.
+        if (sFollowMode != 0) {
+            float c[3];
+            if (FollowCenter(c)) {
+                float dx = c[0] - sFollowOrigin[0], dy = c[1] - sFollowOrigin[1], dz = c[2] - sFollowOrigin[2];
+                s.eye[0] += dx;
+                s.eye[1] += dy;
+                s.eye[2] += dz;
+                s.at[0] += dx;
+                s.at[1] += dy;
+                s.at[2] += dz;
+            }
+        }
+        if (sShakeEnabled && (sPlaying || sShakeOnPreview)) {
+            ApplyShake(sPlayhead, s.eye, s.at, &s.roll);
+        }
         CinematicCam_SetPlayback(1, s.eye, s.at, s.roll, s.fov);
         wasActive = true;
     } else if (wasActive) {
         float z[3] = { 0.0f, 0.0f, 0.0f };
         CinematicCam_SetPlayback(0, z, z, 0.0f, 0.0f);
         wasActive = false;
+    }
+
+    // Parameter automation: while a cinematic is driving the view, override the green screen from its track.
+    // Off (-1) otherwise, so the manual dropdown applies when stopped.
+    float gv;
+    if (active && EvalParamTrack(sGreenScreenTrack, sPlayhead, gv)) {
+        sGreenScreenOverride = (int)(gv + 0.5f);
+    } else {
+        sGreenScreenOverride = -1;
     }
 
     // Hide the HUD while the cinematic camera is active (reuses SoH's NoUI state). Only clear what we set,
@@ -484,7 +932,7 @@ static void AddKeyframe() {
     kf.time = sKeyframes.empty() ? 0.0f : sKeyframes.back().time + 2.0f;
     sKeyframes.push_back(kf);
     sIds.push_back(sNextId);
-    sSelectedId = sNextId;
+    SelectOnly(sNextId);
     sNextId++;
 }
 
@@ -507,17 +955,20 @@ static void DeleteSelected() {
     PushUndo();
     sKeyframes.erase(sKeyframes.begin() + idx);
     sIds.erase(sIds.begin() + idx);
-    sSelectedId = sIds.empty() ? -1 : sIds[std::min((size_t)idx, sIds.size() - 1)];
+    SelectOnly(sIds.empty() ? -1 : sIds[std::min((size_t)idx, sIds.size() - 1)]);
 }
 
 static void ClearPath() {
     PushUndo();
     sKeyframes.clear();
     sIds.clear();
-    sSelectedId = -1;
+    SelectOnly(-1);
     sPlayhead = 0.0f;
     sPlaying = false;
     sPreview = false;
+    sFollowMode = 0; // follow is path-level runtime state; clear it with the path
+    sGreenScreenTrack.keys.clear();
+    sGreenScreenTrack.enabled = false;
 }
 
 static void CopySelected() {
@@ -538,7 +989,7 @@ static void AddKeyframeAtPlayhead(const CineKeyframe& kf) {
     k.aimActorPtr = nullptr; // runtime pointer is not copied
     sKeyframes.push_back(k);
     sIds.push_back(sNextId);
-    sSelectedId = sNextId;
+    SelectOnly(sNextId);
     sNextId++;
     SortByTime();
 }
@@ -560,23 +1011,56 @@ static void InsertAtPlayhead() {
     AddKeyframeAtPlayhead(kf);
 }
 
-static void SavePath() {
-    nlohmann::json j = nlohmann::json::array();
-    for (auto& k : sKeyframes) {
-        j.push_back({ { "time", k.time },
-                      { "eye", { k.eye[0], k.eye[1], k.eye[2] } },
-                      { "at", { k.at[0], k.at[1], k.at[2] } },
-                      { "roll", k.roll },
-                      { "fov", k.fov },
-                      { "interp", k.interp },
-                      { "tension", k.tension },
-                      { "continuity", k.continuity },
-                      { "bias", k.bias },
-                      { "hasTangent", k.hasTangent },
-                      { "tangent", { k.tangent[0], k.tangent[1], k.tangent[2] } },
-                      { "aimMode", k.aimMode },
-                      { "aimActorId", k.aimActorId } });
+// Serialize / restore a parameter track to the path file. Generic so future tracks reuse it.
+static nlohmann::json TrackToJson(const CineParamTrack& t) {
+    nlohmann::json keys = nlohmann::json::array();
+    for (const CineParamKey& k : t.keys) {
+        keys.push_back({ { "time", k.time }, { "value", k.value } });
     }
+    return { { "enabled", t.enabled }, { "keys", keys } };
+}
+
+static void TrackFromJson(CineParamTrack& t, const nlohmann::json& j) {
+    t.keys.clear();
+    t.enabled = j.value("enabled", false);
+    if (j.contains("keys")) {
+        for (const auto& e : j["keys"]) {
+            t.keys.push_back({ e.value("time", 0.0f), e.value("value", 0.0f) });
+        }
+        std::sort(t.keys.begin(), t.keys.end(),
+                  [](const CineParamKey& a, const CineParamKey& b) { return a.time < b.time; });
+    }
+}
+
+static void SavePath() {
+    nlohmann::json arr = nlohmann::json::array();
+    for (auto& k : sKeyframes) {
+        arr.push_back({ { "time", k.time },
+                        { "eye", { k.eye[0], k.eye[1], k.eye[2] } },
+                        { "at", { k.at[0], k.at[1], k.at[2] } },
+                        { "roll", k.roll },
+                        { "fov", k.fov },
+                        { "interp", k.interp },
+                        { "tension", k.tension },
+                        { "continuity", k.continuity },
+                        { "bias", k.bias },
+                        { "hasTangent", k.hasTangent },
+                        { "tangent", { k.tangent[0], k.tangent[1], k.tangent[2] } },
+                        { "aimMode", k.aimMode },
+                        { "aimActorId", k.aimActorId },
+                        { "aimActorPos", { k.aimActorPos[0], k.aimActorPos[1], k.aimActorPos[2] } },
+                        { "easeIn", k.easeIn },
+                        { "easeOut", k.easeOut } });
+    }
+    // Object wrapper carries path-level state (the shared aim target) alongside the keyframes.
+    nlohmann::json j;
+    j["keyframes"] = arr;
+    j["target"] = { sAimOverridePoint[0], sAimOverridePoint[1], sAimOverridePoint[2] };
+    // Optionally bind the current location (entrance = scene + spawn) so loading the path warps you back here.
+    sPathEntrance = sBindLocation ? CinematicCam_GetCurrentEntrance() : -1;
+    j["entrance"] = sPathEntrance;
+    // Parameter automation tracks (each keyed by its stable id).
+    j["tracks"][sGreenScreenTrack.id] = TrackToJson(sGreenScreenTrack);
     std::filesystem::create_directories("cinematics");
     std::ofstream f(std::string("cinematics/") + sFilename + ".json");
     if (f.good()) {
@@ -594,7 +1078,24 @@ static void LoadPath() {
         f >> j;
     } catch (...) { return; }
     ClearPath();
-    for (auto& e : j) {
+    // New files are an object { keyframes, target, entrance }; old files are a bare keyframe array (still supported).
+    const nlohmann::json* arr = &j;
+    sPathEntrance = -1;
+    if (j.is_object()) {
+        if (j.contains("keyframes")) {
+            arr = &j["keyframes"];
+        }
+        if (j.contains("target") && j["target"].size() >= 3) {
+            sAimOverridePoint[0] = j["target"][0];
+            sAimOverridePoint[1] = j["target"][1];
+            sAimOverridePoint[2] = j["target"][2];
+        }
+        sPathEntrance = j.value("entrance", -1);
+        if (j.contains("tracks") && j["tracks"].contains(sGreenScreenTrack.id)) {
+            TrackFromJson(sGreenScreenTrack, j["tracks"][sGreenScreenTrack.id]);
+        }
+    }
+    for (auto& e : *arr) {
         CineKeyframe k{};
         k.time = e.value("time", 0.0f);
         k.eye[0] = e["eye"][0];
@@ -622,11 +1123,48 @@ static void LoadPath() {
         k.aimMode = e.value("aimMode", 0);
         k.aimActorId = e.value("aimActorId", 0);
         k.aimActorPtr = nullptr;
+        if (e.contains("aimActorPos") && e["aimActorPos"].size() >= 3) {
+            k.aimActorPos[0] = e["aimActorPos"][0];
+            k.aimActorPos[1] = e["aimActorPos"][1];
+            k.aimActorPos[2] = e["aimActorPos"][2];
+        } else {
+            k.aimActorPos[0] = k.aimActorPos[1] = k.aimActorPos[2] = 0.0f;
+        }
+        k.easeIn = e.value("easeIn", 0.0f);
+        k.easeOut = e.value("easeOut", 0.0f);
         sKeyframes.push_back(k);
         sIds.push_back(sNextId++);
     }
     SortByTime();
-    sSelectedId = sIds.empty() ? -1 : sIds[0];
+    SelectOnly(sIds.empty() ? -1 : sIds[0]);
+
+    // If this path is bound to a location, warp there - unless we're already in that scene (avoids a needless
+    // fade reload when re-loading a path in its home area).
+    if (sTeleportOnLoad && sPathEntrance >= 0 && CinematicCam_GetCurrentEntrance() != sPathEntrance) {
+        CinematicCam_WarpToEntrance(sPathEntrance);
+    }
+}
+
+// List saved cinematic file base-names (without the .json extension) in the cinematics/ folder, sorted.
+static std::vector<std::string> ListCinematics() {
+    std::vector<std::string> out;
+    std::error_code ec;
+    if (std::filesystem::exists("cinematics", ec)) {
+        for (auto& e : std::filesystem::directory_iterator("cinematics", ec)) {
+            if (e.is_regular_file() && e.path().extension() == ".json") {
+                out.push_back(e.path().stem().string());
+            }
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// Point sFilename at a saved file and load it.
+static void LoadNamed(const std::string& name) {
+    strncpy(sFilename, name.c_str(), sizeof(sFilename) - 1);
+    sFilename[sizeof(sFilename) - 1] = '\0';
+    LoadPath();
 }
 
 // ---------------------------------------------------------------------------
@@ -707,6 +1245,159 @@ static void v3rot(const float* v, const float* k, float ang, float* o) {
     float kd = v3dot(k, v);
     for (int i = 0; i < 3; i++) {
         o[i] = v[i] * c + kv[i] * s + k[i] * kd * (1.0f - c);
+    }
+}
+
+// --- Path tools: smoothing + speed normalization -------------------------------------------------
+
+// Smooth the path WITHOUT moving any keyframe: reset every keyframe to clean spline defaults so the chosen
+// parameterization (centripetal by default) can produce loop-free, even motion. Removes linear (sharp)
+// segments, manual Bend tangents, and any Tension/Continuity/Bias that was sharpening corners. Positions,
+// aim, roll and FOV are untouched.
+static void SmoothPath() {
+    if ((int)sKeyframes.size() < 2) {
+        return;
+    }
+    PushUndo();
+    for (auto& k : sKeyframes) {
+        k.interp = CINE_INTERP_SMOOTH;
+        k.hasTangent = 0;
+        k.tension = 0.0f;
+        k.continuity = 0.0f;
+        k.bias = 0.0f;
+    }
+}
+
+// Arc length of the spline between keyframe i and i+1 (geometry is independent of timing, so we sample by
+// the segment's current time span). Used by speed normalization.
+static float SegmentArcLength(int i) {
+    const int kSub = 24;
+    float t0 = sKeyframes[i].time, t1 = sKeyframes[i + 1].time;
+    if (t1 - t0 < 1e-4f) {
+        float d[3] = { sKeyframes[i + 1].eye[0] - sKeyframes[i].eye[0], sKeyframes[i + 1].eye[1] - sKeyframes[i].eye[1],
+                       sKeyframes[i + 1].eye[2] - sKeyframes[i].eye[2] };
+        return std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    }
+    float len = 0.0f;
+    CineKeyframe prev = SampleAt(t0);
+    for (int s = 1; s <= kSub; s++) {
+        float t = t0 + (t1 - t0) * (float)s / (float)kSub;
+        CineKeyframe cur = SampleAt(t);
+        float d[3] = { cur.eye[0] - prev.eye[0], cur.eye[1] - prev.eye[1], cur.eye[2] - prev.eye[2] };
+        len += std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        prev = cur;
+    }
+    return len;
+}
+
+// Re-time keyframes so each segment's duration is ~proportional to its physical path length: the camera then
+// covers the whole path at a near-constant speed. Total duration and the first keyframe's time are preserved.
+//
+// Two refinements over a naive single pass:
+//   - Iterate. With the time-based curve, changing the times changes the geometry (and thus the arc lengths),
+//     so one pass doesn't converge - re-measure and re-time a few times.
+//   - Floor each segment. Two physically close keyframes have a tiny arc length, so pure proportionality gives
+//     them a near-zero duration -> a velocity spike as the camera jumps between them. Each segment is given at
+//     least a small share of the average, which keeps the motion smooth right where it used to struggle.
+static void NormalizeSpeed() {
+    int n = (int)sKeyframes.size();
+    if (n < 3) {
+        return;
+    }
+    float base = sKeyframes[0].time;
+    float totalTime = sKeyframes[n - 1].time - base;
+    if (totalTime <= 1e-4f) {
+        return;
+    }
+    PushUndo();
+    const float kFloor = 0.15f; // each segment gets at least ~15% of the average segment's time
+    for (int iter = 0; iter < 5; iter++) {
+        std::vector<float> seg(n - 1);
+        float totalLen = 0.0f;
+        for (int i = 0; i < n - 1; i++) {
+            seg[i] = SegmentArcLength(i);
+            totalLen += seg[i];
+        }
+        if (totalLen <= 1e-4f) {
+            break;
+        }
+        float avgLen = totalLen / (float)(n - 1);
+        std::vector<float> w(n - 1);
+        float wsum = 0.0f;
+        for (int i = 0; i < n - 1; i++) {
+            w[i] = seg[i] + kFloor * avgLen;
+            wsum += w[i];
+        }
+        float t = base;
+        for (int i = 1; i < n; i++) {
+            t += totalTime * (w[i - 1] / wsum);
+            sKeyframes[i].time = t;
+        }
+        sKeyframes[n - 1].time = base + totalTime; // pin the end exactly
+    }
+}
+
+// Rescale all keyframe times so the path lasts `newTotal` seconds (keeps the first keyframe's time and the
+// relative spacing). The inverse of reading the duration off the timeline.
+static void SetTotalDuration(float newTotal) {
+    int n = (int)sKeyframes.size();
+    if (n < 2 || newTotal <= 1e-4f) {
+        return;
+    }
+    float base = sKeyframes[0].time;
+    float old = sKeyframes[n - 1].time - base;
+    if (old <= 1e-4f) {
+        return;
+    }
+    PushUndo();
+    float s = newTotal / old;
+    for (auto& k : sKeyframes) {
+        k.time = base + (k.time - base) * s;
+    }
+}
+
+// Build a fresh circular/arc path of `count` keyframes orbiting `center` at `radius`/`height`, each aiming at
+// the center. Replaces the current path. A full 360 orbit enables looping. If followMode != 0 the path is set
+// to track that target (Link=1 / actor=2) so the orbit follows it as it moves.
+static void GenerateOrbit(const float* center, float radius, float height, int count, float arcDeg, float startDeg,
+                          float duration, int followMode, int followActorId, void* followActorPtr) {
+    if (count < 2) {
+        count = 2;
+    }
+    PushUndo();
+    sKeyframes.clear();
+    sIds.clear();
+    SelectOnly(-1);
+    bool full = arcDeg >= 359.9f;
+    for (int i = 0; i < count; i++) {
+        float frac = full ? (float)i / (float)count : (float)i / (float)(count - 1);
+        float ang = (startDeg + arcDeg * frac) * (3.14159265f / 180.0f);
+        CineKeyframe k{};
+        k.eye[0] = center[0] + std::cos(ang) * radius;
+        k.eye[1] = center[1] + height;
+        k.eye[2] = center[2] + std::sin(ang) * radius;
+        k.fov = 60.0f;
+        k.aimMode = CINE_AIM_POINT; // aim at the (baked) center; follow translates eye + at together
+        k.at[0] = center[0];
+        k.at[1] = center[1];
+        k.at[2] = center[2];
+        k.time = duration * frac;
+        sKeyframes.push_back(k);
+        sIds.push_back(sNextId++);
+    }
+    SortByTime();
+    SelectOnly(sIds.empty() ? -1 : sIds[0]);
+    // Set up (or clear) path follow so the whole orbit tracks the moving target.
+    sFollowMode = followMode;
+    sFollowActorId = followActorId;
+    sFollowActorPtr = followActorPtr;
+    sFollowOrigin[0] = center[0];
+    sFollowOrigin[1] = center[1];
+    sFollowOrigin[2] = center[2];
+    if (full) {
+        sLoop = true;
+        sLoopMode = 0;
+        sLoopReturnTime = duration / (float)count; // even spacing across the wrap-around segment
     }
 }
 
@@ -1305,18 +1996,165 @@ static bool TargetTryStart(int idx, ImVec2 m) {
     return false;
 }
 
-// Draw the spline, numbered keyframe markers, facing indicators and the playhead over the game view.
-static void DrawWorldOverlay() {
-    if (sKeyframes.empty()) {
+// --- Movable aim target (the path-level "All look at point" override) ---------------------------
+// A single world target you can place at the camera and drag with a 3-axis gizmo; when the path's aim
+// override is set to "All look at point", the whole path aims at it.
+static int sOvTargetDragAxis = -1; // which world axis (0/1/2) of the override target is being dragged
+
+// The shared aim target is "in use" when the path-level override points at it, or any keyframe aims at it.
+static bool TargetInUse() {
+    if (sAimOverride == 2) {
+        return true;
+    }
+    for (auto& k : sKeyframes) {
+        if (k.aimMode == CINE_AIM_TARGET) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void DrawOverrideTarget(ImDrawList* dl) {
+    if (!TargetInUse()) {
         return;
     }
+    float* t = sAimOverridePoint;
+    ImVec2 origin;
+    if (!WorldToScreen(t, origin)) {
+        return;
+    }
+    // Crosshair + label so it reads as a target even from far away.
+    dl->AddLine(ImVec2(origin.x - 10, origin.y), ImVec2(origin.x + 10, origin.y), IM_COL32(255, 120, 60, 230), 1.5f);
+    dl->AddLine(ImVec2(origin.x, origin.y - 10), ImVec2(origin.x, origin.y + 10), IM_COL32(255, 120, 60, 230), 1.5f);
+    dl->AddCircle(origin, 12.0f, IM_COL32(255, 120, 60, 200), 0, 1.5f);
+    dl->AddText(ImVec2(origin.x + 13, origin.y - 9), IM_COL32(255, 180, 120, 255), "target");
+
+    float L = GizmoScale(t, 60.0f);
+    if (L <= 0.0f) {
+        return;
+    }
+    const float axes[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
+    for (int a = 0; a < 3; a++) {
+        float end[3];
+        v3mad(t, axes[a], L, end);
+        ImVec2 ep;
+        if (!WorldToScreen(end, ep)) {
+            continue;
+        }
+        bool hot = (sOvTargetDragAxis == a);
+        ImU32 c = hot ? IM_COL32(255, 255, 120, 255) : kMoveCol[a];
+        dl->AddLine(origin, ep, c, hot ? 3.0f : 2.0f);
+        dl->AddCircleFilled(ep, 3.5f, c);
+    }
+}
+
+static void OverrideTargetContinue() {
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        sOvTargetDragAxis = -1;
+        return;
+    }
+    float* t = sAimOverridePoint;
+    ImVec2 origin, ep;
+    if (!WorldToScreen(t, origin)) {
+        return;
+    }
+    float L = GizmoScale(t, 60.0f);
+    if (L <= 0.0f) {
+        return;
+    }
+    float axis[3] = { 0, 0, 0 };
+    axis[sOvTargetDragAxis] = 1.0f;
+    float end[3];
+    v3mad(t, axis, L, end);
+    if (!WorldToScreen(end, ep)) {
+        return;
+    }
+    float sx = ep.x - origin.x, sy = ep.y - origin.y;
+    float slen = std::sqrt(sx * sx + sy * sy);
+    if (slen < 1e-3f) {
+        return;
+    }
+    ImGuiIO& io = ImGui::GetIO();
+    float along = (io.MouseDelta.x * sx + io.MouseDelta.y * sy) / slen;
+    t[sOvTargetDragAxis] += along * (L / slen);
+}
+
+static bool OverrideTargetTryStart(ImVec2 m) {
+    if (!TargetInUse()) {
+        return false;
+    }
+    float* t = sAimOverridePoint;
+    ImVec2 origin;
+    if (!WorldToScreen(t, origin)) {
+        return false;
+    }
+    float L = GizmoScale(t, 60.0f);
+    if (L <= 0.0f) {
+        return false;
+    }
+    const float axes[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
+    int best = -1;
+    float bestd = 9.0f;
+    for (int a = 0; a < 3; a++) {
+        float end[3];
+        v3mad(t, axes[a], L, end);
+        ImVec2 ep;
+        if (!WorldToScreen(end, ep)) {
+            continue;
+        }
+        float d = DistToSegment(m, origin, ep);
+        if (d < bestd) {
+            bestd = d;
+            best = a;
+        }
+    }
+    if (best >= 0) {
+        sOvTargetDragAxis = best;
+        return true;
+    }
+    return false;
+}
+
+// Place the override target a few units in front of the live free camera.
+static void PlaceOverrideTargetAtCamera() {
+    float eye[3], at[3], roll, fov;
+    CinematicCam_GetPose(eye, at, &roll, &fov);
+    float fwd[3] = { at[0] - eye[0], at[1] - eye[1], at[2] - eye[2] };
+    float len = std::sqrt(fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]);
+    if (len > 1e-3f) {
+        float s = 100.0f / len;
+        sAimOverridePoint[0] = eye[0] + fwd[0] * s;
+        sAimOverridePoint[1] = eye[1] + fwd[1] * s;
+        sAimOverridePoint[2] = eye[2] + fwd[2] * s;
+    } else {
+        sAimOverridePoint[0] = eye[0];
+        sAimOverridePoint[1] = eye[1];
+        sAimOverridePoint[2] = eye[2];
+    }
+}
+
+// Draw the spline, numbered keyframe markers, facing indicators and the playhead over the game view.
+static void DrawWorldOverlay() {
     // Foreground draw list of the game's viewport so the overlay sits on top of the rendered frame.
     ImDrawList* dl = ImGui::GetForegroundDrawList(ImGui::GetMainViewport());
 
-    // Spline curve.
+    DrawOverrideTarget(dl); // the movable aim target draws even before any keyframes exist
+
+    if (sKeyframes.empty()) {
+        return;
+    }
+
+    // Spline curve. Tessellation scales with the number of segments so bends stay smooth on long paths
+    // (this is ONLY the drawn preview line - the camera samples the true curve continuously, see note below).
     if (sKeyframes.size() >= 2) {
         float total = EffectiveTotal();
-        const int steps = 120;
+        int steps = (int)sKeyframes.size() * 32;
+        if (steps < 160) {
+            steps = 160;
+        }
+        if (steps > 2400) {
+            steps = 2400;
+        }
         ImVec2 prev;
         bool prevValid = false;
         for (int i = 0; i <= steps; i++) {
@@ -1415,6 +2253,10 @@ static void HandleOverlayInput() {
         TargetContinue();
         return;
     }
+    if (sOvTargetDragAxis >= 0) {
+        OverrideTargetContinue();
+        return;
+    }
 
     // Start a new interaction on click. Bail only if an ImGui widget is actively being used, so dragging
     // a slider or pressing a button in the editor doesn't also grab a world handle. (We deliberately do
@@ -1427,7 +2269,10 @@ static void HandleOverlayInput() {
     ImVec2 m = io.MousePos;
     int sel = SelectedIndex();
 
-    // Grab the selected keyframe's look-at target, then its gizmo, if the click landed on a handle.
+    // Grab the movable aim target first, then the selected keyframe's look-at target, then its gizmo.
+    if (OverrideTargetTryStart(m)) {
+        return;
+    }
     if (sel >= 0 && TargetTryStart(sel, m)) {
         return;
     }
@@ -1442,7 +2287,11 @@ static void HandleOverlayInput() {
             float dxp = sp.x - m.x;
             float dyp = sp.y - m.y;
             if (dxp * dxp + dyp * dyp <= 11.0f * 11.0f) {
-                sSelectedId = sIds[i];
+                if (ImGui::GetIO().KeyCtrl) {
+                    ToggleSelect(sIds[i]);
+                } else {
+                    SelectOnly(sIds[i]);
+                }
                 return;
             }
         }
@@ -1451,32 +2300,42 @@ static void HandleOverlayInput() {
 
 // Draw a distance-sorted actor list (nearest the camera first) with id + position so identical-named
 // actors are distinguishable. Returns the picked index into buf, or -1.
-static int DrawActorPickerList(CineActorInfo* buf, int n) {
+// Self-contained actor picker for use inside a BeginPopup. The actor list is SNAPSHOTTED when the popup opens
+// (and on Refresh) and sorted nearest-first once, so fast-moving actors don't reorder under the cursor (which
+// made clicks land on the wrong actor / miss entirely). Fills *out and returns true when one is picked.
+static bool DrawActorPicker(CineActorInfo* out) {
+    static std::vector<CineActorInfo> snap;
+    static char filter[32] = "";
+
     float eye[3];
     bool haveEye = CinematicCam_GetViewEye(eye) != 0;
-
-    static std::vector<int> order;
-    order.resize(n);
-    for (int i = 0; i < n; i++) {
-        order[i] = i;
-    }
-    auto dist2 = [&](int k) {
-        float dx = buf[k].pos[0] - eye[0], dy = buf[k].pos[1] - eye[1], dz = buf[k].pos[2] - eye[2];
+    auto dist2 = [&](const CineActorInfo& a) {
+        float dx = a.pos[0] - eye[0], dy = a.pos[1] - eye[1], dz = a.pos[2] - eye[2];
         return dx * dx + dy * dy + dz * dz;
     };
-    if (haveEye) {
-        std::sort(order.begin(), order.end(), [&](int a, int b) { return dist2(a) < dist2(b); });
+
+    bool refresh = ImGui::IsWindowAppearing(); // first frame the popup is shown
+    ImGui::Text("%d actors%s", (int)snap.size(), haveEye ? " (nearest first)" : "");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Refresh")) {
+        refresh = true;
     }
-
-    ImGui::Text("%d actors%s", n, haveEye ? " (nearest first)" : "");
-    static char filter[32] = "";
+    if (refresh) {
+        static CineActorInfo tmp[512];
+        int n = CinematicCam_EnumActors(tmp, 512);
+        snap.assign(tmp, tmp + n);
+        if (haveEye) {
+            std::sort(snap.begin(), snap.end(),
+                      [&](const CineActorInfo& a, const CineActorInfo& b) { return dist2(a) < dist2(b); });
+        }
+    }
     ImGui::InputTextWithHint("##actorfilter", "filter by name...", filter, sizeof(filter));
+    ImGui::TextDisabled("List frozen while open - press Refresh to re-read positions.");
 
-    int picked = -1;
-    ImGui::BeginChild("##actorlist", ImVec2(390, 340), true);
-    for (int oi = 0; oi < n; oi++) {
-        int i = order[oi];
-        const char* nm = buf[i].name ? buf[i].name : "?";
+    bool picked = false;
+    ImGui::BeginChild("##actorlist", ImVec2(390, 320), true);
+    for (size_t i = 0; i < snap.size(); i++) {
+        const char* nm = snap[i].name ? snap[i].name : "?";
         if (filter[0]) {
             std::string h = nm, f = filter;
             std::transform(h.begin(), h.end(), h.begin(), [](unsigned char ch) { return (char)std::tolower(ch); });
@@ -1485,12 +2344,13 @@ static int DrawActorPickerList(CineActorInfo* buf, int n) {
                 continue;
             }
         }
-        float d = haveEye ? std::sqrt(dist2(i)) : 0.0f;
+        float d = haveEye ? std::sqrt(dist2(snap[i])) : 0.0f;
         char lbl[128];
-        snprintf(lbl, sizeof(lbl), "%s  (id %d)  %.0fu  @ %.0f, %.0f, %.0f##ap%d", nm, buf[i].id, d, buf[i].pos[0],
-                 buf[i].pos[1], buf[i].pos[2], i);
+        snprintf(lbl, sizeof(lbl), "%s  (id %d)  %.0fu  @ %.0f, %.0f, %.0f##ap%zu", nm, snap[i].id, d, snap[i].pos[0],
+                 snap[i].pos[1], snap[i].pos[2], i);
         if (ImGui::Selectable(lbl)) {
-            picked = i;
+            *out = snap[i];
+            picked = true;
         }
     }
     ImGui::EndChild();
@@ -1501,101 +2361,319 @@ static int DrawActorPickerList(CineActorInfo* buf, int n) {
 // loop-return region shaded. Replaces the plain slider.
 static void DrawTimeline() {
     int n = (int)sKeyframes.size();
-    float total = EffectiveTotal();
-    if (total <= 0.0f) {
-        total = 1.0f;
+
+    // Interaction state (persists across frames). Declared up top so the view-duration logic can tell whether
+    // an edit is in progress and avoid rescaling the ruler mid-drag.
+    static bool sTlScrub = false;
+    static int sTlDragMode = 0;          // 0 none, 1 move selection, 2 ripple (this kf + everything after)
+    static float sTlGrabTime0 = 0.0f;    // timeline time under the cursor when the drag began
+    static float sTlGrabbedT0 = 0.0f;    // original time of the grabbed marker (ripple threshold)
+    static std::vector<int> sTlDragIds;  // snapshot of all ids at drag start...
+    static std::vector<float> sTlDragT0; // ...and their original times
+    static bool sTlNoDrag = false;       // true for a ctrl-click (toggle select, don't move)
+    static float sTlViewDur = 0.0f;      // displayed ruler length in seconds (decoupled from content)
+    static bool sTlAutoFit = true;       // keep the ruler fit to the path when not zoomed manually
+    static int sTlTrackDrag = -1;        // automation lane whose key is being dragged (-1 = none)
+    static int sTlKeyDrag = -1;          // key index within that track
+    bool interacting = (sTlDragMode != 0) || sTlScrub || (sTlTrackDrag >= 0);
+
+    float content = EffectiveTotal(); // actual path length (for labels + playhead clamp)
+    if (content <= 0.0f) {
+        content = 1.0f;
+    }
+    // Ruler length: fit-to-content with headroom when idle; frozen during a drag so markers don't slide
+    // around under the cursor. Always grows to keep every marker on-screen.
+    if (sTlAutoFit && !interacting) {
+        sTlViewDur = content * 1.12f;
+    }
+    if (sTlViewDur < content) {
+        sTlViewDur = content;
+    }
+    if (sTlViewDur < 0.25f) {
+        sTlViewDur = 0.25f;
+    }
+    float view = sTlViewDur;
+
+    // Dope-sheet lanes: the camera keyframes, plus one lane per enabled automation track. Extend autoLanes as
+    // more keyframable parameters come online (the timeline picks them up automatically).
+    struct TlLane {
+        CineParamTrack* track;
+        const char* name;
+        const ImU32* palette;
+        int palCount;
+    };
+    static const ImU32 kGsPalette[3] = { IM_COL32(150, 150, 150, 255), IM_COL32(40, 200, 90, 255),
+                                         IM_COL32(60, 120, 230, 255) };
+    std::vector<TlLane> autoLanes;
+    if (sGreenScreenTrack.enabled) {
+        autoLanes.push_back({ &sGreenScreenTrack, "Green scr", kGsPalette, 3 });
     }
 
-    ImVec2 size = ImVec2(ImGui::GetContentRegionAvail().x, 46.0f);
-    if (size.x < 60.0f) {
-        size.x = 60.0f;
+    const float headerW = 88.0f;
+    const float rulerH = 15.0f;
+    const float laneH = 22.0f;
+    int laneCount = 1 + (int)autoLanes.size();
+
+    ImVec2 size = ImVec2(ImGui::GetContentRegionAvail().x, rulerH + laneH * laneCount + 6.0f);
+    if (size.x < 80.0f) {
+        size.x = 80.0f;
     }
     ImVec2 p0 = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton("##timeline", size);
     ImVec2 p1 = ImVec2(p0.x + size.x, p0.y + size.y);
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddRectFilled(p0, p1, IM_COL32(35, 35, 38, 255), 4.0f);
+    dl->AddRectFilled(p0, p1, IM_COL32(28, 28, 31, 255), 4.0f);
     dl->AddRect(p0, p1, IM_COL32(90, 90, 95, 255), 4.0f);
 
-    auto timeToX = [&](float t) { return p0.x + (t / total) * size.x; };
+    float axisX0 = p0.x + headerW;
+    float axisW = size.x - headerW;
+    if (axisW < 20.0f) {
+        axisW = 20.0f;
+    }
+    float rulerY1 = p0.y + rulerH;
+    auto timeToX = [&](float t) { return axisX0 + (t / view) * axisW; };
     auto xToTime = [&](float x) {
-        float u = (x - p0.x) / size.x;
+        float u = (x - axisX0) / axisW;
         if (u < 0.0f) {
             u = 0.0f;
         }
         if (u > 1.0f) {
             u = 1.0f;
         }
-        return u * total;
+        return u * view;
     };
+    auto laneTop = [&](int lane) { return rulerY1 + lane * laneH; };
+    auto laneMid = [&](int lane) { return rulerY1 + lane * laneH + laneH * 0.5f; };
 
-    if (sLoop && n >= 2) { // shade the loop-return tail
-        float lx = timeToX(TotalTime());
-        dl->AddRectFilled(ImVec2(lx, p0.y + 1), ImVec2(p1.x - 1, p1.y - 1), IM_COL32(80, 60, 30, 90), 4.0f);
+    // Header divider + ruler baseline.
+    dl->AddLine(ImVec2(axisX0, p0.y), ImVec2(axisX0, p1.y), IM_COL32(70, 70, 75, 255), 1.0f);
+    dl->AddLine(ImVec2(axisX0, rulerY1), ImVec2(p1.x, rulerY1), IM_COL32(70, 70, 75, 255), 1.0f);
+
+    // Ruler ticks + faint vertical gridlines through every lane.
+    {
+        float rough = view / 8.0f;
+        if (rough < 1e-4f) {
+            rough = 1e-4f;
+        }
+        float mag = std::pow(10.0f, std::floor(std::log10(rough)));
+        float r = rough / mag;
+        float stepT = (r >= 5.0f) ? 5.0f * mag : (r >= 2.0f) ? 2.0f * mag : mag;
+        for (float t = 0.0f; t <= view + 1e-4f; t += stepT) {
+            float x = timeToX(t);
+            dl->AddLine(ImVec2(x, rulerY1), ImVec2(x, p1.y), IM_COL32(46, 46, 50, 255), 1.0f);
+            char lbl[16];
+            snprintf(lbl, sizeof(lbl), "%g", t);
+            dl->AddText(ImVec2(x + 2.0f, p0.y + 1.0f), IM_COL32(140, 140, 145, 255), lbl);
+        }
     }
 
-    float cy = (p0.y + p1.y) * 0.5f;
+    // Lane labels + separators.
+    dl->AddText(ImVec2(p0.x + 6.0f, laneMid(0) - 7.0f), IM_COL32(215, 215, 220, 255), "Camera");
+    for (int li = 0; li < (int)autoLanes.size(); li++) {
+        dl->AddText(ImVec2(p0.x + 6.0f, laneMid(1 + li) - 7.0f), IM_COL32(215, 215, 220, 255), autoLanes[li].name);
+    }
+    for (int lane = 1; lane < laneCount; lane++) {
+        float y = laneTop(lane);
+        dl->AddLine(ImVec2(p0.x, y), ImVec2(p1.x, y), IM_COL32(45, 45, 48, 255), 1.0f);
+    }
+
+    // Loop-return tail shading (camera lane only).
+    if (LoopCyclic() && n >= 2) {
+        float lx = timeToX(TotalTime());
+        float rx = timeToX(content);
+        dl->AddRectFilled(ImVec2(lx, laneTop(0) + 1.0f), ImVec2(rx, laneTop(0) + laneH - 1.0f),
+                          IM_COL32(80, 60, 30, 90), 0.0f);
+    }
+
+    // Camera keyframe markers.
+    float camCy = laneMid(0);
     for (int i = 0; i < n; i++) {
         float kx = timeToX(sKeyframes[i].time);
-        bool sel = sIds[i] == sSelectedId;
+        bool sel = IsSelected(sIds[i]);
+        bool primary = sIds[i] == sSelectedId;
         ImU32 c = sel ? IM_COL32(80, 200, 255, 255) : IM_COL32(255, 160, 30, 255);
-        dl->AddLine(ImVec2(kx, p0.y + 4), ImVec2(kx, p1.y - 4), c, sel ? 2.0f : 1.0f);
-        dl->AddCircleFilled(ImVec2(kx, cy), sel ? 6.0f : 5.0f, c);
-        dl->AddCircle(ImVec2(kx, cy), sel ? 6.0f : 5.0f, IM_COL32(0, 0, 0, 180), 0, 1.0f);
+        dl->AddCircleFilled(ImVec2(kx, camCy), sel ? 6.0f : 5.0f, c);
+        dl->AddCircle(ImVec2(kx, camCy), primary ? 8.0f : 6.0f, IM_COL32(255, 255, 255, primary ? 220 : 120), 0,
+                      primary ? 2.0f : 1.0f);
     }
 
-    float px = timeToX(sPlayhead);
-    dl->AddLine(ImVec2(px, p0.y), ImVec2(px, p1.y), IM_COL32(60, 255, 90, 255), 2.0f);
-    dl->AddTriangleFilled(ImVec2(px - 5, p0.y + 1), ImVec2(px + 5, p0.y + 1), ImVec2(px, p0.y + 9),
-                          IM_COL32(60, 255, 90, 255));
+    // Automation-track keys, drawn as squares colored by the value they hold.
+    for (int li = 0; li < (int)autoLanes.size(); li++) {
+        const TlLane& L = autoLanes[li];
+        float ly = laneMid(1 + li);
+        for (size_t ki = 0; ki < L.track->keys.size(); ki++) {
+            float kx = timeToX(L.track->keys[ki].time);
+            int v = (int)(L.track->keys[ki].value + 0.5f);
+            ImU32 c = (v >= 0 && v < L.palCount) ? L.palette[v] : IM_COL32(150, 150, 150, 255);
+            dl->AddRectFilled(ImVec2(kx - 4.0f, ly - 6.0f), ImVec2(kx + 4.0f, ly + 6.0f), c, 2.0f);
+            dl->AddRect(ImVec2(kx - 4.0f, ly - 6.0f), ImVec2(kx + 4.0f, ly + 6.0f), IM_COL32(255, 255, 255, 130), 2.0f);
+        }
+    }
 
-    // Interaction: grab a nearby marker to retime it, otherwise scrub the playhead.
-    static int sTlDragKfId = -1;
-    static bool sTlScrub = false;
-    static float sTlGrabOffset = 0.0f; // marker time minus grab time, so a click doesn't snap the marker
-    float mx = ImGui::GetIO().MousePos.x;
-    if (ImGui::IsItemActivated()) {
-        int hit = -1;
-        float hitd = 8.0f;
-        for (int i = 0; i < n; i++) {
-            float d = std::fabs(timeToX(sKeyframes[i].time) - mx);
-            if (d < hitd) {
-                hitd = d;
-                hit = i;
+    // Playhead spanning all lanes.
+    float px = timeToX(sPlayhead);
+    dl->AddLine(ImVec2(px, rulerY1), ImVec2(px, p1.y), IM_COL32(60, 255, 90, 255), 2.0f);
+    dl->AddTriangleFilled(ImVec2(px - 5.0f, rulerY1 + 1.0f), ImVec2(px + 5.0f, rulerY1 + 1.0f),
+                          ImVec2(px, rulerY1 + 9.0f), IM_COL32(60, 255, 90, 255));
+
+    // Interaction: in the Camera lane, click/drag markers (ctrl-click multi-select, shift-drag ripple). In an
+    // automation lane, drag a key to retime it (clamped between its neighbors so order stays stable). Empty lane
+    // space or the ruler scrubs the playhead. Clicks in the header column are ignored.
+    ImGuiIO& io = ImGui::GetIO();
+    float mx = io.MousePos.x;
+    float my = io.MousePos.y;
+    auto laneAt = [&](float y) -> int {
+        for (int lane = 0; lane < laneCount; lane++) {
+            if (y >= laneTop(lane) && y < laneTop(lane) + laneH) {
+                return lane;
             }
         }
-        if (hit >= 0) {
-            PushUndo();
-            sTlDragKfId = sIds[hit];
-            sSelectedId = sIds[hit];
-            sTlGrabOffset = sKeyframes[hit].time - xToTime(mx);
-            sTlScrub = false;
-        } else {
-            sTlScrub = true;
+        return -1;
+    };
+    if (ImGui::IsItemActivated()) {
+        sTlNoDrag = false;
+        sTlDragMode = 0;
+        sTlScrub = false;
+        sTlTrackDrag = -1;
+        sTlKeyDrag = -1;
+        int lane = (mx >= axisX0) ? laneAt(my) : -2; // -2 = header column, ignore
+        if (lane == 0) {
+            int hit = -1;
+            float hitd = 8.0f;
+            for (int i = 0; i < n; i++) {
+                float d = std::fabs(timeToX(sKeyframes[i].time) - mx);
+                if (d < hitd) {
+                    hitd = d;
+                    hit = i;
+                }
+            }
+            if (hit >= 0) {
+                int hitId = sIds[hit];
+                if (io.KeyCtrl) {
+                    ToggleSelect(hitId); // add/remove from the multi-selection, no drag
+                    sTlNoDrag = true;
+                } else {
+                    if (!IsSelected(hitId)) {
+                        SelectOnly(hitId); // clicking an unselected marker selects just it
+                    } else {
+                        sSelectedId = hitId; // keep the group, make this the primary
+                    }
+                    PushUndo();
+                    sTlDragMode = io.KeyShift ? 2 : 1;
+                    sTlGrabTime0 = xToTime(mx);
+                    sTlGrabbedT0 = sKeyframes[hit].time;
+                    sTlDragIds = sIds;
+                    sTlDragT0.resize(n);
+                    for (int i = 0; i < n; i++) {
+                        sTlDragT0[i] = sKeyframes[i].time;
+                    }
+                }
+            } else {
+                sTlScrub = true;
+                sPreview = true;
+                CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
+            }
+        } else if (lane > 0) {
+            CineParamTrack* tr = autoLanes[lane - 1].track;
+            int hit = -1;
+            float hitd = 8.0f;
+            for (int ki = 0; ki < (int)tr->keys.size(); ki++) {
+                float d = std::fabs(timeToX(tr->keys[ki].time) - mx);
+                if (d < hitd) {
+                    hitd = d;
+                    hit = ki;
+                }
+            }
+            if (hit >= 0) {
+                PushUndo();
+                sTlTrackDrag = lane - 1;
+                sTlKeyDrag = hit;
+            } else {
+                sTlScrub = true;
+                sPreview = true;
+                CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
+            }
+        } else if (lane == -1) {
+            sTlScrub = true; // ruler / empty area below the lanes
             sPreview = true;
             CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
         }
     }
     if (ImGui::IsItemActive()) {
-        if (sTlDragKfId >= 0) {
-            float t = xToTime(mx) + sTlGrabOffset; // preserve the grab point (no jump on click)
-            for (int i = 0; i < n; i++) {
-                if (sIds[i] == sTlDragKfId) {
-                    sKeyframes[i].time = (t < 0.0f) ? 0.0f : t;
-                    SortByTime();
-                    break;
+        if (sTlDragMode != 0) {
+            float delta = xToTime(mx) - sTlGrabTime0;
+            for (size_t s = 0; s < sTlDragIds.size(); s++) {
+                bool affected = (sTlDragMode == 2) ? (sTlDragT0[s] >= sTlGrabbedT0 - 1e-4f) : IsSelected(sTlDragIds[s]);
+                if (!affected) {
+                    continue;
                 }
+                float nt = sTlDragT0[s] + delta;
+                if (nt < 0.0f) {
+                    nt = 0.0f;
+                }
+                for (int i = 0; i < (int)sIds.size(); i++) {
+                    if (sIds[i] == sTlDragIds[s]) {
+                        sKeyframes[i].time = nt;
+                        break;
+                    }
+                }
+            }
+            SortByTime();
+        } else if (sTlTrackDrag >= 0 && sTlTrackDrag < (int)autoLanes.size()) {
+            CineParamTrack* tr = autoLanes[sTlTrackDrag].track;
+            if (sTlKeyDrag >= 0 && sTlKeyDrag < (int)tr->keys.size()) {
+                // Clamp between neighbors so order (and the dragged index) stays valid - no resort needed.
+                float lo = (sTlKeyDrag > 0) ? tr->keys[sTlKeyDrag - 1].time + 1e-3f : 0.0f;
+                float hi = (sTlKeyDrag < (int)tr->keys.size() - 1) ? tr->keys[sTlKeyDrag + 1].time - 1e-3f : 1e9f;
+                float nt = xToTime(mx);
+                nt = std::min(std::max(nt, lo), hi);
+                tr->keys[sTlKeyDrag].time = nt;
             }
         } else if (sTlScrub) {
             sPlayhead = xToTime(mx);
+            if (sPlayhead > content) {
+                sPlayhead = content;
+            }
             sPreview = true;
             CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
         }
     }
     if (ImGui::IsItemDeactivated()) {
-        sTlDragKfId = -1;
+        sTlDragMode = 0;
         sTlScrub = false;
+        sTlNoDrag = false;
+        sTlTrackDrag = -1;
+        sTlKeyDrag = -1;
     }
+
+    float total = content;
+
+    // Zoom controls for the ruler (manual zoom turns off auto-fit; Fit re-enables it).
+    if (ImGui::SmallButton("-##tlzoom")) {
+        sTlAutoFit = false;
+        sTlViewDur *= 1.35f;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Zoom out (show more time)");
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("+##tlzoom")) {
+        sTlAutoFit = false;
+        sTlViewDur /= 1.35f;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Zoom in (more precise dragging)");
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Fit")) {
+        sTlAutoFit = true;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Auto-fit the ruler to the path length");
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("|");
+    ImGui::SameLine();
 
     // Step controls: prev keyframe, -1 tick, +1 tick, next keyframe.
     auto setPlayhead = [&](float t) {
@@ -1650,6 +2728,12 @@ static void DrawTimeline() {
     }
     ImGui::SameLine();
     ImGui::Text("%.2fs / %.2fs%s", sPlayhead, total, sLoop ? " (loop)" : "");
+    if (SelectionCount() > 1) {
+        ImGui::TextDisabled("%d keyframes selected - drag any to move them together.", SelectionCount());
+    } else {
+        ImGui::TextDisabled("Camera: drag = move, Ctrl+click = multi-select, Shift+drag = ripple. Track keys: drag to "
+                            "retime (add/remove in Automation).");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1659,14 +2743,117 @@ void CinematicCamPathWindow::InitElement() {
     if (!sHookRegistered) {
         GameInteractor::Instance->RegisterGameHook<GameInteractor::OnCameraState>(
             [](PlayState* play) { PlaybackTick(); });
+        // Force the numeric locale to "C" so ImGui's Ctrl+click value entry (which parses via sscanf("%f", ...))
+        // accepts a '.' decimal point. On comma-decimal locales sscanf otherwise stops at the dot, which made
+        // typed decimals silently truncate to whole numbers. "C" numeric locale is what SoH's own config parsing
+        // already expects, so this is consistent and safe.
+        setlocale(LC_NUMERIC, "C");
         sHookRegistered = true;
     }
 }
 
+// Generic editor for a discrete (enum) parameter track: pick a value, add a key at the playhead, then edit the
+// per-key time/value rows. `labels`/`count` describe the enum. Reused as more discrete parameters are added.
+static void DrawParamTrackEditor(CineParamTrack& t, const char* const* labels, int count) {
+    static int addVal = 0; // value chosen for the next "Add key" (one editor visible at a time today)
+    if (addVal >= count) {
+        addVal = 0;
+    }
+    ImGui::SetNextItemWidth(140.0f);
+    ImGui::Combo("##addval", &addVal, labels, count);
+    ImGui::SameLine();
+    if (ImGui::Button("Add key at playhead")) {
+        TrackAddKey(t, sPlayhead, (float)addVal);
+    }
+    ImGui::SameLine();
+    float pv;
+    int cur = EvalParamTrack(t, sPlayhead, pv) ? (int)(pv + 0.5f) : -1;
+    ImGui::TextDisabled("now: %s", (cur >= 0 && cur < count) ? labels[cur] : "-");
+
+    if (t.keys.empty()) {
+        ImGui::TextDisabled("No keys yet - choose a value and Add at the playhead.");
+        return;
+    }
+    int removeIdx = -1;
+    bool needSort = false;
+    for (int i = 0; i < (int)t.keys.size(); i++) {
+        ImGui::PushID(i);
+        ImGui::SetNextItemWidth(70.0f);
+        float tm = t.keys[i].time;
+        if (ImGui::InputFloat("##t", &tm, 0.0f, 0.0f, "%.2f")) {
+            t.keys[i].time = (tm < 0.0f) ? 0.0f : tm;
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            needSort = true;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("s");
+        ImGui::SameLine();
+        int v = (int)(t.keys[i].value + 0.5f);
+        if (v >= count) {
+            v = 0;
+        }
+        ImGui::SetNextItemWidth(140.0f);
+        if (ImGui::Combo("##v", &v, labels, count)) {
+            t.keys[i].value = (float)v;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("X")) {
+            removeIdx = i;
+        }
+        ImGui::PopID();
+    }
+    if (removeIdx >= 0) {
+        t.keys.erase(t.keys.begin() + removeIdx);
+    } else if (needSort) {
+        std::sort(t.keys.begin(), t.keys.end(),
+                  [](const CineParamKey& a, const CineParamKey& b) { return a.time < b.time; });
+    }
+}
+
 void CinematicCamPathWindow::DrawElement() {
-    ImGui::TextWrapped("Fly the free camera to a shot and Add Keyframe (or Record a live flight). Build a few, "
-                       "then Play to glide through them. Click a marker in the world or on the timeline to "
-                       "select it; drag to reposition / retime.");
+    // Status strip: always shows the current mode at a glance.
+    {
+        char st[96];
+        ImVec4 col;
+        if (sRecording) {
+            snprintf(st, sizeof(st), "REC  %.1fs  (%d keyframes)", sRecordTime, (int)sKeyframes.size());
+            col = ImVec4(1.0f, 0.35f, 0.35f, 1.0f);
+        } else if (sPlaying) {
+            snprintf(st, sizeof(st), "PLAYING  %.2f / %.2fs%s", sPlayhead, EffectiveTotal(),
+                     sLoop ? (sLoopMode == 1 ? "  (ping-pong)" : "  (loop)") : "");
+            col = ImVec4(0.4f, 1.0f, 0.5f, 1.0f);
+        } else if (sPreview) {
+            snprintf(st, sizeof(st), "PREVIEW  %.2fs", sPlayhead);
+            col = ImVec4(1.0f, 0.85f, 0.3f, 1.0f);
+        } else if (FreeCamEnabled()) {
+            int s = SelectedIndex();
+            if (s >= 0) {
+                snprintf(st, sizeof(st), "FREE CAMERA  -  editing keyframe %d / %d", s + 1, (int)sKeyframes.size());
+            } else {
+                snprintf(st, sizeof(st), "FREE CAMERA  -  %d keyframes", (int)sKeyframes.size());
+            }
+            col = ImVec4(0.5f, 0.8f, 1.0f, 1.0f);
+        } else {
+            snprintf(st, sizeof(st), "IDLE  -  enable the free camera to begin");
+            col = ImVec4(0.7f, 0.7f, 0.7f, 1.0f);
+        }
+        ImGui::TextColored(col, "%s", st);
+    }
+    if (ImGui::CollapsingHeader("Help / shortcuts")) {
+        ImGui::TextWrapped("Fly the free camera to a shot and Add Keyframe (or Record a live flight). Build a few, "
+                           "then Play to glide through them. Click a marker in the world or on the timeline to "
+                           "select it; drag to reposition / retime.");
+        ImGui::BulletText("Sticks: left = move, right = look. Buttons (rebindable in Dev Tools > Cinematic Cam):");
+        ImGui::Indent();
+        ImGui::TextUnformatted("Boost = RB, Precision = L, Ascend = R, Descend = Z, FOV = D-pad up/down, "
+                               "Roll = D-pad left/right.");
+        ImGui::Unindent();
+        ImGui::BulletText("Timeline: drag a marker to move; Ctrl+click = multi-select; Shift+drag = ripple "
+                          "(push this + later). -/+/Fit zoom the ruler.");
+        ImGui::BulletText("Keyboard (this window focused): Space = play/stop, , / . = step a tick, "
+                          "[ / ] = prev/next keyframe, K = add keyframe, Del = delete, Ctrl+Z / Ctrl+Y = undo/redo.");
+    }
     ImGui::Separator();
 
     bool enabled = FreeCamEnabled();
@@ -1688,6 +2875,82 @@ void CinematicCamPathWindow::DrawElement() {
         DrawWorldOverlay();
     }
 
+    // Keyboard shortcuts (only while this window is focused and not typing into a field).
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !ImGui::GetIO().WantTextInput) {
+        ImGuiIO& io = ImGui::GetIO();
+        auto goTo = [&](float t) {
+            sPlayhead = std::min(std::max(t, 0.0f), EffectiveTotal());
+            sPreview = true;
+            CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
+        };
+        auto selectAdjacent = [&](int dir) {
+            if (sIds.empty()) {
+                return;
+            }
+            int idx = SelectedIndex();
+            idx = (idx < 0) ? 0 : std::min(std::max(idx + dir, 0), (int)sIds.size() - 1);
+            SelectOnly(sIds[idx]);
+            goTo(sKeyframes[idx].time); // jump the playhead to it so the camera frames the selection
+        };
+        if (ImGui::IsKeyPressed(ImGuiKey_Space) && sKeyframes.size() >= 2) {
+            if (sPlaying) {
+                sPlaying = false;
+            } else {
+                float pt = EffectiveTotal();
+                if (sPlayhead >= pt) {
+                    sPlayhead = 0.0f;
+                }
+                sPlayU = InvertEasedProgress((pt > 0.0f) ? (sPlayhead / pt) : 0.0f); // resume exactly at playhead
+                sPlayDir = 1;
+                if (sPlayhead == 0.0f && CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.SyncIdleAnim"), 0)) {
+                    CinematicCam_SyncLinkIdleAnim(); // anchor Link's idle anim when starting from the top
+                }
+                sPlaying = true;
+                sPreview = false;
+                CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
+            }
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Comma)) {
+            goTo(sPlayhead - kTickSeconds);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Period)) {
+            goTo(sPlayhead + kTickSeconds);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket)) {
+            selectAdjacent(-1);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_RightBracket)) {
+            selectAdjacent(1);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_K) && enabled) {
+            AddKeyframe();
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Delete) && SelectedIndex() >= 0) {
+            DeleteSelected();
+        }
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z)) {
+            Undo();
+        }
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y)) {
+            Redo();
+        }
+    }
+
+    // Phase 1 layout: a left controls column, a right column (inspector + playback + library), and the dope-sheet
+    // timeline pinned across the bottom. Sized from the remaining space so the timeline always stays in view.
+    ImVec2 cineAvail = ImGui::GetContentRegionAvail();
+    int cineLanes = 1 + (sGreenScreenTrack.enabled ? 1 : 0);
+    float cineBottomH = (15.0f + 22.0f * cineLanes + 6.0f) + 80.0f;
+    float cineTopH = cineAvail.y - cineBottomH - 8.0f;
+    if (cineTopH < 150.0f) {
+        cineTopH = 150.0f;
+    }
+    float cineLeftW = cineAvail.x * 0.42f;
+    if (cineLeftW < 240.0f) {
+        cineLeftW = 240.0f;
+    }
+    ImGui::BeginChild("##cineLeft", ImVec2(cineLeftW, cineTopH), true);
+
     // Actor POV spectate: lock the camera to an actor's viewpoint, live.
     if (ImGui::CollapsingHeader("Actor POV (spectate)")) {
         bool spec = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.SpectateEnabled"), 0);
@@ -1702,12 +2965,10 @@ void CinematicCamPathWindow::DrawElement() {
             ImGui::OpenPopup("Pick spectate actor");
         }
         if (ImGui::BeginPopup("Pick spectate actor")) {
-            static CineActorInfo sa[512];
-            int pn = CinematicCam_EnumActors(sa, 512);
-            int pick = DrawActorPickerList(sa, pn);
-            if (pick >= 0) {
-                CinematicCam_SetSpectateActor(sa[pick].ptr, sa[pick].id);
-                strncpy(sSpectateName, sa[pick].name ? sa[pick].name : "?", sizeof(sSpectateName) - 1);
+            CineActorInfo pick;
+            if (DrawActorPicker(&pick)) {
+                CinematicCam_SetSpectateActor(pick.ptr, pick.id);
+                strncpy(sSpectateName, pick.name ? pick.name : "?", sizeof(sSpectateName) - 1);
                 sSpectateName[sizeof(sSpectateName) - 1] = '\0';
                 ImGui::CloseCurrentPopup();
             }
@@ -1723,12 +2984,223 @@ void CinematicCamPathWindow::DrawElement() {
                               "With this on, you'll usually want a lower Eye height.");
         }
         float h = CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.SpectateHeight"), 40.0f);
-        if (ImGui::SliderFloat("Eye height", &h, -100.0f, 200.0f, "%.0f")) {
+        if (ImGui::SliderFloat("Eye height", &h, -100.0f, 200.0f, "%.2f", ImGuiSliderFlags_NoRoundToFormat)) {
             CVarSetFloat(CVAR_ENHANCEMENT("CinematicCam.SpectateHeight"), h);
         }
         ImGui::TextDisabled("Locks the camera to the actor's viewpoint (aimed along its facing). "
                             "The world keeps running so you see what it sees.");
     }
+
+    // Follow actor: the FREE camera rides along with a moving actor (keeps its offset); you still fly + aim.
+    if (ImGui::CollapsingHeader("Follow actor (free camera)")) {
+        int followId = CinematicCam_GetFreecamFollowId();
+        if (followId != 0) {
+            const char* nm = CinematicCam_ActorName(followId);
+            ImGui::TextColored(ImVec4(0.5f, 0.9f, 1.0f, 1.0f), "Following: %s (id %d)", nm ? nm : "?", followId);
+            ImGui::SameLine();
+            if (ImGui::Button("Stop##follow")) {
+                CinematicCam_SetFreecamFollow(nullptr, 0);
+            }
+        } else {
+            ImGui::TextDisabled("Not following. Pick an actor to attach the free camera to it.");
+        }
+        if (ImGui::Button("Pick actor##follow")) {
+            ImGui::OpenPopup("Pick follow actor");
+        }
+        if (ImGui::BeginPopup("Pick follow actor")) {
+            CineActorInfo pick;
+            if (DrawActorPicker(&pick)) {
+                CinematicCam_SetFreecamFollow(pick.ptr, pick.id);
+                CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+        bool ctrlLink = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.FollowControlsLink"), 0);
+        if (ImGui::Checkbox("Control Link (camera auto-aims at Link)", &ctrlLink)) {
+            CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.FollowControlsLink"), ctrlLink);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("The best of both: the controller plays Link normally while the camera rides the "
+                              "followed actor and automatically keeps Link in frame. You give up manual camera "
+                              "control during the take (it's hands-off). Turn off to fly/aim the camera yourself.");
+        }
+        if (ctrlLink) {
+            ImGui::TextDisabled("Hands-off camera: follows the actor + auto-aims at Link. You play Link normally; "
+                                "the world runs (this overrides Freeze World).");
+        } else {
+            ImGui::TextDisabled("The camera keeps its position relative to the actor as it moves - fly to set the "
+                                "offset (e.g. behind it) and aim wherever you like. Needs the world unfrozen.");
+        }
+    }
+
+    // Area teleporter: jump to any major location to set up a shot without flying there.
+    if (ImGui::CollapsingHeader("Teleport to area")) {
+        int tn = CinematicCam_GetTeleportCount();
+        static int sTpSel = 0;
+        if (sTpSel >= tn) {
+            sTpSel = 0;
+        }
+        const char* curName = CinematicCam_GetTeleportName(sTpSel);
+        ImGui::SetNextItemWidth(220.0f);
+        if (ImGui::BeginCombo("Destination", curName ? curName : "?")) {
+            for (int i = 0; i < tn; i++) {
+                const char* nm = CinematicCam_GetTeleportName(i);
+                if (nm && ImGui::Selectable(nm, i == sTpSel)) {
+                    sTpSel = i;
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Go")) {
+            CinematicCam_TeleportTo(sTpSel);
+        }
+        ImGui::TextDisabled("Fades to the chosen area (spawn point 0). Only works while in-game.");
+    }
+
+    // Sky & time: freeze the sky for clean loops and scrub the time of day directly.
+    if (ImGui::CollapsingHeader("Sky & time")) {
+        int greenScreen = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.GreenScreen"), 0);
+        ImGui::SetNextItemWidth(180.0f);
+        const char* gsModes[] = { "Off", "Green (#00B140)", "Blue (#0047BB)" };
+        ImGui::BeginDisabled(sGreenScreenTrack.enabled); // a keyframed track takes over the green screen
+        if (ImGui::Combo("Green screen", &greenScreen, gsModes, 3)) {
+            CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.GreenScreen"), greenScreen);
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Replace the sky with a solid chroma-key color (and hide the sun/moon/sky glow) so you "
+                              "can key it out when compositing. Scene geometry still renders over it.");
+        }
+        if (sGreenScreenTrack.enabled) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(keyframed - see Automation)");
+        }
+
+        bool freezeSky = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.FreezeSky"), 0);
+        if (ImGui::Checkbox("Freeze sky & time", &freezeSky)) {
+            CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.FreezeSky"), freezeSky);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Stop cloud drift and time-of-day progression so looping clips/GIFs line up.");
+        }
+        int dt = CinematicCam_GetDayTime();
+        if (dt < 0) {
+            ImGui::TextDisabled("Time of day available in-game only.");
+        } else {
+            int mins = (int)(dt * (24.0f * 60.0f) / 65536.0f);
+            char label[16];
+            snprintf(label, sizeof(label), "%02d:%02d", (mins / 60) % 24, mins % 60);
+            ImGui::SetNextItemWidth(240.0f);
+            if (ImGui::SliderInt("Time of day", &dt, 0, 0xFFFF, label)) {
+                CinematicCam_SetDayTime(dt);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Set the sun/moon position and lighting. Turn on Freeze to hold it there.");
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Noon")) {
+                CinematicCam_SetDayTime(0x8000);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Sunset")) {
+                CinematicCam_SetDayTime(0xC000);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Night")) {
+                CinematicCam_SetDayTime(0x0000);
+            }
+        }
+    }
+
+    // Automation: keyframe exposed parameters on their own sub-timeline (independent of the camera keyframes).
+    // Applied during Play/Preview. Green screen is the first; this section grows as more parameters are wired up.
+    if (ImGui::CollapsingHeader("Automation (parameter tracks)")) {
+        ImGui::TextDisabled("Keyframe parameters on their own timeline. Applied during Play / Preview.");
+        ImGui::Checkbox("Keyframe green screen", &sGreenScreenTrack.enabled);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Drive the green screen from keys below during playback, instead of the fixed setting "
+                              "in Sky & time. Stepped: it snaps to each key's value and holds until the next.");
+        }
+        if (sGreenScreenTrack.enabled) {
+            ImGui::Indent();
+            const char* gsLabels[] = { "Off", "Green", "Blue" };
+            DrawParamTrackEditor(sGreenScreenTrack, gsLabels, 3);
+            ImGui::Unindent();
+        }
+    }
+
+    if (ImGui::CollapsingHeader("Pose Link")) {
+        int yaw = CinematicCam_GetLinkYaw();
+        if (yaw < 0) {
+            ImGui::TextDisabled("Available in-game only.");
+        } else {
+            const float kPi = 3.14159265358979f;
+            const float radius = 58.0f;
+            ImVec2 size(radius * 2.0f + 6.0f, radius * 2.0f + 6.0f);
+            ImVec2 p0 = ImGui::GetCursorScreenPos();
+            ImGui::InvisibleButton("##linkdial", size);
+            bool dialActive = ImGui::IsItemActive();
+            ImVec2 center(p0.x + size.x * 0.5f, p0.y + size.y * 0.5f);
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            ImU32 colRing = ImGui::GetColorU32(ImGuiCol_FrameBg);
+            ImU32 colBorder = ImGui::GetColorU32(ImGuiCol_Border);
+            ImU32 colNeedle = ImGui::GetColorU32(ImGuiCol_SliderGrabActive);
+            ImU32 colTick = ImGui::GetColorU32(ImGuiCol_TextDisabled);
+            dl->AddCircleFilled(center, radius, colRing, 48);
+            dl->AddCircle(center, radius, colBorder, 48, 1.5f);
+            // Cardinal ticks (visual reference only - the dial sets an absolute heading).
+            for (int i = 0; i < 4; i++) {
+                float a = i * (kPi * 0.5f);
+                ImVec2 t0(center.x + sinf(a) * (radius - 8.0f), center.y - cosf(a) * (radius - 8.0f));
+                ImVec2 t1(center.x + sinf(a) * radius, center.y - cosf(a) * radius);
+                dl->AddLine(t0, t1, colTick, 1.5f);
+            }
+
+            // While dragging, point Link toward the cursor (clockwise from straight up = 0 deg).
+            int newYaw = yaw;
+            if (dialActive) {
+                ImVec2 m = ImGui::GetIO().MousePos;
+                float dx = m.x - center.x, dy = m.y - center.y;
+                if (dx != 0.0f || dy != 0.0f) {
+                    float deg = atan2f(dx, -dy) * (180.0f / kPi);
+                    newYaw = (int)floorf(deg + 0.5f);
+                }
+            }
+            newYaw %= 360;
+            if (newYaw < 0) {
+                newYaw += 360;
+            }
+            float rad = newYaw * (kPi / 180.0f);
+            ImVec2 tip(center.x + sinf(rad) * (radius - 6.0f), center.y - cosf(rad) * (radius - 6.0f));
+            dl->AddLine(center, tip, colNeedle, 2.5f);
+            dl->AddCircleFilled(tip, 4.0f, colNeedle);
+            dl->AddCircleFilled(center, 3.0f, colBorder);
+            if (dialActive && newYaw != yaw) {
+                CinematicCam_SetLinkYaw(newYaw);
+                yaw = newYaw;
+            }
+
+            ImGui::SameLine();
+            ImGui::BeginGroup();
+            ImGui::SetNextItemWidth(120.0f);
+            int yIn = yaw;
+            if (ImGui::InputInt("degrees", &yIn)) {
+                CinematicCam_SetLinkYaw(yIn);
+            }
+            if (ImGui::Button("Face camera")) {
+                CinematicCam_FaceLinkToCamera(0);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Face away")) {
+                CinematicCam_FaceLinkToCamera(1);
+            }
+            ImGui::EndGroup();
+            ImGui::TextDisabled("Drag the dial or type degrees to aim Link. Best while he stands idle.");
+        }
+    }
+
     ImGui::SeparatorText("Keyframes");
     ImGui::BeginDisabled(!enabled);
     if (ImGui::Button("Add Keyframe")) {
@@ -1783,7 +3255,7 @@ void CinematicCamPathWindow::DrawElement() {
             PushUndo();
             sKeyframes.clear();
             sIds.clear();
-            sSelectedId = -1;
+            SelectOnly(-1);
             sPlayhead = 0.0f;
             sPlaying = false;
             sPreview = false;
@@ -1800,7 +3272,7 @@ void CinematicCamPathWindow::DrawElement() {
     } else {
         if (ImGui::Button("Stop recording")) {
             sRecording = false;
-            sSelectedId = sIds.empty() ? -1 : sIds[0];
+            SelectOnly(sIds.empty() ? -1 : sIds[0]);
         }
     }
     ImGui::SameLine();
@@ -1823,23 +3295,182 @@ void CinematicCamPathWindow::DrawElement() {
     }
     ImGui::EndDisabled();
 
+    // Path tools: smooth out jitter, normalize speed, retime, and generate orbits.
+    if (ImGui::CollapsingHeader("Path tools", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SetNextItemWidth(180.0f);
+        const char* curveModes[] = { "Even velocity (smooth)", "Uniform (classic)" };
+        ImGui::Combo("Curve", &sSplineParam, curveModes, 2);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("How the camera moves between keyframes.\n"
+                              "Even velocity (smooth): the camera and the view direction move at a smooth, "
+                              "time-coherent rate - no hang/snap at keyframes. Timeline spacing still controls "
+                              "pacing. The cinematic default.\n"
+                              "Uniform (classic): snappier classic Catmull-Rom; can overshoot on unevenly spaced "
+                              "keyframes - tame it with Tension or Smooth path.");
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled((int)sKeyframes.size() < 2);
+        if (ImGui::Button("Smooth path")) {
+            SmoothPath();
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Reset every keyframe to clean spline defaults (no linear segments, manual bends, or "
+                              "tension) so the curve flows smoothly. Doesn't move any keyframe.");
+        }
+
+        ImGui::BeginDisabled((int)sKeyframes.size() < 3);
+        if (ImGui::Button("Normalize speed")) {
+            NormalizeSpeed();
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Re-time the keyframes so the camera moves at a constant speed: keyframes spread out "
+                              "over long path stretches and pack together over short ones. Keeps total duration.");
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled((int)sKeyframes.size() < 2);
+        float dur = TotalTime();
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::InputFloat("Total (s)", &dur, 0.0f, 0.0f, "%.2f");
+        if (ImGui::IsItemDeactivatedAfterEdit()) { // commit on Enter / focus loss, not on every keystroke
+            SetTotalDuration(dur);
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Set the whole path's duration; all keyframe times rescale to fit. Press Enter.");
+        }
+
+        // Auto-orbit: its own collapsible (collapsed by default) so it isn't always taking up space.
+        if (ImGui::CollapsingHeader("Auto-orbit")) {
+            static float oRadius = 200.0f, oHeight = 80.0f, oArc = 360.0f, oDur = 8.0f;
+            static int oCount = 8, oCenter = 0; // center: 0 Link, 1 actor, 2 target, 3 in front of camera
+            static bool oFollow = true;
+            static int oActorId = 0;
+            static void* oActorPtr = nullptr;
+            static char oActorName[64] = "";
+            const char* centers[] = { "Link", "Actor", "Target", "Camera" };
+            ImGui::SetNextItemWidth(110.0f);
+            ImGui::Combo("Around", &oCenter, centers, 4);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(120.0f);
+            ImGui::SliderInt("Points", &oCount, 3, 32);
+            if (oCenter == 1) { // actor: pick which one
+                ImGui::Text("Actor: %s (id %d)", oActorName[0] ? oActorName : "(none)", oActorId);
+                ImGui::SameLine();
+                if (ImGui::Button("Pick##orbitactor")) {
+                    ImGui::OpenPopup("Pick orbit actor");
+                }
+                if (ImGui::BeginPopup("Pick orbit actor")) {
+                    CineActorInfo pick;
+                    if (DrawActorPicker(&pick)) {
+                        oActorId = pick.id;
+                        oActorPtr = pick.ptr;
+                        strncpy(oActorName, pick.name ? pick.name : "?", sizeof(oActorName) - 1);
+                        oActorName[sizeof(oActorName) - 1] = '\0';
+                        ImGui::CloseCurrentPopup();
+                    }
+                    ImGui::EndPopup();
+                }
+            }
+            ImGui::SetNextItemWidth(110.0f);
+            ImGui::DragFloat("Radius", &oRadius, 1.0f, 10.0f, 8000.0f, "%.2f", ImGuiSliderFlags_NoRoundToFormat);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(110.0f);
+            ImGui::DragFloat("Height", &oHeight, 1.0f, -1000.0f, 2000.0f, "%.2f", ImGuiSliderFlags_NoRoundToFormat);
+            ImGui::SetNextItemWidth(110.0f);
+            ImGui::SliderFloat("Arc", &oArc, 30.0f, 360.0f, "%.2f deg", ImGuiSliderFlags_NoRoundToFormat);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(110.0f);
+            ImGui::SliderFloat("Seconds", &oDur, 1.0f, 60.0f, "%.1f");
+            if (oCenter == 0 || oCenter == 1) {
+                ImGui::Checkbox("Follow it as it moves", &oFollow);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "The whole orbit tracks the target's movement during playback, keeping it framed.");
+                }
+            }
+            if (ImGui::Button("Generate orbit")) {
+                float c[3];
+                bool have = false;
+                int followMode = 0;
+                int followId = 0;
+                void* followPtr = nullptr;
+                if (oCenter == 0) {
+                    have = CinematicCam_GetPlayerPos(c) != 0;
+                    followMode = oFollow ? 1 : 0;
+                } else if (oCenter == 1) {
+                    have = CinematicCam_ResolveActor(&oActorPtr, (short)oActorId, nullptr, c) != 0;
+                    followMode = oFollow ? 2 : 0;
+                    followId = oActorId;
+                    followPtr = oActorPtr;
+                } else if (oCenter == 2) {
+                    c[0] = sAimOverridePoint[0];
+                    c[1] = sAimOverridePoint[1];
+                    c[2] = sAimOverridePoint[2];
+                    have = true;
+                } else {
+                    float eye[3], at[3], roll, fov;
+                    CinematicCam_GetPose(eye, at, &roll, &fov);
+                    float f[3] = { at[0] - eye[0], at[1] - eye[1], at[2] - eye[2] };
+                    float l = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+                    float s = (l > 1e-3f) ? oRadius / l : 0.0f;
+                    c[0] = eye[0] + f[0] * s;
+                    c[1] = eye[1] + f[1] * s;
+                    c[2] = eye[2] + f[2] * s;
+                    have = true;
+                }
+                if (have) {
+                    GenerateOrbit(c, oRadius, oHeight, oCount, oArc, 0.0f, oDur, followMode, followId, followPtr);
+                }
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Replace the path with a circle/arc of keyframes around the chosen center, each "
+                                  "aimed at it. A full 360 arc turns on looping. Great for establishing shots.");
+            }
+        } // Auto-orbit collapsible
+    }
+
     // Keyframe list
     ImGui::Text("Keyframes: %d", (int)sKeyframes.size());
+    if (SelectionCount() > 1) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%d selected)", SelectionCount());
+    }
     ImGui::BeginChild("##kflist", ImVec2(0, 160), true);
-    for (int i = 0; i < (int)sKeyframes.size(); i++) {
-        ImGui::PushID(i);
-        char label[64];
-        snprintf(label, sizeof(label), "#%d   t=%.2fs   %s", i + 1, sKeyframes[i].time,
-                 sKeyframes[i].interp == CINE_INTERP_LINEAR ? "[Linear]" : "");
-        if (ImGui::Selectable(label, sIds[i] == sSelectedId)) {
-            sSelectedId = sIds[i];
+    // Clipper: only build widgets for visible rows (keeps long/recorded paths responsive).
+    ImGuiListClipper clipper;
+    clipper.Begin((int)sKeyframes.size());
+    while (clipper.Step()) {
+        for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) {
+            ImGui::PushID(i);
+            char label[64];
+            snprintf(label, sizeof(label), "#%d   t=%.2fs   %s", i + 1, sKeyframes[i].time,
+                     sKeyframes[i].interp == CINE_INTERP_LINEAR ? "[Linear]" : "");
+            if (ImGui::Selectable(label, IsSelected(sIds[i]))) {
+                if (ImGui::GetIO().KeyCtrl) {
+                    ToggleSelect(sIds[i]); // ctrl-click extends the selection
+                } else {
+                    SelectOnly(sIds[i]);
+                }
+            }
+            ImGui::PopID();
         }
-        ImGui::PopID();
     }
     ImGui::EndChild();
 
+    // End the controls column; begin the right column (selected-keyframe inspector + playback + save/load).
+    ImGui::EndChild(); // ##cineLeft
+    ImGui::SameLine();
+    ImGui::BeginChild("##cineRight", ImVec2(0, cineTopH), true);
+
     int sel = SelectedIndex();
-    if (sel >= 0) {
+    if (SelectionCount() > 1) {
+        ImGui::SeparatorText("Selected keyframes");
+        ImGui::TextDisabled("%d keyframes selected. Per-keyframe fields are hidden while multiple are selected - "
+                            "drag on the timeline to move them together, or Ctrl+click to narrow the selection.",
+                            SelectionCount());
+    } else if (sel >= 0) {
         ImGui::SeparatorText("Selected keyframe");
 
         // World gizmo for this keyframe (only meaningful while the in-world path is shown).
@@ -1934,10 +3565,43 @@ void CinematicCamPathWindow::DrawElement() {
             }
         }
 
+        // Per-keyframe timing ease: slow the camera arriving at / leaving this keyframe (set both high to
+        // "hold" on it).
+        float eIn = sKeyframes[sel].easeIn, eOut = sKeyframes[sel].easeOut;
+        ImGui::SetNextItemWidth(130.0f);
+        ImGui::SliderFloat("Ease in", &eIn, 0.0f, 1.0f, "%.2f");
+        if (ImGui::IsItemActivated()) {
+            PushUndo();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Decelerate as the camera arrives at this keyframe (slows the segment before it).");
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(130.0f);
+        ImGui::SliderFloat("Ease out", &eOut, 0.0f, 1.0f, "%.2f");
+        if (ImGui::IsItemActivated()) {
+            PushUndo();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Accelerate gently as the camera leaves this keyframe (slows the segment after it). "
+                              "Set Ease in + Ease out high to pause on this keyframe.");
+        }
+        sKeyframes[sel].easeIn = eIn;
+        sKeyframes[sel].easeOut = eOut;
+        if ((eIn > 0.0f || eOut > 0.0f)) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Clear ease")) {
+                PushUndo();
+                sKeyframes[sel].easeIn = 0.0f;
+                sKeyframes[sel].easeOut = 0.0f;
+            }
+        }
+
         // Aim mode: how this keyframe's camera is oriented.
-        const char* aimModes[] = { "Free orientation", "Look at point", "Look at Link", "Look at actor" };
+        const char* aimModes[] = { "Free orientation", "Look at point", "Look at Link", "Look at actor",
+                                   "Look at target" };
         int am = sKeyframes[sel].aimMode;
-        if (ImGui::Combo("Aim", &am, aimModes, 4)) {
+        if (ImGui::Combo("Aim", &am, aimModes, 5)) {
             PushUndo();
             sKeyframes[sel].aimMode = am;
         }
@@ -1966,35 +3630,36 @@ void CinematicCamPathWindow::DrawElement() {
         } else if (sKeyframes[sel].aimMode == CINE_AIM_PLAYER) {
             ImGui::TextDisabled("Tracks Link's position (live during playback).");
         } else if (sKeyframes[sel].aimMode == CINE_AIM_ACTOR) {
-            static CineActorInfo sActors[512];
-            // Resolve the current target's name for display.
-            const char* curName = "(pick one)";
-            int n = CinematicCam_EnumActors(sActors, 512);
-            for (int ai = 0; ai < n; ai++) {
-                if (sActors[ai].ptr == sKeyframes[sel].aimActorPtr) {
-                    curName = sActors[ai].name ? sActors[ai].name : "?";
-                    break;
-                }
-                if (sActors[ai].id == sKeyframes[sel].aimActorId) {
-                    curName = sActors[ai].name ? sActors[ai].name : "?";
-                }
-            }
-            ImGui::Text("Target: %s (id %d)", curName, sKeyframes[sel].aimActorId);
+            // Cheap id->name lookup (no per-frame enumeration of all actors).
+            const char* curName =
+                sKeyframes[sel].aimActorId ? CinematicCam_ActorName(sKeyframes[sel].aimActorId) : "(pick one)";
+            ImGui::Text("Target: %s (id %d)", curName ? curName : "?", sKeyframes[sel].aimActorId);
             if (ImGui::Button("Pick actor...")) {
                 ImGui::OpenPopup("Pick actor");
             }
             if (ImGui::BeginPopup("Pick actor")) {
-                int pn = CinematicCam_EnumActors(sActors, 512);
-                int pick = DrawActorPickerList(sActors, pn);
-                if (pick >= 0) {
+                CineActorInfo pick;
+                if (DrawActorPicker(&pick)) {
                     PushUndo();
-                    sKeyframes[sel].aimActorId = sActors[pick].id;
-                    sKeyframes[sel].aimActorPtr = sActors[pick].ptr;
+                    sKeyframes[sel].aimActorId = pick.id;
+                    sKeyframes[sel].aimActorPtr = pick.ptr;
+                    sKeyframes[sel].aimActorPos[0] = pick.pos[0]; // hint for nearest-actor re-acquire on reload
+                    sKeyframes[sel].aimActorPos[1] = pick.pos[1];
+                    sKeyframes[sel].aimActorPos[2] = pick.pos[2];
                     ImGui::CloseCurrentPopup();
                 }
                 ImGui::EndPopup();
             }
             ImGui::TextDisabled("Tracks the actor live. Saved by id (re-acquired on load).");
+        } else if (sKeyframes[sel].aimMode == CINE_AIM_TARGET) {
+            ImGui::SetNextItemWidth(180.0f);
+            ImGui::InputFloat3("##kftgt", sAimOverridePoint, "%.0f");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Place at camera")) {
+                PlaceOverrideTargetAtCamera();
+            }
+            ImGui::TextDisabled("Aims at the shared movable target (one point for the whole path). Drag its "
+                                "red/green/blue gizmo in the world to move it.");
         }
 
         // Numeric fields: type exact position/orientation values for the selected keyframe.
@@ -2082,7 +3747,11 @@ void CinematicCamPathWindow::DrawElement() {
             if (sPlayhead >= pt) {
                 sPlayhead = 0.0f;
             }
-            sPlayU = (pt > 0.0f) ? (sPlayhead / pt) : 0.0f; // seed eased progress from the current playhead
+            sPlayU = InvertEasedProgress((pt > 0.0f) ? (sPlayhead / pt) : 0.0f); // resume exactly at the playhead
+            sPlayDir = 1;
+            if (sPlayhead == 0.0f && CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.SyncIdleAnim"), 0)) {
+                CinematicCam_SyncLinkIdleAnim(); // anchor Link's idle anim when starting from the top
+            }
             sPlaying = true;
             sPreview = false;
             CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
@@ -2107,10 +3776,54 @@ void CinematicCamPathWindow::DrawElement() {
                           "(the camera follows the path). Pairs well with 'Look at Link'.");
     }
 
+    // Path follow status: when set (e.g. by an orbit), the whole path tracks a moving target.
+    if (sFollowMode != 0) {
+        ImGui::TextColored(ImVec4(0.5f, 0.9f, 1.0f, 1.0f), "Following: %s", sFollowMode == 1 ? "Link" : "actor");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Stop following")) {
+            sFollowMode = 0;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Re-anchor here")) {
+            // Reset the origin to the target's current position (so the path centers on it from now).
+            float c[3];
+            int prev = sFollowMode;
+            if (FollowCenter(c)) {
+                sFollowOrigin[0] = c[0];
+                sFollowOrigin[1] = c[1];
+                sFollowOrigin[2] = c[2];
+            }
+            sFollowMode = prev;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Recenter the follow offset on the target's current position.");
+        }
+    }
+
     if (sLoop) {
-        ImGui::SliderFloat("Loop return (s)", &sLoopReturnTime, 0.25f, 10.0f, "%.2fs");
-        if (sLoopReturnTime < 0.0f) {
-            sLoopReturnTime = 0.0f;
+        ImGui::SetNextItemWidth(160.0f);
+        const char* loopModes[] = { "Forward (wrap)", "Ping-pong (reverse)" };
+        ImGui::Combo("Loop style", &sLoopMode, loopModes, 2);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Forward: glide from the last keyframe back to the first and repeat. "
+                              "Ping-pong: play to the end, then play back in reverse, and repeat.");
+        }
+        if (sLoopMode == 0) {
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(140.0f);
+            ImGui::SliderFloat("Return (s)", &sLoopReturnTime, 0.25f, 10.0f, "%.2fs");
+            if (sLoopReturnTime < 0.0f) {
+                sLoopReturnTime = 0.0f;
+            }
+        }
+        bool loopMark = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.LoopStartMarker"), 0);
+        if (ImGui::Checkbox("Loop-start marker", &loopMark)) {
+            CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.LoopStartMarker"), loopMark);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Flash a magenta square in the top-left for the single frame each loop restarts. "
+                              "Lets you find the exact loop boundary in a recording and trim there (off by "
+                              "default - it's only an editing aid, delete that frame in post).");
         }
     }
 
@@ -2131,8 +3844,26 @@ void CinematicCamPathWindow::DrawElement() {
         }
     }
 
+    // Camera shake / handheld: organic jitter layered on top of playback.
+    ImGui::Checkbox("Camera shake", &sShakeEnabled);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Add smooth handheld-style jitter to the moving camera. Deterministic, so it looks the "
+                          "same every time you scrub or replay.");
+    }
+    if (sShakeEnabled) {
+        ImGui::SetNextItemWidth(130.0f);
+        ImGui::SliderFloat("Position##shake", &sShakePosAmp, 0.0f, 30.0f, "%.1f");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(130.0f);
+        ImGui::SliderFloat("Angle##shake", &sShakeRotAmp, 0.0f, 5.0f, "%.2f deg");
+        ImGui::SetNextItemWidth(130.0f);
+        ImGui::SliderFloat("Frequency##shake", &sShakeFreq, 0.5f, 20.0f, "%.1f Hz");
+        ImGui::SameLine();
+        ImGui::Checkbox("In preview too", &sShakeOnPreview);
+    }
+
     // Path-level aim override: aim every keyframe at one target (fixes up recorded paths at once).
-    const char* aimOv[] = { "Per-keyframe (off)", "All look at Link", "All look at point", "All look at actor" };
+    const char* aimOv[] = { "Per-keyframe (off)", "All look at Link", "All look at target", "All look at actor" };
     ImGui::SetNextItemWidth(200.0f);
     ImGui::Combo("Aim override", &sAimOverride, aimOv, 4);
     if (ImGui::IsItemHovered()) {
@@ -2141,20 +3872,27 @@ void CinematicCamPathWindow::DrawElement() {
     }
     if (sAimOverride == 2) {
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(220.0f);
+        ImGui::SetNextItemWidth(180.0f);
         ImGui::InputFloat3("##aimovpt", sAimOverridePoint, "%.0f");
+        ImGui::SameLine();
+        if (ImGui::Button("Place at camera")) {
+            PlaceOverrideTargetAtCamera();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Drop the aim target in front of the free camera. With 'Show path in world' on you can "
+                              "then drag its red/green/blue handles to reposition it, and the whole path aims at it.");
+        }
+        ImGui::TextDisabled("Movable aim target: the whole path looks at this point. Drag its gizmo in the world.");
     } else if (sAimOverride == 3) {
         ImGui::SameLine();
         if (ImGui::Button("Pick##aimov")) {
             ImGui::OpenPopup("Pick override actor");
         }
         if (ImGui::BeginPopup("Pick override actor")) {
-            static CineActorInfo oa[512];
-            int pn = CinematicCam_EnumActors(oa, 512);
-            int pick = DrawActorPickerList(oa, pn);
-            if (pick >= 0) {
-                sAimOverrideActorId = oa[pick].id;
-                sAimOverrideActorPtr = oa[pick].ptr;
+            CineActorInfo pick;
+            if (DrawActorPicker(&pick)) {
+                sAimOverrideActorId = pick.id;
+                sAimOverrideActorPtr = pick.ptr;
                 ImGui::CloseCurrentPopup();
             }
             ImGui::EndPopup();
@@ -2163,37 +3901,114 @@ void CinematicCamPathWindow::DrawElement() {
         ImGui::Text("id %d", sAimOverrideActorId);
     }
 
-    DrawTimeline();
-
-    ImGui::SeparatorText("Save / Load");
-    ImGui::InputText("Name", sFilename, sizeof(sFilename));
-    if (ImGui::Button("Save")) {
-        std::string p = std::string("cinematics/") + sFilename + ".json";
-        if (std::filesystem::exists(p)) {
-            ImGui::OpenPopup("Overwrite path?");
-        } else {
-            SavePath();
-        }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Load")) {
-        LoadPath();
-    }
-    ImGui::SameLine();
-    ImGui::TextDisabled("(cinematics/<name>.json)");
-
-    if (ImGui::BeginPopupModal("Overwrite path?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("\"%s.json\" already exists. Overwrite it?", sFilename);
-        if (ImGui::Button("Overwrite")) {
-            SavePath();
-            ImGui::CloseCurrentPopup();
+    if (ImGui::CollapsingHeader("Save / Load", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::InputText("Name", sFilename, sizeof(sFilename));
+        if (ImGui::Button("Save")) {
+            std::string p = std::string("cinematics/") + sFilename + ".json";
+            if (std::filesystem::exists(p)) {
+                ImGui::OpenPopup("Overwrite path?");
+            } else {
+                SavePath();
+            }
         }
         ImGui::SameLine();
-        if (ImGui::Button("Cancel")) {
-            ImGui::CloseCurrentPopup();
+        if (ImGui::Button("Load")) {
+            LoadPath();
         }
-        ImGui::EndPopup();
-    }
+        ImGui::SameLine();
+        if (ImGui::Button("Browse...")) {
+            ImGui::OpenPopup("Cinematic files");
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Browse, load, or delete saved cinematics in the cinematics/ folder.");
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(cinematics/<name>.json)");
+
+        // Path-bound location: tie the current scene/spawn to the path so loading warps you straight back.
+        ImGui::Checkbox("Bind location to path", &sBindLocation);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("When saving, remember the current scene/spawn so loading this path warps you here.");
+        }
+        ImGui::SameLine();
+        ImGui::Checkbox("Teleport on load", &sTeleportOnLoad);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("When loading a path with a bound location, fade-warp to it (skipped if already there).");
+        }
+        if (sPathEntrance >= 0) {
+            bool here = (CinematicCam_GetCurrentEntrance() == sPathEntrance);
+            ImGui::TextDisabled("Bound location: entrance %d%s", sPathEntrance, here ? "  (you are here)" : "");
+        } else {
+            ImGui::TextDisabled("Bound location: none");
+        }
+
+        if (ImGui::BeginPopup("Cinematic files")) {
+            ImGui::TextDisabled("Saved cinematics  (* = current)");
+            ImGui::Separator();
+            std::vector<std::string> files = ListCinematics();
+            if (files.empty()) {
+                ImGui::TextDisabled("(none yet - Save one first)");
+            }
+            static std::string sConfirmDelete; // name awaiting delete confirmation, or empty
+            bool closePopup = false;
+            ImGui::BeginChild("##cinelist", ImVec2(320, 240), false);
+            for (auto& name : files) {
+                ImGui::PushID(name.c_str());
+                // Buttons first (a full-width Selectable would otherwise swallow their clicks).
+                if (ImGui::SmallButton("Load")) {
+                    LoadNamed(name);
+                    closePopup = true;
+                }
+                ImGui::SameLine();
+                if (sConfirmDelete == name) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "delete?");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("yes")) {
+                        std::error_code ec;
+                        std::filesystem::remove(std::string("cinematics/") + name + ".json", ec);
+                        sConfirmDelete.clear();
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("no")) {
+                        sConfirmDelete.clear();
+                    }
+                } else {
+                    if (ImGui::SmallButton("X")) {
+                        sConfirmDelete = name;
+                    }
+                    ImGui::SameLine();
+                    bool isCurrent = (name == sFilename);
+                    ImGui::TextUnformatted((name + (isCurrent ? "  *" : "")).c_str());
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndChild();
+            if (closePopup) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
+        if (ImGui::BeginPopupModal("Overwrite path?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::Text("\"%s.json\" already exists. Overwrite it?", sFilename);
+            if (ImGui::Button("Overwrite")) {
+                SavePath();
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+    } // end of the "Save / Load" collapsing section
+
+    ImGui::EndChild(); // ##cineRight
+
+    // Dope-sheet timeline pinned across the bottom, full width of the editor.
+    ImGui::BeginChild("##cineTimeline", ImVec2(0, cineBottomH), true);
+    DrawTimeline();
+    ImGui::EndChild();
 }
 
 // Called every frame (even when the window is hidden): draw the cinematic letterbox bars and grid overlay.
@@ -2227,5 +4042,31 @@ void CinematicCamPathWindow::UpdateElement() {
             dl->AddLine(ImVec2(x, vp->Pos.y), ImVec2(x, vp->Pos.y + vp->Size.y), col, 1.0f);
             dl->AddLine(ImVec2(vp->Pos.x, y), ImVec2(vp->Pos.x + vp->Size.x, y), col, 1.0f);
         }
+    }
+
+    // Live readout: state + FOV / roll / move speed in the corner while flying (toggle in the menu).
+    if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.ShowReadout"), 1)) {
+        float eye[3], at[3], roll, fov;
+        CinematicCam_GetPose(eye, at, &roll, &fov);
+        float spd = CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.MoveSpeed"), 30.0f);
+        const char* mode = sRecording ? "REC" : (sPlaying ? "PLAY" : (sPreview ? "PREVIEW" : "FREE CAM"));
+        char buf[128];
+        snprintf(buf, sizeof(buf), "%s   FOV %.0f   Roll %.0f   Speed %.0f", mode, fov, roll, spd);
+        float barOff = 0.0f;
+        if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Letterbox"), 0)) {
+            barOff = vp->Size.y * CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.LetterboxAmount"), 0.12f);
+        }
+        ImVec2 tp(vp->Pos.x + 16.0f, vp->Pos.y + barOff + 12.0f);
+        dl->AddText(ImVec2(tp.x + 1.0f, tp.y + 1.0f), IM_COL32(0, 0, 0, 200), buf); // shadow for readability
+        dl->AddText(tp, IM_COL32(255, 255, 255, 210), buf);
+    }
+
+    // Loop-start marker: a solid magenta square shown for the single frame the loop restarts, so the loop
+    // boundary is findable in a recorded clip. Opt-in; the user trims that frame in post.
+    if (sLoopMarkerFrame && CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.LoopStartMarker"), 0)) {
+        ImVec2 a(vp->Pos.x + 8.0f, vp->Pos.y + 8.0f);
+        ImVec2 b(a.x + 40.0f, a.y + 40.0f);
+        dl->AddRectFilled(a, b, IM_COL32(255, 0, 255, 255));
+        dl->AddRect(a, b, IM_COL32(255, 255, 255, 255), 0.0f, 0, 2.0f);
     }
 }

@@ -280,6 +280,22 @@ void SohMenu::AddMenuDevTools() {
         .Options(CheckboxOptions().DefaultValue(true).Tooltip(
             "Freeze actors and physics while flying. Turn off to let the action continue (note: the controller "
             "still only drives the camera, not Link)."));
+    AddWidget(path, "Freeze Sky & Time", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.FreezeSky"))
+        .Options(CheckboxOptions().DefaultValue(false).Tooltip(
+            "Stop the sky from drifting and the time of day from advancing (clouds, sun/moon, lighting). "
+            "Makes looping clips/GIFs line up perfectly. Works independently of the camera."));
+    AddWidget(path, "No Idle Fidgets (Link)", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.NoIdleFidget"))
+        .Options(CheckboxOptions().DefaultValue(false).Tooltip(
+            "Stop Link's idle fidget animations (stretching, looking around, tapping his foot) so he holds a "
+            "clean standing pose for shots. Works independently of the camera."));
+    AddWidget(path, "Sync Link Idle to Loop Start", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.SyncIdleAnim"))
+        .Options(CheckboxOptions().DefaultValue(false).Tooltip(
+            "Restart Link's standing idle (breathing/head-bob) animation from frame 0 each time playback starts "
+            "from the top and each time a loop wraps. Make your timeline a whole number of idle cycles "
+            "(~134 frames @ 30fps per cycle) for a perfectly seamless looping GIF. Pairs with No Idle Fidgets."));
     AddWidget(path, "Hide HUD", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.HideHud"))
         .Options(CheckboxOptions().DefaultValue(true).Tooltip(
@@ -304,6 +320,10 @@ void SohMenu::AddMenuDevTools() {
                 .ComboMap(cineGridModes)
                 .DefaultIndex(0)
                 .Tooltip("Overlay a framing grid while the cinematic camera is active (rule-of-thirds and finer)."));
+    AddWidget(path, "Show readout", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("CinematicCam.ShowReadout"))
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "Show a small corner readout (state, FOV, roll, move speed) while the cinematic camera is active."));
     AddWidget(path, "Extend Draw Distance", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.DisableCulling"))
         .Options(CheckboxOptions().DefaultValue(true).Tooltip(
@@ -340,13 +360,16 @@ void SohMenu::AddMenuDevTools() {
                               "Select/Back button to it in Controller Configuration."));
     AddWidget(path, "Boost (faster):", WIDGET_CVAR_BTN_SELECTOR)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.BoostBtn"))
-        .Options(BtnSelectorOptions().DefaultValue(BTN_R));
+        .Options(BtnSelectorOptions()
+                     .DefaultValue(BTN_CUSTOM_MODIFIER2)
+                     .Tooltip("Hold to fly faster. Default is Additional Button 2 - map your right bumper (RB) to "
+                              "it in Controller Configuration."));
     AddWidget(path, "Precision (slower):", WIDGET_CVAR_BTN_SELECTOR)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.PrecisionBtn"))
         .Options(BtnSelectorOptions().DefaultValue(BTN_L));
     AddWidget(path, "Ascend:", WIDGET_CVAR_BTN_SELECTOR)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.UpBtn"))
-        .Options(BtnSelectorOptions().DefaultValue(BTN_A));
+        .Options(BtnSelectorOptions().DefaultValue(BTN_R));
     AddWidget(path, "Descend:", WIDGET_CVAR_BTN_SELECTOR)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.DownBtn"))
         .Options(BtnSelectorOptions().DefaultValue(BTN_Z));

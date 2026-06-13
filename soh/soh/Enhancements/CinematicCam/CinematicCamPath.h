@@ -15,6 +15,7 @@ enum CineAim {
     CINE_AIM_POINT = 1,  // look at a fixed world point (the stored look-at)
     CINE_AIM_PLAYER = 2, // look at Link (tracked live)
     CINE_AIM_ACTOR = 3,  // look at a chosen actor (tracked live by id; pointer cached at runtime)
+    CINE_AIM_TARGET = 4, // look at the shared movable aim target (the same point used by the aim override)
 };
 
 // A single captured camera pose on the path timeline.
@@ -36,9 +37,32 @@ struct CineKeyframe {
     int hasTangent;   // 0 = automatic tangent, 1 = use the custom direction below
     float tangent[3]; // unit direction
 
-    int aimMode;       // CineAim: how the camera is aimed (free / point / Link / actor)
-    int aimActorId;    // for CINE_AIM_ACTOR: the actor id to track (saved)
-    void* aimActorPtr; // runtime-only cached Actor* for the tracked actor (not saved)
+    int aimMode;          // CineAim: how the camera is aimed (free / point / Link / actor)
+    int aimActorId;       // for CINE_AIM_ACTOR: the actor id to track (saved)
+    void* aimActorPtr;    // runtime-only cached Actor* for the tracked actor (not saved)
+    float aimActorPos[3]; // actor position when it was picked - on reload, re-acquire the NEAREST actor of that
+                          // id to this point (disambiguates multiple identical actors, e.g. several frogs)
+
+    // Per-keyframe timing ease (0..1). easeOut slows the camera leaving this keyframe; easeIn slows it
+    // arriving at this keyframe. Use both near 1 to "hold" on a keyframe (slow in, slow out).
+    float easeIn;
+    float easeOut;
+};
+
+// --- Parameter automation tracks -------------------------------------------------------------------------
+// A keyframable parameter on its OWN sub-timeline, independent of the camera path keyframes. This is the
+// foundation for automating any exposed parameter over time; the green screen is the first one wired up.
+
+// One key on a parameter track.
+struct CineParamKey {
+    float time;  // seconds on the timeline
+    float value; // parameter value (discrete params store an integer cast to float)
+};
+
+// How a track's value is read between keys.
+enum CineTrackInterp {
+    CINE_TRACK_STEP = 0,   // hold the most recent key (discrete params: green screen, toggles, enums)
+    CINE_TRACK_LINEAR = 1, // linearly interpolate between keys (continuous params)
 };
 
 // Editor window for building and playing back cinematic camera paths.
