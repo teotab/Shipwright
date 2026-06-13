@@ -13,6 +13,7 @@
 #include "soh/ResourceManagerHelpers.h"
 #include "soh/SaveManager.h"
 #include "soh/framebuffer_effects.h"
+#include "soh/Enhancements/CinematicCam/CinematicCamBridge.h"
 
 #include <libultraship/libultraship.h>
 
@@ -1353,6 +1354,30 @@ void Play_DrawOverlayElements(PlayState* play) {
     }
 }
 
+// SOH [Enhancement] Cinematic green screen: RCP setup for a flat, full-frame primitive-color fill (mirrors the
+// screen-fade setup). 1-cycle, no texture/lighting/fog, cloud-surface blend - with alpha 255 it fully covers.
+static Gfx sCineGreenScreenSetupDL[] = {
+    gsDPPipeSync(),
+    gsSPClearGeometryMode(G_ZBUFFER | G_SHADE | G_CULL_BOTH | G_FOG | G_LIGHTING | G_TEXTURE_GEN |
+                          G_TEXTURE_GEN_LINEAR | G_LOD | G_SHADING_SMOOTH),
+    gsDPSetOtherMode(G_AD_DISABLE | G_CD_MAGICSQ | G_CK_NONE | G_TC_FILT | G_TF_BILERP | G_TT_NONE | G_TL_TILE |
+                         G_TD_CLAMP | G_TP_NONE | G_CYC_1CYCLE | G_PM_1PRIMITIVE,
+                     G_AC_NONE | G_ZS_PIXEL | G_RM_CLD_SURF | G_RM_CLD_SURF2),
+    gsDPSetCombineLERP(0, 0, 0, PRIMITIVE, 0, 0, 0, PRIMITIVE, 0, 0, 0, PRIMITIVE, 0, 0, 0, PRIMITIVE),
+    gsSPEndDisplayList(),
+};
+
+// Fill the whole frame with a solid chroma-key color, behind all geometry, so the sky can be keyed out when
+// compositing. Drawn where the skybox would be (no Z write), so scene geometry and actors render over it.
+static void Play_DrawCineGreenScreen(Gfx** gfxP, u8 r, u8 g, u8 b) {
+    Gfx* gfx = *gfxP;
+    gSPDisplayList(gfx++, sCineGreenScreenSetupDL);
+    gDPSetPrimColor(gfx++, 0, 0, r, g, b, 255);
+    gDPFillRectangle(gfx++, 0, 0, gScreenWidth - 1, gScreenHeight - 1);
+    gDPPipeSync(gfx++);
+    *gfxP = gfx;
+}
+
 void Play_Draw(PlayState* play) {
     GraphicsContext* gfxCtx = play->state.gfxCtx;
     Lights* sp228;
@@ -1505,8 +1530,21 @@ void Play_Draw(PlayState* play) {
             goto Play_Draw_DrawOverlayElements;
         }
 
+        // SOH [Enhancement] Cinematic green screen: replace the sky (and sky elements) with a flat chroma-key
+        // color for compositing. 1 = green (#00B140), 2 = blue (#0047BB) - the standard chroma-key hues. The
+        // value comes from the cinematic bridge so an automation track can keyframe it during playback.
+        s32 cineGreenScreen = CinematicCam_GetGreenScreen();
+
         if ((HREG(80) != 10) || (HREG(83) != 0)) {
-            if (play->skyboxId && (play->skyboxId != SKYBOX_UNSET_1D) && !play->envCtx.skyboxDisabled) {
+            if (cineGreenScreen != 0) {
+                Gfx* gfxGs = POLY_OPA_DISP;
+                if (cineGreenScreen == 2) {
+                    Play_DrawCineGreenScreen(&gfxGs, 0, 71, 187); // chroma-key blue
+                } else {
+                    Play_DrawCineGreenScreen(&gfxGs, 0, 177, 64); // chroma-key green
+                }
+                POLY_OPA_DISP = gfxGs;
+            } else if (play->skyboxId && (play->skyboxId != SKYBOX_UNSET_1D) && !play->envCtx.skyboxDisabled) {
                 if ((play->skyboxId == SKYBOX_NORMAL_SKY) || (play->skyboxId == SKYBOX_CUTSCENE_MAP)) {
                     Environment_UpdateSkybox(play, play->skyboxId, &play->envCtx, &play->skyboxCtx);
                     SkyboxDraw_Draw(&play->skyboxCtx, gfxCtx, play->skyboxId, play->envCtx.skyboxBlend,
@@ -1519,13 +1557,15 @@ void Play_Draw(PlayState* play) {
         }
 
         if ((HREG(80) != 10) || (HREG(90) & 2)) {
-            if (!play->envCtx.sunMoonDisabled) {
+            if (!play->envCtx.sunMoonDisabled && !cineGreenScreen) {
                 Environment_DrawSunAndMoon(play);
             }
         }
 
         if ((HREG(80) != 10) || (HREG(90) & 1)) {
-            Environment_DrawSkyboxFilters(play);
+            if (!cineGreenScreen) {
+                Environment_DrawSkyboxFilters(play);
+            }
         }
 
         if ((HREG(80) != 10) || (HREG(90) & 4)) {
@@ -1555,7 +1595,8 @@ void Play_Draw(PlayState* play) {
         }
 
         if ((HREG(80) != 10) || (HREG(83) != 0)) {
-            if ((play->skyboxCtx.unk_140 != 0) && (GET_ACTIVE_CAM(play)->setting != CAM_SET_PREREND_FIXED)) {
+            if (!cineGreenScreen && (play->skyboxCtx.unk_140 != 0) &&
+                (GET_ACTIVE_CAM(play)->setting != CAM_SET_PREREND_FIXED)) {
                 Vec3f quakeOffset;
 
                 Camera_GetSkyboxOffset(&quakeOffset, GET_ACTIVE_CAM(play));
