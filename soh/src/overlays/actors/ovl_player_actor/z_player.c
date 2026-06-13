@@ -8266,7 +8266,9 @@ void Player_ChooseNextIdleAnim(PlayState* play, Player* this) {
     s32 fidgetType;
     s32 commonType;
 
-    if ((this->focusActor != NULL) ||
+    // SOH [Enhancement] Cinematic: optionally suppress idle fidget animations (stretch, look around, etc.) so
+    // Link stays still for clean shots - force the plain standing idle instead.
+    if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.NoIdleFidget"), 0) || (this->focusActor != NULL) ||
         (!(heathIsCritical = HealthMeter_IsCritical()) && ((this->idleType = (this->idleType + 1) & 1) != 0))) {
         this->stateFlags2 &= ~PLAYER_STATE2_IDLE_FIDGET;
         anim = Player_GetIdleAnim(this);
@@ -8344,6 +8346,86 @@ void Player_ChooseNextIdleAnim(PlayState* play, Player* this) {
 
     LinkAnimation_Change(play, &this->skelAnime, anim, (2.0f / 3.0f) * sWaterSpeedFactor, 0.0f,
                          Animation_GetLastFrame(anim), ANIMMODE_ONCE, -6.0f);
+}
+
+// SOH [Enhancement] Cinematic: hard-restart Link's standing idle animation from frame 0 with no morph, so the
+// breathing/head-bob cycle can be anchored to the start of a cinematic loop (seamless looping GIFs). Only acts
+// while Link is actually idle, so it never snaps an action animation. Callable from C++ via the bridge header.
+void CinematicCam_SyncLinkIdleAnim(void) {
+    Player* player;
+    LinkAnimationHeader* anim;
+
+    if (gPlayState == NULL) {
+        return;
+    }
+    player = GET_PLAYER(gPlayState);
+    if ((player == NULL) || (player->actionFunc != Player_Action_Idle)) {
+        return;
+    }
+    anim = Player_GetIdleAnim(player);
+    LinkAnimation_Change(gPlayState, &player->skelAnime, anim, (2.0f / 3.0f) * sWaterSpeedFactor, 0.0f,
+                         Animation_GetLastFrame(anim), ANIMMODE_ONCE, 0.0f);
+}
+
+// SOH [Enhancement] Cinematic: helpers to snap Link's facing direction for posed shots. Sets shape, world and
+// the general `yaw` field together so the idle action holds the new heading instead of stepping back.
+static void CinematicCam_ApplyLinkYaw(Player* player, s16 yaw) {
+    player->yaw = yaw;
+    player->actor.shape.rot.y = yaw;
+    player->actor.world.rot.y = yaw;
+}
+
+// Link's current facing as degrees 0..359, or -1 if unavailable.
+s32 CinematicCam_GetLinkYaw(void) {
+    Player* player;
+
+    if (gPlayState == NULL) {
+        return -1;
+    }
+    player = GET_PLAYER(gPlayState);
+    if (player == NULL) {
+        return -1;
+    }
+    return (s32)(((f32)(u16)player->actor.shape.rot.y / 65536.0f) * 360.0f);
+}
+
+// Snap Link to face the given absolute heading (degrees, any range; wrapped). No-op outside gameplay.
+void CinematicCam_SetLinkYaw(s32 degrees) {
+    Player* player;
+
+    if (gPlayState == NULL) {
+        return;
+    }
+    player = GET_PLAYER(gPlayState);
+    if (player == NULL) {
+        return;
+    }
+    degrees %= 360;
+    if (degrees < 0) {
+        degrees += 360;
+    }
+    CinematicCam_ApplyLinkYaw(player, (s16)(s32)(((f32)degrees / 360.0f) * 65536.0f));
+}
+
+// Snap Link to face the active camera (or directly away from it when `away` is set). Great for "look at lens" shots.
+void CinematicCam_FaceLinkToCamera(s32 away) {
+    Player* player;
+    Camera* cam;
+    s16 yaw;
+
+    if (gPlayState == NULL) {
+        return;
+    }
+    player = GET_PLAYER(gPlayState);
+    cam = GET_ACTIVE_CAM(gPlayState);
+    if ((player == NULL) || (cam == NULL)) {
+        return;
+    }
+    yaw = Math_Vec3f_Yaw(&player->actor.world.pos, &cam->eye);
+    if (away) {
+        yaw += 0x8000;
+    }
+    CinematicCam_ApplyLinkYaw(player, yaw);
 }
 
 void Player_Action_Idle(Player* this, PlayState* play) {

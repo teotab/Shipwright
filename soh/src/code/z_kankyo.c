@@ -895,8 +895,12 @@ void Environment_Update(PlayState* play, EnvironmentContext* envCtx, LightContex
         Rumble_ClearRequests();
     }
 
+    // SOH [Enhancement] Cinematic free camera: optionally freeze the sky (no cloud drift, no time-of-day
+    // progression) so looping clips/GIFs line up perfectly.
+    s32 cineFreezeSky = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.FreezeSky"), 0);
+
     if (pauseCtx->state == 0) {
-        if ((play->pauseCtx.state == 0) && (play->pauseCtx.debugState == 0)) {
+        if ((play->pauseCtx.state == 0) && (play->pauseCtx.debugState == 0) && !cineFreezeSky) {
             if (play->skyboxId == SKYBOX_NORMAL_SKY) {
                 play->skyboxCtx.rot.y -= 0.001f;
             } else if (play->skyboxId == SKYBOX_CUTSCENE_MAP) {
@@ -923,7 +927,7 @@ void Environment_Update(PlayState* play, EnvironmentContext* envCtx, LightContex
         if ((pauseCtx->state == 0) && (gameOverCtx->state == GAMEOVER_INACTIVE)) {
             if (((msgCtx->msgLength == 0) && (msgCtx->msgMode == 0)) ||
                 (((void)0, gSaveContext.gameMode) == GAMEMODE_END_CREDITS)) {
-                if ((envCtx->unk_1A == 0) && !FrameAdvance_IsEnabled(play) &&
+                if ((envCtx->unk_1A == 0) && !FrameAdvance_IsEnabled(play) && !cineFreezeSky &&
                     (play->transitionMode == TRANS_MODE_OFF || ((void)0, gSaveContext.gameMode) != GAMEMODE_NORMAL)) {
 
                     if (IS_DAY || gTimeIncrement >= 0x190) {
