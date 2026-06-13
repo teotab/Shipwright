@@ -7510,6 +7510,13 @@ static Vec3f sCineCamVel;
 static f32 sCineCamYawVel;
 static f32 sCineCamPitchVel;
 
+// Free-camera actor follow state (declared early so the input isolation in PreUpdateInput can see it). The
+// camera carries with this actor's movement; with FollowControlsLink the controller drives Link instead.
+static void* sCineFollowPtr = NULL;
+static s16 sCineFollowId = 0;
+static Vec3f sCineFollowLast;
+static s32 sCineFollowHasLast = 0;
+
 // The controller state captured before the rest of the frame consumed it (see CinematicCam_PreUpdateInput).
 Input gCineCamInput;
 // Globals read by the actor culling code (z_actor.c) to force-draw while flying.
@@ -7549,6 +7556,13 @@ void CinematicCam_PreUpdateInput(PlayState* play) {
     // During path playback with "control Link" enabled, the path drives the camera (not the controller),
     // so leave the controller to the player and let the world keep running.
     if (gCineCamPlaybackActive && CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.PlaybackControlsLink"), 0)) {
+        return;
+    }
+    // Free-camera "follow actor + control Link": the camera auto-follows/aims, so leave the controller to the
+    // player. (Capture the input first so the freecam still sees it, but don't blank it.)
+    if (!gCineCamPlaybackActive && sCineFollowId != 0 &&
+        CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.FollowControlsLink"), 0)) {
+        gCineCamInput = play->state.input[0];
         return;
     }
 
@@ -7644,10 +7658,12 @@ s32 CinematicCam_EnumActors(CineActorInfo* out, s32 maxCount) {
 }
 
 // Resolve an actor's aim position (a bit above its base), validating/re-acquiring by id.
-s32 CinematicCam_ResolveActor(void** ptr, s16 id, f32* out) {
+s32 CinematicCam_ResolveActor(void** ptr, s16 id, f32* hint, f32* out) {
     s32 i;
     Actor* a;
     Actor* cached = (Actor*)*ptr;
+    Actor* best = NULL;
+    f32 bestDist = 1e30f;
 
     if (gPlayState == NULL) {
         return 0;
@@ -7667,19 +7683,36 @@ s32 CinematicCam_ResolveActor(void** ptr, s16 id, f32* out) {
             }
         }
     }
-    // Re-acquire the first live actor with this id.
+    // Re-acquire by id. With a hint position, pick the NEAREST matching actor (disambiguates multiple identical
+    // actors after a reload); without one, take the first match.
     for (i = 0; i < ARRAY_COUNT(gPlayState->actorCtx.actorLists); i++) {
         a = gPlayState->actorCtx.actorLists[i].head;
         while (a != NULL) {
             if (a->id == id) {
-                *ptr = a;
-                out[0] = a->world.pos.x;
-                out[1] = a->world.pos.y + 20.0f;
-                out[2] = a->world.pos.z;
-                return 1;
+                if (hint == NULL) {
+                    if (best == NULL) {
+                        best = a;
+                    }
+                } else {
+                    f32 dx = a->world.pos.x - hint[0];
+                    f32 dy = a->world.pos.y - hint[1];
+                    f32 dz = a->world.pos.z - hint[2];
+                    f32 d = (dx * dx) + (dy * dy) + (dz * dz);
+                    if (d < bestDist) {
+                        bestDist = d;
+                        best = a;
+                    }
+                }
             }
             a = a->next;
         }
+    }
+    if (best != NULL) {
+        *ptr = best;
+        out[0] = best->world.pos.x;
+        out[1] = best->world.pos.y + 20.0f;
+        out[2] = best->world.pos.z;
+        return 1;
     }
     return 0;
 }
@@ -7691,6 +7724,55 @@ static s16 sCineSpectateId = 0;
 void CinematicCam_SetSpectateActor(void* ptr, s32 id) {
     sCineSpectatePtr = ptr;
     sCineSpectateId = (s16)id;
+}
+
+// (Follow state declared near the top so PreUpdateInput's isolation can read it.)
+void CinematicCam_SetFreecamFollow(void* ptr, s32 id) {
+    sCineFollowPtr = ptr;
+    sCineFollowId = (s16)id;
+    sCineFollowHasLast = 0; // re-anchor on the actor's current spot; no jump when toggled on
+}
+
+s32 CinematicCam_GetFreecamFollowId(void) {
+    return sCineFollowId;
+}
+
+// ActorDB display name for an actor id (cheap single lookup; avoids enumerating all actors each frame).
+const char* CinematicCam_ActorName(s32 id) {
+    return ActorDB_Retrieve((s16)id)->name;
+}
+
+// Resolve the follow actor (validate the cached pointer, else re-acquire by id). NULL if none/unavailable.
+static Actor* CinematicCam_ResolveFollowActor(void) {
+    s32 i;
+    Actor* a;
+    Actor* cached = (Actor*)sCineFollowPtr;
+
+    if (gPlayState == NULL || sCineFollowId == 0) {
+        return NULL;
+    }
+    if (cached != NULL) {
+        for (i = 0; i < ARRAY_COUNT(gPlayState->actorCtx.actorLists); i++) {
+            a = gPlayState->actorCtx.actorLists[i].head;
+            while (a != NULL) {
+                if (a == cached && a->id == sCineFollowId) {
+                    return a;
+                }
+                a = a->next;
+            }
+        }
+    }
+    for (i = 0; i < ARRAY_COUNT(gPlayState->actorCtx.actorLists); i++) { // re-acquire by id
+        a = gPlayState->actorCtx.actorLists[i].head;
+        while (a != NULL) {
+            if (a->id == sCineFollowId) {
+                sCineFollowPtr = a;
+                return a;
+            }
+            a = a->next;
+        }
+    }
+    return NULL;
 }
 
 // Resolve the spectated actor's viewpoint. With useFocus, the eye rides the actor's animated focus point
@@ -7802,6 +7884,99 @@ s32 CinematicCam_GetViewEye(f32* out) {
     return 1;
 }
 
+// --- Cinematic camera: area teleporter -----------------------------------------------------------
+// Major destinations for quickly setting up shots. Each entry uses the canonical "entrance index 0" of a
+// scene (spawn 0), the same indices the warp songs / scene transitions use.
+typedef struct {
+    const char* name;
+    s16 entrance;
+} CineTeleportDest;
+
+static const CineTeleportDest sCineTeleports[] = {
+    { "Kokiri Forest", ENTR_KOKIRI_FOREST_0 },
+    { "Lost Woods", ENTR_LOST_WOODS_SOUTH_EXIT },
+    { "Sacred Forest Meadow", ENTR_SACRED_FOREST_MEADOW_SOUTH_EXIT },
+    { "Hyrule Field", ENTR_HYRULE_FIELD_PAST_BRIDGE_SPAWN },
+    { "Lon Lon Ranch", ENTR_LON_LON_RANCH_ENTRANCE },
+    { "Market", ENTR_MARKET_SOUTH_EXIT },
+    { "Temple of Time", ENTR_TEMPLE_OF_TIME_ENTRANCE },
+    { "Hyrule Castle / Grounds", ENTR_CASTLE_GROUNDS_SOUTH_EXIT },
+    { "Kakariko Village", ENTR_KAKARIKO_VILLAGE_FRONT_GATE },
+    { "Graveyard", ENTR_GRAVEYARD_ENTRANCE },
+    { "Death Mountain Trail", ENTR_DEATH_MOUNTAIN_TRAIL_BOTTOM_EXIT },
+    { "Goron City", ENTR_GORON_CITY_UPPER_EXIT },
+    { "Death Mountain Crater", ENTR_DEATH_MOUNTAIN_CRATER_UPPER_EXIT },
+    { "Zora's River", ENTR_ZORAS_RIVER_WEST_EXIT },
+    { "Zora's Domain", ENTR_ZORAS_DOMAIN_ENTRANCE },
+    { "Zora's Fountain", ENTR_ZORAS_FOUNTAIN_JABU_JABU_BLUE_WARP },
+    { "Lake Hylia", ENTR_LAKE_HYLIA_NORTH_EXIT },
+    { "Gerudo Valley", ENTR_GERUDO_VALLEY_EAST_EXIT },
+    { "Gerudo's Fortress", ENTR_GERUDOS_FORTRESS_EAST_EXIT },
+    { "Haunted Wasteland", ENTR_HAUNTED_WASTELAND_EAST_EXIT },
+    { "Desert Colossus", ENTR_DESERT_COLOSSUS_EAST_EXIT },
+};
+
+s32 CinematicCam_GetTeleportCount(void) {
+    return (s32)(sizeof(sCineTeleports) / sizeof(sCineTeleports[0]));
+}
+
+const char* CinematicCam_GetTeleportName(s32 index) {
+    if (index < 0 || index >= CinematicCam_GetTeleportCount()) {
+        return NULL;
+    }
+    return sCineTeleports[index].name;
+}
+
+// Current time of day (0..65535, where 0 = midnight). Returns -1 if unavailable.
+s32 CinematicCam_GetDayTime(void) {
+    if (gPlayState == NULL) {
+        return -1;
+    }
+    return (s32)((void)0, gSaveContext.dayTime);
+}
+
+// Set the time of day directly (drives sun/moon position and sky/lighting colors). Pairs with Freeze Sky.
+void CinematicCam_SetDayTime(s32 t) {
+    if (gPlayState == NULL) {
+        return;
+    }
+    if (t < 0) {
+        t = 0;
+    }
+    if (t > 0xFFFF) {
+        t = 0xFFFF;
+    }
+    gSaveContext.dayTime = (u16)t;
+    gSaveContext.skyboxTime = (u16)t;
+}
+
+// Start a fade transition to the chosen destination. No-op outside of gameplay.
+// Warp directly to an arbitrary entrance index (fade transition). No-op outside gameplay or for a bad index.
+void CinematicCam_WarpToEntrance(s32 entrance) {
+    if (gPlayState == NULL || entrance < 0) {
+        return;
+    }
+    gPlayState->nextEntranceIndex = entrance;
+    gPlayState->transitionTrigger = TRANS_TRIGGER_START;
+    gPlayState->transitionType = TRANS_TYPE_FADE_BLACK;
+    gSaveContext.nextTransitionType = TRANS_TYPE_FADE_BLACK;
+}
+
+void CinematicCam_TeleportTo(s32 index) {
+    if (index < 0 || index >= CinematicCam_GetTeleportCount()) {
+        return;
+    }
+    CinematicCam_WarpToEntrance(sCineTeleports[index].entrance);
+}
+
+// The entrance (scene + spawn) you are currently in, so a path can remember where it was authored. -1 if N/A.
+s32 CinematicCam_GetCurrentEntrance(void) {
+    if (gPlayState == NULL) {
+        return -1;
+    }
+    return (s32)((void)0, gSaveContext.entranceIndex);
+}
+
 // Project a world point to normalized device coords (-1..1, +Y up) for the path editor's in-world overlay.
 // Returns 0 if there is no active play state or the point is behind the camera.
 s32 CinematicCam_WorldToNdc(f32* world, f32* outNdcX, f32* outNdcY) {
@@ -7889,6 +8064,7 @@ static void CinematicCam_Update(Camera* camera) {
         sCineCam.fov = sCinePlayFov;
         sCineCamVel.x = sCineCamVel.y = sCineCamVel.z = 0.0f;
         sCineCamYawVel = sCineCamPitchVel = 0.0f;
+        sCineFollowHasLast = 0; // re-anchor follow when manual flying resumes
 
         if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.DisableCulling"), 1)) {
             gCineCamDisableCulling = 1;
@@ -7927,6 +8103,7 @@ static void CinematicCam_Update(Camera* camera) {
             sCineCam.yaw = spDir.yaw;
             sCineCamVel.x = sCineCamVel.y = sCineCamVel.z = 0.0f;
             sCineCamYawVel = sCineCamPitchVel = 0.0f;
+            sCineFollowHasLast = 0; // re-anchor follow when manual flying resumes
 
             if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.DisableCulling"), 1)) {
                 gCineCamDisableCulling = 1;
@@ -7941,13 +8118,18 @@ static void CinematicCam_Update(Camera* camera) {
 
     // Rebindable button actions (defaults below; configurable in the menu's Cinematic Cam > Controls).
     s32 btnPrecision = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.PrecisionBtn"), BTN_L);
-    s32 btnBoost = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.BoostBtn"), BTN_R);
-    s32 btnUp = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.UpBtn"), BTN_A);
+    s32 btnBoost = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.BoostBtn"), BTN_CUSTOM_MODIFIER2);
+    s32 btnUp = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.UpBtn"), BTN_R);
     s32 btnDown = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.DownBtn"), BTN_Z);
     s32 btnFovIn = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.FovInBtn"), BTN_DUP);
     s32 btnFovOut = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.FovOutBtn"), BTN_DDOWN);
     s32 btnRollL = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.RollLeftBtn"), BTN_DLEFT);
     s32 btnRollR = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.RollRightBtn"), BTN_DRIGHT);
+
+    // "Follow + control Link": the controller drives Link (input not isolated this frame), so the camera goes
+    // hands-off - it auto-follows the actor and auto-aims at Link instead of reading the sticks.
+    s32 followCtrlLink =
+        (sCineFollowId != 0) && CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.FollowControlsLink"), 0);
 
     // Precision modifier: slow movement and look for fine framing.
     if (CHECK_BTN_ALL(cur->button, btnPrecision)) {
@@ -7959,20 +8141,35 @@ static void CinematicCam_Update(Camera* camera) {
         moveSpeed *= CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.BoostMultiplier"), 3.0f);
     }
 
-    // Look (right stick): yaw + pitch. Sticks are int8 (-128..127).
-    lookX = cur->right_stick_x * lookSpeed;
-    lookY = cur->right_stick_y * lookSpeed;
-    if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.InvertLookX"), 0)) {
-        lookX = -lookX;
+    if (followCtrlLink) {
+        // Auto-aim at Link (a little above his feet) so he stays framed while you play.
+        Player* followPlayer = GET_PLAYER(camera->play);
+        if (followPlayer != NULL) {
+            Vec3f aimTgt = followPlayer->actor.world.pos;
+            VecSph aimDir;
+            aimTgt.y += 40.0f;
+            OLib_Vec3fDiffToVecSphGeo(&aimDir, &sCineCam.eye, &aimTgt);
+            sCineCam.yaw = aimDir.yaw;
+            sCineCam.pitch = aimDir.pitch;
+        }
+        sCineCamYawVel = 0.0f;
+        sCineCamPitchVel = 0.0f;
+    } else {
+        // Look (right stick): yaw + pitch. Sticks are int8 (-128..127).
+        lookX = cur->right_stick_x * lookSpeed;
+        lookY = cur->right_stick_y * lookSpeed;
+        if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.InvertLookX"), 0)) {
+            lookX = -lookX;
+        }
+        if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.InvertLookY"), 0)) {
+            lookY = -lookY;
+        }
+        // Ease angular velocity toward the look input, then integrate into the orientation.
+        sCineCamYawVel += (-lookX - sCineCamYawVel) * response;
+        sCineCamPitchVel += (lookY - sCineCamPitchVel) * response;
+        sCineCam.yaw += (s16)sCineCamYawVel;
+        sCineCam.pitch += (s16)sCineCamPitchVel;
     }
-    if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.InvertLookY"), 0)) {
-        lookY = -lookY;
-    }
-    // Ease angular velocity toward the look input, then integrate into the orientation.
-    sCineCamYawVel += (-lookX - sCineCamYawVel) * response;
-    sCineCamPitchVel += (lookY - sCineCamPitchVel) * response;
-    sCineCam.yaw += (s16)sCineCamYawVel;
-    sCineCam.pitch += (s16)sCineCamPitchVel;
     // Clamp pitch shy of vertical to avoid the up-vector flipping.
     if (sCineCam.pitch > 0x3C00) {
         sCineCam.pitch = 0x3C00;
@@ -7993,14 +8190,14 @@ static void CinematicCam_Update(Camera* camera) {
     OLib_VecSphGeoToVec3f(&right, &rightSph);
 
     // Move (left stick): forward/back along facing (incl. pitch) + strafe. Stick up = forward.
-    // Vertical along world Y: R = ascend, Z = descend.
-    fwdInput = cur->stick_y / 127.0f;
-    strafeInput = cur->stick_x / 127.0f;
+    // Vertical along world Y: R = ascend, Z = descend. (Hands-off when the player is driving Link.)
+    fwdInput = followCtrlLink ? 0.0f : cur->stick_y / 127.0f;
+    strafeInput = followCtrlLink ? 0.0f : cur->stick_x / 127.0f;
     vertInput = 0.0f;
-    if (CHECK_BTN_ALL(cur->button, btnUp)) {
+    if (!followCtrlLink && CHECK_BTN_ALL(cur->button, btnUp)) {
         vertInput += 1.0f;
     }
-    if (CHECK_BTN_ALL(cur->button, btnDown)) {
+    if (!followCtrlLink && CHECK_BTN_ALL(cur->button, btnDown)) {
         vertInput -= 1.0f;
     }
 
@@ -8016,24 +8213,41 @@ static void CinematicCam_Update(Camera* camera) {
     sCineCam.eye.y += sCineCamVel.y;
     sCineCam.eye.z += sCineCamVel.z;
 
-    // FOV and roll.
-    if (CHECK_BTN_ALL(cur->button, btnFovIn)) {
-        sCineCam.fov -= 1.0f;
+    // Free-camera actor follow: carry the camera along with a moving actor (rigid offset). Stick movement
+    // above still applies on top, and look/aim is unaffected - so you can frame whatever you like.
+    if (sCineFollowId != 0) {
+        Actor* followActor = CinematicCam_ResolveFollowActor();
+        if (followActor != NULL) {
+            if (sCineFollowHasLast) {
+                sCineCam.eye.x += followActor->world.pos.x - sCineFollowLast.x;
+                sCineCam.eye.y += followActor->world.pos.y - sCineFollowLast.y;
+                sCineCam.eye.z += followActor->world.pos.z - sCineFollowLast.z;
+            }
+            sCineFollowLast = followActor->world.pos;
+            sCineFollowHasLast = 1;
+        }
     }
-    if (CHECK_BTN_ALL(cur->button, btnFovOut)) {
-        sCineCam.fov += 1.0f;
-    }
-    if (sCineCam.fov < 1.0f) {
-        sCineCam.fov = 1.0f;
-    }
-    if (sCineCam.fov > 170.0f) {
-        sCineCam.fov = 170.0f;
-    }
-    if (CHECK_BTN_ALL(cur->button, btnRollL)) {
-        sCineCam.roll -= 0x80;
-    }
-    if (CHECK_BTN_ALL(cur->button, btnRollR)) {
-        sCineCam.roll += 0x80;
+
+    // FOV and roll (skipped in follow+control-Link mode so those buttons belong to Link).
+    if (!followCtrlLink) {
+        if (CHECK_BTN_ALL(cur->button, btnFovIn)) {
+            sCineCam.fov -= 1.0f;
+        }
+        if (CHECK_BTN_ALL(cur->button, btnFovOut)) {
+            sCineCam.fov += 1.0f;
+        }
+        if (sCineCam.fov < 1.0f) {
+            sCineCam.fov = 1.0f;
+        }
+        if (sCineCam.fov > 170.0f) {
+            sCineCam.fov = 170.0f;
+        }
+        if (CHECK_BTN_ALL(cur->button, btnRollL)) {
+            sCineCam.roll -= 0x80;
+        }
+        if (CHECK_BTN_ALL(cur->button, btnRollR)) {
+            sCineCam.roll += 0x80;
+        }
     }
 
     // Compose the view: at = eye + facing, up from pitch/yaw/roll.
@@ -8063,8 +8277,9 @@ static void CinematicCam_Update(Camera* camera) {
     }
 
     // Freeze the world while flying so the player doesn't react to the sticks. Takes effect next frame
-    // (actors already updated before the camera block). Toggle off via CinematicCam.FreezeWorld.
-    if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.FreezeWorld"), 1)) {
+    // (actors already updated before the camera block). Toggle off via CinematicCam.FreezeWorld. Never freeze
+    // in follow+control-Link mode - the whole point is to play while the camera follows.
+    if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.FreezeWorld"), 1) && !followCtrlLink) {
         IREG(72) = 1;
     }
 }
