@@ -63,8 +63,15 @@ struct CineParamTrack {
 static CineParamTrack sGreenScreenTrack = { "greenScreen", CINE_TRACK_STEP, false, {} };
 static int sGreenScreenOverride = -1; // value forced by the track this frame, or -1 = none (CVar applies)
 
-// Evaluate a track at a time. Returns false (no value) when the track is disabled or empty. Step tracks hold
-// the most recent key (and clamp before the first / after the last); linear tracks blend between neighbors.
+// A key's effective interpolation mode (per-key, falling back to the track default when unset).
+static int KeyInterp(const CineParamTrack& t, int i) {
+    int m = t.keys[i].interp;
+    return (m < 0) ? t.interp : m;
+}
+
+// Evaluate a track at a time. Returns false (no value) when the track is disabled or empty. Clamps before the
+// first / after the last key. The segment uses the LEFT key's interpolation: step (hold), linear, or smooth
+// (uniform Catmull-Rom through the neighbors).
 static bool EvalParamTrack(const CineParamTrack& t, float time, float& out) {
     if (!t.enabled || t.keys.empty()) {
         return false;
@@ -81,19 +88,29 @@ static bool EvalParamTrack(const CineParamTrack& t, float time, float& out) {
     while (i + 1 < t.keys.size() && t.keys[i + 1].time <= time) {
         i++;
     }
-    if (t.interp == CINE_TRACK_LINEAR && i + 1 < t.keys.size()) {
-        const CineParamKey& a = t.keys[i];
-        const CineParamKey& b = t.keys[i + 1];
-        float d = b.time - a.time;
-        float s = (d > 1e-5f) ? (time - a.time) / d : 0.0f;
-        out = a.value + (b.value - a.value) * s;
+    const CineParamKey& a = t.keys[i];
+    const CineParamKey& b = t.keys[i + 1];
+    float d = b.time - a.time;
+    float s = (d > 1e-5f) ? (time - a.time) / d : 0.0f;
+    int mode = KeyInterp(t, (int)i);
+    if (mode == CINE_TRACK_STEP) {
+        out = a.value;
+    } else if (mode == CINE_TRACK_SMOOTH) {
+        float p0 = (i > 0) ? t.keys[i - 1].value : a.value;
+        float p1 = a.value;
+        float p2 = b.value;
+        float p3 = (i + 2 < t.keys.size()) ? t.keys[i + 2].value : b.value;
+        float s2 = s * s, s3 = s2 * s;
+        out = 0.5f * ((2.0f * p1) + (-p0 + p2) * s + (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * s2 +
+                      (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * s3);
     } else {
-        out = t.keys[i].value; // step / hold
+        out = a.value + (b.value - a.value) * s; // linear
     }
     return true;
 }
 
-// Insert (or overwrite a near-coincident) key, keeping the track sorted by time.
+// Insert (or overwrite a near-coincident) key, keeping the track sorted by time. New keys inherit the track's
+// default interpolation (interp = -1).
 static void TrackAddKey(CineParamTrack& t, float time, float value) {
     for (CineParamKey& k : t.keys) {
         if (std::fabs(k.time - time) < 1e-3f) {
@@ -101,7 +118,7 @@ static void TrackAddKey(CineParamTrack& t, float time, float value) {
             return;
         }
     }
-    t.keys.push_back({ time, value });
+    t.keys.push_back({ time, value, -1 });
     std::sort(t.keys.begin(), t.keys.end(),
               [](const CineParamKey& a, const CineParamKey& b) { return a.time < b.time; });
 }
@@ -113,6 +130,78 @@ extern "C" int CinematicCam_GetGreenScreen(void) {
         return sGreenScreenOverride;
     }
     return CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.GreenScreen"), 0);
+}
+
+// Time of day: 0..65535 (0 = midnight). Continuous, so it interpolates (linear ramps between keys).
+static CineParamTrack sTodTrack = { "timeOfDay", CINE_TRACK_LINEAR, false, {} };
+
+// Discrete-value palette for dope-sheet coloring (index = value).
+static const ImU32 kGsPalette[3] = { IM_COL32(150, 150, 150, 255), IM_COL32(40, 200, 90, 255),
+                                     IM_COL32(60, 120, 230, 255) };
+
+// Camera shake intensity: a multiplier on the shake amplitudes (0 = still, 1 = the sliders' value, up to 2x).
+static CineParamTrack sShakeTrack = { "shake", CINE_TRACK_LINEAR, false, {} };
+static float sShakeIntensity = 1.0f; // runtime multiplier applied to the shake amps this frame
+
+// Hide HUD (0 = show, 1 = hide), to reveal/hide the HUD over a shot. Stepped (discrete).
+static CineParamTrack sHudTrack = { "hideHud", CINE_TRACK_STEP, false, {} };
+static int sHudHideOverride = -1; // 0/1 forced by the track this frame, or -1 = none (the HideHud setting applies)
+static const ImU32 kHudPalette[2] = { IM_COL32(90, 90, 95, 255), IM_COL32(230, 170, 60, 255) };
+
+// The shared movable aim target (used by "look at target" keyframes and the aim override). Declared here so the
+// target-animation tracks below can drive it; its UI lives in the aim-override / per-keyframe sections.
+static float sAimOverridePoint[3] = { 0.0f, 0.0f, 0.0f };
+
+// Aim target position (X/Y/Z), continuous. When enabled, the movable target follows these curves over the shot.
+static CineParamTrack sTargetXTrack = { "targetX", CINE_TRACK_LINEAR, false, {} };
+static CineParamTrack sTargetYTrack = { "targetY", CINE_TRACK_LINEAR, false, {} };
+static CineParamTrack sTargetZTrack = { "targetZ", CINE_TRACK_LINEAR, false, {} };
+
+// Per-track apply hooks, run during playback/preview with the track's value at the playhead.
+static void ApplyGreenScreen(float v) {
+    sGreenScreenOverride = (int)(v + 0.5f);
+}
+static void ApplyTimeOfDay(float v) {
+    CinematicCam_SetDayTime((int)(v + 0.5f));
+}
+static void ApplyShakeIntensity(float v) {
+    sShakeIntensity = v;
+}
+static void ApplyHud(float v) {
+    sHudHideOverride = (v > 0.5f) ? 1 : 0;
+}
+static void ApplyTargetX(float v) {
+    sAimOverridePoint[0] = v;
+}
+static void ApplyTargetY(float v) {
+    sAimOverridePoint[1] = v;
+}
+static void ApplyTargetZ(float v) {
+    sAimOverridePoint[2] = v;
+}
+
+// Registry of every keyframable parameter. Listing a parameter here makes it appear on the dope sheet and flow
+// through save/load, playback and undo automatically; its inline keyframe control sits next to its own widget.
+struct TrackDef {
+    CineParamTrack* track;
+    const char* name;     // dope-sheet lane label
+    bool continuous;      // ramp (continuous) vs stepped (discrete) rendering
+    float vmin, vmax;     // value range, for the continuous lane ramp
+    const ImU32* palette; // discrete value colors (null when continuous)
+    int palCount;
+    void (*apply)(float v); // applied to the live parameter during playback
+};
+static const std::vector<TrackDef>& AllTrackDefs() {
+    static const std::vector<TrackDef> defs = {
+        { &sGreenScreenTrack, "Green scr", false, 0.0f, 0.0f, kGsPalette, 3, &ApplyGreenScreen },
+        { &sTodTrack, "Time of day", true, 0.0f, 65535.0f, nullptr, 0, &ApplyTimeOfDay },
+        { &sShakeTrack, "Shake", true, 0.0f, 2.0f, nullptr, 0, &ApplyShakeIntensity },
+        { &sHudTrack, "Hide HUD", false, 0.0f, 0.0f, kHudPalette, 2, &ApplyHud },
+        { &sTargetXTrack, "Target X", true, 0.0f, 0.0f, nullptr, 0, &ApplyTargetX }, // 0,0 = auto-range
+        { &sTargetYTrack, "Target Y", true, 0.0f, 0.0f, nullptr, 0, &ApplyTargetY },
+        { &sTargetZTrack, "Target Z", true, 0.0f, 0.0f, nullptr, 0, &ApplyTargetZ },
+    };
+    return defs;
 }
 
 static int sEaseMode = 1;        // playback timing easing: 0 none, 1 in/out, 2 in, 3 out
@@ -128,7 +217,7 @@ static bool sShakeOnPreview = true; // also shake while scrubbing/previewing (no
 
 // Path-level aim override: when set, every keyframe aims at this target instead of its own.
 static int sAimOverride = 0; // 0 none, 1 Link, 2 point, 3 actor
-static float sAimOverridePoint[3] = { 0.0f, 0.0f, 0.0f };
+// sAimOverridePoint (the movable target) is declared earlier, next to its animation tracks.
 static int sAimOverrideActorId = 0;
 static void* sAimOverrideActorPtr = nullptr;
 
@@ -166,10 +255,28 @@ struct PathSnapshot {
     std::vector<int> ids;
     int selectedId;
     std::vector<int> selection;
-    std::vector<CineParamKey> gsKeys; // green-screen automation track keys
+    std::vector<std::vector<CineParamKey>> tracks; // keys of every automation track, in AllTrackDefs() order
 };
 static std::vector<PathSnapshot> sUndo;
 static std::vector<PathSnapshot> sRedo;
+
+static PathSnapshot MakeSnapshot() {
+    PathSnapshot s{ sKeyframes, sIds, sSelectedId, sSelection, {} };
+    for (const TrackDef& d : AllTrackDefs()) {
+        s.tracks.push_back(d.track->keys);
+    }
+    return s;
+}
+static void RestoreSnapshot(const PathSnapshot& s) {
+    sKeyframes = s.kf;
+    sIds = s.ids;
+    sSelectedId = s.selectedId;
+    sSelection = s.selection;
+    const std::vector<TrackDef>& defs = AllTrackDefs();
+    for (size_t i = 0; i < defs.size() && i < s.tracks.size(); i++) {
+        defs[i].track->keys = s.tracks[i];
+    }
+}
 
 // Assumed game logic tick rate; playback advances this many seconds per OnCameraState call.
 static const float kTickSeconds = 1.0f / 20.0f;
@@ -194,7 +301,7 @@ static float EffectiveTotal() {
 }
 
 static void PushUndo() {
-    sUndo.push_back({ sKeyframes, sIds, sSelectedId, sSelection, sGreenScreenTrack.keys });
+    sUndo.push_back(MakeSnapshot());
     if (sUndo.size() > 64) {
         sUndo.erase(sUndo.begin());
     }
@@ -205,28 +312,20 @@ static void Undo() {
     if (sUndo.empty()) {
         return;
     }
-    sRedo.push_back({ sKeyframes, sIds, sSelectedId, sSelection, sGreenScreenTrack.keys });
+    sRedo.push_back(MakeSnapshot());
     PathSnapshot s = sUndo.back();
     sUndo.pop_back();
-    sKeyframes = s.kf;
-    sIds = s.ids;
-    sSelectedId = s.selectedId;
-    sSelection = s.selection;
-    sGreenScreenTrack.keys = s.gsKeys;
+    RestoreSnapshot(s);
 }
 
 static void Redo() {
     if (sRedo.empty()) {
         return;
     }
-    sUndo.push_back({ sKeyframes, sIds, sSelectedId, sSelection, sGreenScreenTrack.keys });
+    sUndo.push_back(MakeSnapshot());
     PathSnapshot s = sRedo.back();
     sRedo.pop_back();
-    sKeyframes = s.kf;
-    sIds = s.ids;
-    sSelectedId = s.selectedId;
-    sSelection = s.selection;
-    sGreenScreenTrack.keys = s.gsKeys;
+    RestoreSnapshot(s);
 }
 
 static int SelectedIndex() {
@@ -748,9 +847,12 @@ static void ApplyShake(float playTime, float* eye, float* at, float* roll) {
             n[i] = ShakeNoise(t, i * 10.0f);
         }
     }
-    float px = n[0] * sShakePosAmp;
-    float py = n[1] * sShakePosAmp;
-    float pz = n[2] * sShakePosAmp;
+    // Scale by the (optionally keyframed) shake intensity multiplier.
+    float posAmp = sShakePosAmp * sShakeIntensity;
+    float rotAmp = sShakeRotAmp * sShakeIntensity;
+    float px = n[0] * posAmp;
+    float py = n[1] * posAmp;
+    float pz = n[2] * posAmp;
     // Translate eye and look-at together so the aim direction is preserved...
     eye[0] += px;
     eye[1] += py;
@@ -764,10 +866,10 @@ static void ApplyShake(float playTime, float* eye, float* at, float* roll) {
     if (dist < 1.0f) {
         dist = 1.0f;
     }
-    float k = dist * std::tan(sShakeRotAmp * 3.14159265f / 180.0f);
+    float k = dist * std::tan(rotAmp * 3.14159265f / 180.0f);
     at[0] += n[3] * k;
     at[1] += n[4] * k;
-    *roll += n[5] * sShakeRotAmp * 0.5f;
+    *roll += n[5] * rotAmp * 0.5f;
 }
 
 // Live position of the follow target (Link or actor). Returns false if follow is off or unavailable.
@@ -869,6 +971,23 @@ static void PlaybackTick() {
     }
 
     bool active = (sPlaying || sPreview) && !sKeyframes.empty();
+
+    // Parameter automation: while a cinematic drives the view, each enabled track applies its value at the
+    // playhead to the live parameter. Reset the per-frame overrides first so a non-driving track falls back to
+    // its manual setting (green screen / HUD) or neutral value (shake intensity 1.0). Done before the pose block
+    // so shake intensity is current this frame.
+    sGreenScreenOverride = -1;
+    sShakeIntensity = 1.0f;
+    sHudHideOverride = -1;
+    for (const TrackDef& d : AllTrackDefs()) {
+        if (active && d.track->enabled) {
+            float v;
+            if (EvalParamTrack(*d.track, sPlayhead, v)) {
+                d.apply(v);
+            }
+        }
+    }
+
     if (active) {
         CineKeyframe s = SampleAt(sPlayhead);
         // Path follow: shift the whole rig by how far the tracked target has moved since authoring.
@@ -884,8 +1003,8 @@ static void PlaybackTick() {
                 s.at[2] += dz;
             }
         }
-        if (sShakeEnabled && (sPlaying || sShakeOnPreview)) {
-            ApplyShake(sPlayhead, s.eye, s.at, &s.roll);
+        if ((sShakeEnabled && (sPlaying || sShakeOnPreview)) || sShakeTrack.enabled) {
+            ApplyShake(sPlayhead, s.eye, s.at, &s.roll); // intensity scales the amps (keyframable)
         }
         CinematicCam_SetPlayback(1, s.eye, s.at, s.roll, s.fov);
         wasActive = true;
@@ -895,20 +1014,12 @@ static void PlaybackTick() {
         wasActive = false;
     }
 
-    // Parameter automation: while a cinematic is driving the view, override the green screen from its track.
-    // Off (-1) otherwise, so the manual dropdown applies when stopped.
-    float gv;
-    if (active && EvalParamTrack(sGreenScreenTrack, sPlayhead, gv)) {
-        sGreenScreenOverride = (int)(gv + 0.5f);
-    } else {
-        sGreenScreenOverride = -1;
-    }
-
     // Hide the HUD while the cinematic camera is active (reuses SoH's NoUI state). Only clear what we set,
-    // so an independently-enabled "no UI" isn't disturbed.
+    // so an independently-enabled "no UI" isn't disturbed. A keyframed HUD track overrides the manual setting.
     static bool sWeHidHud = false;
     bool camActive = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 0) || active;
-    bool hideHud = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.HideHud"), 1) != 0;
+    bool hideHud = (sHudHideOverride >= 0) ? (sHudHideOverride != 0)
+                                           : (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.HideHud"), 1) != 0);
     if (camActive && hideHud) {
         GameInteractor::State::NoUIActive = 1;
         sWeHidHud = true;
@@ -967,8 +1078,10 @@ static void ClearPath() {
     sPlaying = false;
     sPreview = false;
     sFollowMode = 0; // follow is path-level runtime state; clear it with the path
-    sGreenScreenTrack.keys.clear();
-    sGreenScreenTrack.enabled = false;
+    for (const TrackDef& d : AllTrackDefs()) {
+        d.track->keys.clear();
+        d.track->enabled = false;
+    }
 }
 
 static void CopySelected() {
@@ -1015,7 +1128,7 @@ static void InsertAtPlayhead() {
 static nlohmann::json TrackToJson(const CineParamTrack& t) {
     nlohmann::json keys = nlohmann::json::array();
     for (const CineParamKey& k : t.keys) {
-        keys.push_back({ { "time", k.time }, { "value", k.value } });
+        keys.push_back({ { "time", k.time }, { "value", k.value }, { "interp", k.interp } });
     }
     return { { "enabled", t.enabled }, { "keys", keys } };
 }
@@ -1025,7 +1138,7 @@ static void TrackFromJson(CineParamTrack& t, const nlohmann::json& j) {
     t.enabled = j.value("enabled", false);
     if (j.contains("keys")) {
         for (const auto& e : j["keys"]) {
-            t.keys.push_back({ e.value("time", 0.0f), e.value("value", 0.0f) });
+            t.keys.push_back({ e.value("time", 0.0f), e.value("value", 0.0f), e.value("interp", -1) });
         }
         std::sort(t.keys.begin(), t.keys.end(),
                   [](const CineParamKey& a, const CineParamKey& b) { return a.time < b.time; });
@@ -1060,7 +1173,9 @@ static void SavePath() {
     sPathEntrance = sBindLocation ? CinematicCam_GetCurrentEntrance() : -1;
     j["entrance"] = sPathEntrance;
     // Parameter automation tracks (each keyed by its stable id).
-    j["tracks"][sGreenScreenTrack.id] = TrackToJson(sGreenScreenTrack);
+    for (const TrackDef& d : AllTrackDefs()) {
+        j["tracks"][d.track->id] = TrackToJson(*d.track);
+    }
     std::filesystem::create_directories("cinematics");
     std::ofstream f(std::string("cinematics/") + sFilename + ".json");
     if (f.good()) {
@@ -1091,8 +1206,12 @@ static void LoadPath() {
             sAimOverridePoint[2] = j["target"][2];
         }
         sPathEntrance = j.value("entrance", -1);
-        if (j.contains("tracks") && j["tracks"].contains(sGreenScreenTrack.id)) {
-            TrackFromJson(sGreenScreenTrack, j["tracks"][sGreenScreenTrack.id]);
+        if (j.contains("tracks")) {
+            for (const TrackDef& d : AllTrackDefs()) {
+                if (j["tracks"].contains(d.track->id)) {
+                    TrackFromJson(*d.track, j["tracks"][d.track->id]);
+                }
+            }
         }
     }
     for (auto& e : *arr) {
@@ -2394,19 +2513,13 @@ static void DrawTimeline() {
     }
     float view = sTlViewDur;
 
-    // Dope-sheet lanes: the camera keyframes, plus one lane per enabled automation track. Extend autoLanes as
-    // more keyframable parameters come online (the timeline picks them up automatically).
-    struct TlLane {
-        CineParamTrack* track;
-        const char* name;
-        const ImU32* palette;
-        int palCount;
-    };
-    static const ImU32 kGsPalette[3] = { IM_COL32(150, 150, 150, 255), IM_COL32(40, 200, 90, 255),
-                                         IM_COL32(60, 120, 230, 255) };
-    std::vector<TlLane> autoLanes;
-    if (sGreenScreenTrack.enabled) {
-        autoLanes.push_back({ &sGreenScreenTrack, "Green scr", kGsPalette, 3 });
+    // Dope-sheet lanes: the camera keyframes, plus one lane per ENABLED automation track, straight from the
+    // registry - any keyframable parameter shows up here automatically once its track is enabled.
+    std::vector<const TrackDef*> autoLanes;
+    for (const TrackDef& d : AllTrackDefs()) {
+        if (d.track->enabled) {
+            autoLanes.push_back(&d);
+        }
     }
 
     const float headerW = 88.0f;
@@ -2470,7 +2583,7 @@ static void DrawTimeline() {
     // Lane labels + separators.
     dl->AddText(ImVec2(p0.x + 6.0f, laneMid(0) - 7.0f), IM_COL32(215, 215, 220, 255), "Camera");
     for (int li = 0; li < (int)autoLanes.size(); li++) {
-        dl->AddText(ImVec2(p0.x + 6.0f, laneMid(1 + li) - 7.0f), IM_COL32(215, 215, 220, 255), autoLanes[li].name);
+        dl->AddText(ImVec2(p0.x + 6.0f, laneMid(1 + li) - 7.0f), IM_COL32(215, 215, 220, 255), autoLanes[li]->name);
     }
     for (int lane = 1; lane < laneCount; lane++) {
         float y = laneTop(lane);
@@ -2497,16 +2610,40 @@ static void DrawTimeline() {
                       primary ? 2.0f : 1.0f);
     }
 
-    // Automation-track keys, drawn as squares colored by the value they hold.
+    // Automation-track keys. Discrete tracks draw value-colored squares (held value); continuous tracks draw a
+    // connecting ramp with a dot at each key, the value mapped to the lane's height.
     for (int li = 0; li < (int)autoLanes.size(); li++) {
-        const TlLane& L = autoLanes[li];
+        const TrackDef* L = autoLanes[li];
+        float lyTop = laneTop(1 + li) + 4.0f;
+        float lyBot = laneTop(1 + li) + laneH - 4.0f;
         float ly = laneMid(1 + li);
-        for (size_t ki = 0; ki < L.track->keys.size(); ki++) {
-            float kx = timeToX(L.track->keys[ki].time);
-            int v = (int)(L.track->keys[ki].value + 0.5f);
-            ImU32 c = (v >= 0 && v < L.palCount) ? L.palette[v] : IM_COL32(150, 150, 150, 255);
-            dl->AddRectFilled(ImVec2(kx - 4.0f, ly - 6.0f), ImVec2(kx + 4.0f, ly + 6.0f), c, 2.0f);
-            dl->AddRect(ImVec2(kx - 4.0f, ly - 6.0f), ImVec2(kx + 4.0f, ly + 6.0f), IM_COL32(255, 255, 255, 130), 2.0f);
+        if (L->continuous) {
+            float span = (L->vmax > L->vmin) ? (L->vmax - L->vmin) : 1.0f;
+            auto valToY = [&](float v) {
+                float u = (v - L->vmin) / span;
+                u = std::min(std::max(u, 0.0f), 1.0f);
+                return lyBot - u * (lyBot - lyTop);
+            };
+            ImU32 line = IM_COL32(120, 200, 255, 220);
+            for (size_t ki = 0; ki + 1 < L->track->keys.size(); ki++) {
+                dl->AddLine(ImVec2(timeToX(L->track->keys[ki].time), valToY(L->track->keys[ki].value)),
+                            ImVec2(timeToX(L->track->keys[ki + 1].time), valToY(L->track->keys[ki + 1].value)), line,
+                            1.5f);
+            }
+            for (size_t ki = 0; ki < L->track->keys.size(); ki++) {
+                ImVec2 c(timeToX(L->track->keys[ki].time), valToY(L->track->keys[ki].value));
+                dl->AddCircleFilled(c, 3.5f, line);
+                dl->AddCircle(c, 3.5f, IM_COL32(255, 255, 255, 150));
+            }
+        } else {
+            for (size_t ki = 0; ki < L->track->keys.size(); ki++) {
+                float kx = timeToX(L->track->keys[ki].time);
+                int v = (int)(L->track->keys[ki].value + 0.5f);
+                ImU32 c = (v >= 0 && v < L->palCount) ? L->palette[v] : IM_COL32(150, 150, 150, 255);
+                dl->AddRectFilled(ImVec2(kx - 4.0f, ly - 6.0f), ImVec2(kx + 4.0f, ly + 6.0f), c, 2.0f);
+                dl->AddRect(ImVec2(kx - 4.0f, ly - 6.0f), ImVec2(kx + 4.0f, ly + 6.0f), IM_COL32(255, 255, 255, 130),
+                            2.0f);
+            }
         }
     }
 
@@ -2574,7 +2711,7 @@ static void DrawTimeline() {
                 CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
             }
         } else if (lane > 0) {
-            CineParamTrack* tr = autoLanes[lane - 1].track;
+            CineParamTrack* tr = autoLanes[lane - 1]->track;
             int hit = -1;
             float hitd = 8.0f;
             for (int ki = 0; ki < (int)tr->keys.size(); ki++) {
@@ -2620,7 +2757,7 @@ static void DrawTimeline() {
             }
             SortByTime();
         } else if (sTlTrackDrag >= 0 && sTlTrackDrag < (int)autoLanes.size()) {
-            CineParamTrack* tr = autoLanes[sTlTrackDrag].track;
+            CineParamTrack* tr = autoLanes[sTlTrackDrag]->track;
             if (sTlKeyDrag >= 0 && sTlKeyDrag < (int)tr->keys.size()) {
                 // Clamp between neighbors so order (and the dragged index) stays valid - no resort needed.
                 float lo = (sTlKeyDrag > 0) ? tr->keys[sTlKeyDrag - 1].time + 1e-3f : 0.0f;
@@ -2752,62 +2889,438 @@ void CinematicCamPathWindow::InitElement() {
     }
 }
 
-// Generic editor for a discrete (enum) parameter track: pick a value, add a key at the playhead, then edit the
-// per-key time/value rows. `labels`/`count` describe the enum. Reused as more discrete parameters are added.
-static void DrawParamTrackEditor(CineParamTrack& t, const char* const* labels, int count) {
-    static int addVal = 0; // value chosen for the next "Add key" (one editor visible at a time today)
-    if (addVal >= count) {
-        addVal = 0;
-    }
-    ImGui::SetNextItemWidth(140.0f);
-    ImGui::Combo("##addval", &addVal, labels, count);
-    ImGui::SameLine();
-    if (ImGui::Button("Add key at playhead")) {
-        TrackAddKey(t, sPlayhead, (float)addVal);
-    }
-    ImGui::SameLine();
-    float pv;
-    int cur = EvalParamTrack(t, sPlayhead, pv) ? (int)(pv + 0.5f) : -1;
-    ImGui::TextDisabled("now: %s", (cur >= 0 && cur < count) ? labels[cur] : "-");
+// Inline Premiere-style keyframe control, placed next to a parameter's own widget. The first button toggles
+// animation for the parameter (the "stopwatch"); when on, the navigator jumps to the previous key, adds OR
+// removes a key at the playhead (with the current `value`), and jumps to the next. Returns true while the track
+// drives the value, so the caller routes edits of the parameter into a keyframe at the playhead.
+static bool DrawParamKeyNav(CineParamTrack& t, float value) {
+    ImGui::PushID(t.id);
+    auto jumpTo = [&](float tm) {
+        sPlayhead = std::min(std::max(tm, 0.0f), EffectiveTotal());
+        sPreview = true;
+        CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
+    };
 
-    if (t.keys.empty()) {
-        ImGui::TextDisabled("No keys yet - choose a value and Add at the playhead.");
+    // Use the state from the START of the frame for push/pop so they stay balanced even though the button toggles
+    // t.enabled below (pushing on the old value but popping on the new one was the PopStyleColor crash).
+    bool wasEnabled = t.enabled;
+    if (wasEnabled) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.55f, 0.32f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.26f, 0.66f, 0.40f, 1.0f));
+    }
+    if (ImGui::SmallButton(wasEnabled ? "Key on" : "Key")) {
+        t.enabled = !t.enabled;
+        if (t.enabled && t.keys.empty()) {
+            PushUndo();
+            TrackAddKey(t, sPlayhead, value); // seed a key so it holds the current value
+        }
+    }
+    if (wasEnabled) {
+        ImGui::PopStyleColor(2);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Keyframe this parameter (animate it over the timeline).");
+    }
+    if (!t.enabled) {
+        ImGui::PopID();
+        return false;
+    }
+
+    // Locate a key at the playhead and the nearest keys on each side.
+    int atIdx = -1;
+    float prevT = -1e9f, nextT = 1e9f;
+    for (int i = 0; i < (int)t.keys.size(); i++) {
+        float kt = t.keys[i].time;
+        if (std::fabs(kt - sPlayhead) < 1e-3f) {
+            atIdx = i;
+        } else if (kt < sPlayhead && kt > prevT) {
+            prevT = kt;
+        } else if (kt > sPlayhead && kt < nextT) {
+            nextT = kt;
+        }
+    }
+
+    ImGui::SameLine();
+    ImGui::BeginDisabled(prevT < -1e8f);
+    if (ImGui::SmallButton("|<")) {
+        jumpTo(prevT);
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::SmallButton(atIdx >= 0 ? "-##key" : "+##key")) {
+        PushUndo();
+        if (atIdx >= 0) {
+            t.keys.erase(t.keys.begin() + atIdx);
+        } else {
+            TrackAddKey(t, sPlayhead, value);
+        }
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(atIdx >= 0 ? "Remove keyframe at playhead" : "Add keyframe at playhead");
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(nextT > 1e8f);
+    if (ImGui::SmallButton(">|")) {
+        jumpTo(nextT);
+    }
+    ImGui::EndDisabled();
+    ImGui::PopID();
+    return true;
+}
+
+// Curve editor: a value-over-time graph for the enabled continuous tracks (time of day, shake intensity). Drag a
+// point in 2D to retime + revalue it; right-click a point to delete; "Add key at playhead" drops one. The dope
+// sheet handles retiming/overview; this panel is where you shape the value.
+// Combined inline keyframe control for the 3-axis movable aim target (keys X/Y/Z together at the playhead).
+static void DrawTargetKeyNav() {
+    ImGui::PushID("targetkey");
+    bool on = sTargetXTrack.enabled || sTargetYTrack.enabled || sTargetZTrack.enabled;
+    auto jumpTo = [&](float tm) {
+        sPlayhead = std::min(std::max(tm, 0.0f), EffectiveTotal());
+        sPreview = true;
+        CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
+    };
+    auto keyAll = [&]() {
+        TrackAddKey(sTargetXTrack, sPlayhead, sAimOverridePoint[0]);
+        TrackAddKey(sTargetYTrack, sPlayhead, sAimOverridePoint[1]);
+        TrackAddKey(sTargetZTrack, sPlayhead, sAimOverridePoint[2]);
+    };
+    if (on) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.55f, 0.32f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.26f, 0.66f, 0.40f, 1.0f));
+    }
+    if (ImGui::SmallButton(on ? "Key on" : "Key")) {
+        bool turnOn = !on;
+        sTargetXTrack.enabled = turnOn;
+        sTargetYTrack.enabled = turnOn;
+        sTargetZTrack.enabled = turnOn;
+        if (turnOn) {
+            PushUndo();
+            keyAll();
+        }
+    }
+    if (on) {
+        ImGui::PopStyleColor(2);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Keyframe the target position (animate it over the timeline); edit per-axis in the Curve "
+                          "editor.");
+    }
+    if (!on) {
+        ImGui::PopID();
         return;
     }
-    int removeIdx = -1;
-    bool needSort = false;
-    for (int i = 0; i < (int)t.keys.size(); i++) {
-        ImGui::PushID(i);
-        ImGui::SetNextItemWidth(70.0f);
-        float tm = t.keys[i].time;
-        if (ImGui::InputFloat("##t", &tm, 0.0f, 0.0f, "%.2f")) {
-            t.keys[i].time = (tm < 0.0f) ? 0.0f : tm;
+    int atIdx = -1;
+    float prevT = -1e9f, nextT = 1e9f;
+    for (int i = 0; i < (int)sTargetXTrack.keys.size(); i++) {
+        float kt = sTargetXTrack.keys[i].time;
+        if (std::fabs(kt - sPlayhead) < 1e-3f) {
+            atIdx = i;
+        } else if (kt < sPlayhead && kt > prevT) {
+            prevT = kt;
+        } else if (kt > sPlayhead && kt < nextT) {
+            nextT = kt;
         }
-        if (ImGui::IsItemDeactivatedAfterEdit()) {
-            needSort = true;
-        }
-        ImGui::SameLine();
-        ImGui::TextDisabled("s");
-        ImGui::SameLine();
-        int v = (int)(t.keys[i].value + 0.5f);
-        if (v >= count) {
-            v = 0;
-        }
-        ImGui::SetNextItemWidth(140.0f);
-        if (ImGui::Combo("##v", &v, labels, count)) {
-            t.keys[i].value = (float)v;
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("X")) {
-            removeIdx = i;
-        }
-        ImGui::PopID();
     }
-    if (removeIdx >= 0) {
-        t.keys.erase(t.keys.begin() + removeIdx);
-    } else if (needSort) {
-        std::sort(t.keys.begin(), t.keys.end(),
-                  [](const CineParamKey& a, const CineParamKey& b) { return a.time < b.time; });
+    ImGui::SameLine();
+    ImGui::BeginDisabled(prevT < -1e8f);
+    if (ImGui::SmallButton("|<")) {
+        jumpTo(prevT);
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::SmallButton(atIdx >= 0 ? "-##key" : "+##key")) {
+        PushUndo();
+        if (atIdx >= 0) {
+            auto rm = [&](CineParamTrack& t) {
+                for (int i = 0; i < (int)t.keys.size(); i++) {
+                    if (std::fabs(t.keys[i].time - sPlayhead) < 1e-3f) {
+                        t.keys.erase(t.keys.begin() + i);
+                        break;
+                    }
+                }
+            };
+            rm(sTargetXTrack);
+            rm(sTargetYTrack);
+            rm(sTargetZTrack);
+        } else {
+            keyAll();
+        }
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(nextT > 1e8f);
+    if (ImGui::SmallButton(">|")) {
+        jumpTo(nextT);
+    }
+    ImGui::EndDisabled();
+    ImGui::PopID();
+}
+
+static void DrawCurveEditor() {
+    std::vector<const TrackDef*> curves;
+    for (const TrackDef& d : AllTrackDefs()) {
+        if (d.continuous && d.track->enabled) {
+            curves.push_back(&d);
+        }
+    }
+    if (curves.empty()) {
+        ImGui::TextDisabled("Enable a continuous parameter (Time of day, Shake intensity) to shape its curve.");
+        return;
+    }
+    static const ImU32 kChanCol[6] = { IM_COL32(120, 200, 255, 255), IM_COL32(255, 180, 90, 255),
+                                       IM_COL32(150, 230, 120, 255), IM_COL32(230, 130, 230, 255),
+                                       IM_COL32(240, 220, 90, 255),  IM_COL32(120, 230, 230, 255) };
+    static int active = 0;
+    static int lastActive = -1;
+    static int keySel = -1;
+    static int drag = -1;
+    if (active >= (int)curves.size()) {
+        active = 0;
+    }
+
+    // Legend: every enabled continuous track is drawn at once (overlay); click one to make it the editable curve.
+    for (int i = 0; i < (int)curves.size(); i++) {
+        ImGui::PushID(i);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(kChanCol[i % 6]));
+        char lbl[64];
+        snprintf(lbl, sizeof(lbl), "%s%s", (i == active) ? "* " : "", curves[i]->name);
+        if (ImGui::SmallButton(lbl)) {
+            active = i;
+            keySel = -1;
+        }
+        ImGui::PopStyleColor();
+        ImGui::PopID();
+        ImGui::SameLine();
+    }
+    ImGui::NewLine();
+    if (active != lastActive) { // switching the active curve clears the point selection (indices differ)
+        keySel = -1;
+        drag = -1;
+        lastActive = active;
+    }
+    const TrackDef* AL = curves[active];
+    CineParamTrack* tr = AL->track;
+
+    float total = EffectiveTotal();
+    if (total < 0.001f) {
+        total = 1.0f;
+    }
+    // Display range for a channel: its fixed range if it has one (vmax > vmin), otherwise auto-fit to the keys
+    // (with padding) - needed for unbounded values like positions.
+    auto rangeOf = [](const TrackDef* C) -> std::pair<float, float> {
+        if (C->vmax > C->vmin) {
+            return { C->vmin, C->vmax };
+        }
+        float lo = 1e30f, hi = -1e30f;
+        for (const CineParamKey& k : C->track->keys) {
+            lo = std::min(lo, k.value);
+            hi = std::max(hi, k.value);
+        }
+        if (lo > hi) {
+            lo = 0.0f;
+            hi = 1.0f;
+        }
+        if (hi - lo < 1e-3f) {
+            lo -= 1.0f;
+            hi += 1.0f;
+        }
+        float pad = (hi - lo) * 0.1f;
+        return { lo - pad, hi + pad };
+    };
+    std::pair<float, float> ar = rangeOf(AL);
+    float vmin = ar.first, vmax = ar.second;
+    float vspan = (vmax > vmin) ? (vmax - vmin) : 1.0f;
+    if (keySel >= (int)tr->keys.size()) {
+        keySel = -1;
+    }
+
+    float graphH = ImGui::GetContentRegionAvail().y - 30.0f; // leave a row for the toolbar below
+    if (graphH < 80.0f) {
+        graphH = 80.0f;
+    }
+    ImVec2 size(ImGui::GetContentRegionAvail().x, graphH);
+    if (size.x < 80.0f) {
+        size.x = 80.0f;
+    }
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##curvegraph", size);
+    ImVec2 p1(p0.x + size.x, p0.y + size.y);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p0, p1, IM_COL32(24, 24, 27, 255), 4.0f);
+    dl->AddRect(p0, p1, IM_COL32(90, 90, 95, 255), 4.0f);
+    float gx0 = p0.x + 6.0f, gx1 = p1.x - 6.0f, gy0 = p0.y + 8.0f, gy1 = p1.y - 8.0f;
+    auto timeToX = [&](float t) { return gx0 + (t / total) * (gx1 - gx0); };
+    auto xToTime = [&](float x) {
+        float u = (x - gx0) / (gx1 - gx0);
+        return std::min(std::max(u, 0.0f), 1.0f) * total;
+    };
+    auto valToY = [&](float v, float lo, float hi) {
+        float sp = (hi > lo) ? (hi - lo) : 1.0f;
+        float u = std::min(std::max((v - lo) / sp, 0.0f), 1.0f);
+        return gy1 - u * (gy1 - gy0);
+    };
+    auto yToValActive = [&](float y) {
+        float u = std::min(std::max((gy1 - y) / (gy1 - gy0), 0.0f), 1.0f);
+        return vmin + u * vspan;
+    };
+
+    for (int i = 0; i <= 4; i++) {
+        float yy = gy0 + (gy1 - gy0) * i / 4.0f;
+        dl->AddLine(ImVec2(gx0, yy), ImVec2(gx1, yy), IM_COL32(44, 44, 48, 255));
+    }
+    char lab[24]; // Y labels are the ACTIVE channel's range (the overlays are normalized to their own ranges).
+    snprintf(lab, sizeof(lab), "%g", vmax);
+    dl->AddText(ImVec2(gx0 + 2.0f, gy0 - 1.0f), IM_COL32(150, 150, 155, 255), lab);
+    snprintf(lab, sizeof(lab), "%g", vmin);
+    dl->AddText(ImVec2(gx0 + 2.0f, gy1 - 13.0f), IM_COL32(150, 150, 155, 255), lab);
+
+    float phx = timeToX(std::min(sPlayhead, total));
+    dl->AddLine(ImVec2(phx, gy0), ImVec2(phx, gy1), IM_COL32(60, 255, 90, 150), 1.5f);
+
+    // Draw every channel PER SEGMENT so each interpolation type renders exactly: step = hold + vertical drop,
+    // linear = a straight line, smooth = a polyline sub-sampled by the segment's on-screen width (so curves
+    // between close keyframes stay smooth instead of collapsing to a line). Each channel is scaled to its own
+    // range; the active one is bright, the rest are faded overlays.
+    for (int ci = 0; ci < (int)curves.size(); ci++) {
+        const TrackDef* C = curves[ci];
+        CineParamTrack* ct = C->track;
+        bool isAct = (ci == active);
+        ImU32 col = isAct ? kChanCol[ci % 6] : ((kChanCol[ci % 6] & 0x00FFFFFF) | 0x55000000);
+        float w = isAct ? 2.0f : 1.3f;
+        std::pair<float, float> cr = rangeOf(C);
+        float lo = cr.first, hi = cr.second;
+        int nk = (int)ct->keys.size();
+        if (nk == 0) {
+            continue;
+        }
+        // Flat "hold" extensions before the first and after the last key.
+        dl->AddLine(ImVec2(gx0, valToY(ct->keys[0].value, lo, hi)),
+                    ImVec2(timeToX(ct->keys[0].time), valToY(ct->keys[0].value, lo, hi)), col, w);
+        dl->AddLine(ImVec2(timeToX(ct->keys[nk - 1].time), valToY(ct->keys[nk - 1].value, lo, hi)),
+                    ImVec2(gx1, valToY(ct->keys[nk - 1].value, lo, hi)), col, w);
+        for (int i = 0; i + 1 < nk; i++) {
+            const CineParamKey& a = ct->keys[i];
+            const CineParamKey& b = ct->keys[i + 1];
+            float xa = timeToX(a.time), xb = timeToX(b.time);
+            float ya = valToY(a.value, lo, hi), yb = valToY(b.value, lo, hi);
+            int mode = KeyInterp(*ct, i);
+            if (mode == CINE_TRACK_STEP) {
+                dl->AddLine(ImVec2(xa, ya), ImVec2(xb, ya), col, w); // hold
+                dl->AddLine(ImVec2(xb, ya), ImVec2(xb, yb), col, w); // vertical drop at the next key
+            } else if (mode == CINE_TRACK_LINEAR) {
+                dl->AddLine(ImVec2(xa, ya), ImVec2(xb, yb), col, w);
+            } else {
+                int sub = (int)((xb - xa) / 4.0f);
+                if (sub < 2) {
+                    sub = 2;
+                }
+                if (sub > 64) {
+                    sub = 64;
+                }
+                ImVec2 prev(xa, ya);
+                for (int sN = 1; sN <= sub; sN++) {
+                    float tt = a.time + (b.time - a.time) * (float)sN / (float)sub;
+                    float vv;
+                    EvalParamTrack(*ct, tt, vv);
+                    ImVec2 cur(timeToX(tt), valToY(vv, lo, hi));
+                    dl->AddLine(prev, cur, col, w);
+                    prev = cur;
+                }
+            }
+        }
+    }
+    // Active channel's key points (draggable).
+    for (int i = 0; i < (int)tr->keys.size(); i++) {
+        ImVec2 c(timeToX(tr->keys[i].time), valToY(tr->keys[i].value, vmin, vmax));
+        bool s = (i == keySel);
+        dl->AddCircleFilled(c, s ? 5.5f : 4.0f, s ? IM_COL32(255, 220, 80, 255) : kChanCol[active % 6]);
+        dl->AddCircle(c, s ? 7.0f : 5.0f, IM_COL32(255, 255, 255, s ? 220 : 120));
+    }
+
+    ImGuiIO& io = ImGui::GetIO();
+    float mx = io.MousePos.x, my = io.MousePos.y;
+    auto nearestKey = [&]() {
+        int hit = -1;
+        float best = 11.0f;
+        for (int i = 0; i < (int)tr->keys.size(); i++) {
+            float dxp = timeToX(tr->keys[i].time) - mx, dyp = valToY(tr->keys[i].value, vmin, vmax) - my;
+            float dd = std::sqrt(dxp * dxp + dyp * dyp);
+            if (dd < best) {
+                best = dd;
+                hit = i;
+            }
+        }
+        return hit;
+    };
+    if (ImGui::IsItemActivated()) {
+        int hit = nearestKey();
+        if (hit >= 0) {
+            keySel = hit;
+            drag = hit;
+            PushUndo();
+        } else {
+            keySel = -1;
+        }
+    }
+    if (ImGui::IsItemActive() && drag >= 0 && drag < (int)tr->keys.size()) {
+        float lo = (drag > 0) ? tr->keys[drag - 1].time + 1e-3f : 0.0f;
+        float hi = (drag < (int)tr->keys.size() - 1) ? tr->keys[drag + 1].time - 1e-3f : total;
+        tr->keys[drag].time = std::min(std::max(xToTime(mx), lo), hi);
+        tr->keys[drag].value = yToValActive(my);
+    }
+    if (ImGui::IsItemDeactivated()) {
+        drag = -1;
+    }
+    if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+        int hit = nearestKey();
+        if (hit >= 0) {
+            PushUndo();
+            tr->keys.erase(tr->keys.begin() + hit);
+            keySel = -1;
+        }
+    }
+
+    // Toolbar: add a key at the playhead; when a point is selected, its interp / time / value / delete.
+    if (ImGui::SmallButton("Add key at playhead")) {
+        float v;
+        if (!EvalParamTrack(*tr, sPlayhead, v)) {
+            v = (vmin + vmax) * 0.5f;
+        }
+        PushUndo();
+        TrackAddKey(*tr, sPlayhead, v);
+    }
+    ImGui::SameLine();
+    if (keySel >= 0 && keySel < (int)tr->keys.size()) {
+        const char* im[] = { "Step", "Linear", "Smooth" };
+        int mode = (tr->keys[keySel].interp < 0) ? tr->interp : tr->keys[keySel].interp;
+        ImGui::SetNextItemWidth(90.0f);
+        if (ImGui::Combo("##ckinterp", &mode, im, 3)) {
+            tr->keys[keySel].interp = mode; // per-key spline type for the segment leaving this key
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Spline type for the segment after this key: Step / Linear / Smooth.");
+        }
+        ImGui::SameLine();
+        float kt = tr->keys[keySel].time, kv = tr->keys[keySel].value;
+        float lo = (keySel > 0) ? tr->keys[keySel - 1].time + 1e-3f : 0.0f;
+        float hi = (keySel < (int)tr->keys.size() - 1) ? tr->keys[keySel + 1].time - 1e-3f : total;
+        ImGui::SetNextItemWidth(70.0f);
+        if (ImGui::InputFloat("t##ck", &kt, 0.0f, 0.0f, "%.2f")) {
+            tr->keys[keySel].time = std::min(std::max(kt, lo), hi);
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(80.0f);
+        if (ImGui::InputFloat("val##ck", &kv, 0.0f, 0.0f, "%.2f")) {
+            tr->keys[keySel].value = std::min(std::max(kv, vmin), vmax);
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Delete##ck")) {
+            PushUndo();
+            tr->keys.erase(tr->keys.begin() + keySel);
+            keySel = -1;
+        }
+    } else {
+        ImGui::TextDisabled("click point = select, drag = move value/time, right-click = delete");
     }
 }
 
@@ -2939,11 +3452,27 @@ void CinematicCamPathWindow::DrawElement() {
     // Phase 1 layout: a left controls column, a right column (inspector + playback + library), and the dope-sheet
     // timeline pinned across the bottom. Sized from the remaining space so the timeline always stays in view.
     ImVec2 cineAvail = ImGui::GetContentRegionAvail();
-    int cineLanes = 1 + (sGreenScreenTrack.enabled ? 1 : 0);
-    float cineBottomH = (15.0f + 22.0f * cineLanes + 6.0f) + 80.0f;
-    float cineTopH = cineAvail.y - cineBottomH - 8.0f;
-    if (cineTopH < 150.0f) {
-        cineTopH = 150.0f;
+    int cineLanes = 1; // camera lane + one per enabled automation track
+    for (const TrackDef& d : AllTrackDefs()) {
+        if (d.track->enabled) {
+            cineLanes++;
+        }
+    }
+    static bool sCurveEditorOpen = false; // remembered from last frame to size the bottom region
+    // Size the TOP first (clamped) and give the bottom the remainder, so the two regions always sum to the
+    // window height - the bottom can never overflow past the window edge. The curve-editor graph then adapts to
+    // fill whatever space the bottom has.
+    float cineTimelineH = (15.0f + 22.0f * cineLanes + 6.0f) + 80.0f; // dope-sheet region
+    float cineWantBottom = cineTimelineH + (sCurveEditorOpen ? 260.0f : 0.0f);
+    float cineMinTop = 160.0f;
+    float cineMaxTop = cineAvail.y - cineTimelineH - 8.0f;
+    if (cineMaxTop < cineMinTop) {
+        cineMaxTop = cineMinTop;
+    }
+    float cineTopH = std::min(std::max(cineAvail.y - cineWantBottom - 8.0f, cineMinTop), cineMaxTop);
+    float cineBottomH = cineAvail.y - cineTopH - 8.0f;
+    if (cineBottomH < 60.0f) {
+        cineBottomH = 60.0f;
     }
     float cineLeftW = cineAvail.x * 0.42f;
     if (cineLeftW < 240.0f) {
@@ -3061,22 +3590,34 @@ void CinematicCamPathWindow::DrawElement() {
 
     // Sky & time: freeze the sky for clean loops and scrub the time of day directly.
     if (ImGui::CollapsingHeader("Sky & time")) {
+        // Keyframable parameters carry an inline [Key | |< +/- >| ] control. When the track is on, editing the
+        // parameter writes a key at the playhead (and previews it); otherwise it drives the live/manual value.
+        bool gsAuto = sGreenScreenTrack.enabled;
         int greenScreen = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.GreenScreen"), 0);
+        if (gsAuto) {
+            float v;
+            if (EvalParamTrack(sGreenScreenTrack, sPlayhead, v)) {
+                greenScreen = (int)(v + 0.5f);
+            }
+        }
         ImGui::SetNextItemWidth(180.0f);
         const char* gsModes[] = { "Off", "Green (#00B140)", "Blue (#0047BB)" };
-        ImGui::BeginDisabled(sGreenScreenTrack.enabled); // a keyframed track takes over the green screen
         if (ImGui::Combo("Green screen", &greenScreen, gsModes, 3)) {
-            CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.GreenScreen"), greenScreen);
+            if (gsAuto) {
+                PushUndo();
+                TrackAddKey(sGreenScreenTrack, sPlayhead, (float)greenScreen);
+                sPreview = true;
+                CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
+            } else {
+                CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.GreenScreen"), greenScreen);
+            }
         }
-        ImGui::EndDisabled();
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Replace the sky with a solid chroma-key color (and hide the sun/moon/sky glow) so you "
                               "can key it out when compositing. Scene geometry still renders over it.");
         }
-        if (sGreenScreenTrack.enabled) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("(keyframed - see Automation)");
-        }
+        ImGui::SameLine();
+        DrawParamKeyNav(sGreenScreenTrack, (float)greenScreen);
 
         bool freezeSky = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.FreezeSky"), 0);
         if (ImGui::Checkbox("Freeze sky & time", &freezeSky)) {
@@ -3085,49 +3626,53 @@ void CinematicCamPathWindow::DrawElement() {
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Stop cloud drift and time-of-day progression so looping clips/GIFs line up.");
         }
-        int dt = CinematicCam_GetDayTime();
-        if (dt < 0) {
+
+        int liveDt = CinematicCam_GetDayTime();
+        if (liveDt < 0) {
             ImGui::TextDisabled("Time of day available in-game only.");
         } else {
+            bool todAuto = sTodTrack.enabled;
+            int dt = liveDt;
+            if (todAuto) {
+                float v;
+                if (EvalParamTrack(sTodTrack, sPlayhead, v)) {
+                    dt = (int)(v + 0.5f);
+                }
+            }
+            auto setTod = [&](int value) {
+                if (todAuto) {
+                    PushUndo();
+                    TrackAddKey(sTodTrack, sPlayhead, (float)value);
+                    sPreview = true;
+                    CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
+                } else {
+                    CinematicCam_SetDayTime(value);
+                }
+            };
             int mins = (int)(dt * (24.0f * 60.0f) / 65536.0f);
             char label[16];
             snprintf(label, sizeof(label), "%02d:%02d", (mins / 60) % 24, mins % 60);
             ImGui::SetNextItemWidth(240.0f);
             if (ImGui::SliderInt("Time of day", &dt, 0, 0xFFFF, label)) {
-                CinematicCam_SetDayTime(dt);
+                setTod(dt);
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Set the sun/moon position and lighting. Turn on Freeze to hold it there.");
+                ImGui::SetTooltip("Set the sun/moon position and lighting. Keyframe it for a sunrise/sunset across a "
+                                  "shot, or turn on Freeze to hold it.");
             }
             ImGui::SameLine();
+            DrawParamKeyNav(sTodTrack, (float)dt);
             if (ImGui::SmallButton("Noon")) {
-                CinematicCam_SetDayTime(0x8000);
+                setTod(0x8000);
             }
             ImGui::SameLine();
             if (ImGui::SmallButton("Sunset")) {
-                CinematicCam_SetDayTime(0xC000);
+                setTod(0xC000);
             }
             ImGui::SameLine();
             if (ImGui::SmallButton("Night")) {
-                CinematicCam_SetDayTime(0x0000);
+                setTod(0x0000);
             }
-        }
-    }
-
-    // Automation: keyframe exposed parameters on their own sub-timeline (independent of the camera keyframes).
-    // Applied during Play/Preview. Green screen is the first; this section grows as more parameters are wired up.
-    if (ImGui::CollapsingHeader("Automation (parameter tracks)")) {
-        ImGui::TextDisabled("Keyframe parameters on their own timeline. Applied during Play / Preview.");
-        ImGui::Checkbox("Keyframe green screen", &sGreenScreenTrack.enabled);
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Drive the green screen from keys below during playback, instead of the fixed setting "
-                              "in Sky & time. Stepped: it snaps to each key's value and holds until the next.");
-        }
-        if (sGreenScreenTrack.enabled) {
-            ImGui::Indent();
-            const char* gsLabels[] = { "Off", "Green", "Blue" };
-            DrawParamTrackEditor(sGreenScreenTrack, gsLabels, 3);
-            ImGui::Unindent();
         }
     }
 
@@ -3652,14 +4197,42 @@ void CinematicCamPathWindow::DrawElement() {
             }
             ImGui::TextDisabled("Tracks the actor live. Saved by id (re-acquired on load).");
         } else if (sKeyframes[sel].aimMode == CINE_AIM_TARGET) {
+            bool tgtAuto = sTargetXTrack.enabled;
+            float tgt[3] = { sAimOverridePoint[0], sAimOverridePoint[1], sAimOverridePoint[2] };
+            if (tgtAuto) {
+                float v;
+                if (EvalParamTrack(sTargetXTrack, sPlayhead, v)) {
+                    tgt[0] = v;
+                }
+                if (EvalParamTrack(sTargetYTrack, sPlayhead, v)) {
+                    tgt[1] = v;
+                }
+                if (EvalParamTrack(sTargetZTrack, sPlayhead, v)) {
+                    tgt[2] = v;
+                }
+            }
             ImGui::SetNextItemWidth(180.0f);
-            ImGui::InputFloat3("##kftgt", sAimOverridePoint, "%.0f");
+            if (ImGui::InputFloat3("##kftgt", tgt, "%.0f")) {
+                sAimOverridePoint[0] = tgt[0];
+                sAimOverridePoint[1] = tgt[1];
+                sAimOverridePoint[2] = tgt[2];
+                if (tgtAuto) {
+                    PushUndo();
+                    TrackAddKey(sTargetXTrack, sPlayhead, tgt[0]);
+                    TrackAddKey(sTargetYTrack, sPlayhead, tgt[1]);
+                    TrackAddKey(sTargetZTrack, sPlayhead, tgt[2]);
+                    sPreview = true;
+                    CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
+                }
+            }
             ImGui::SameLine();
             if (ImGui::SmallButton("Place at camera")) {
                 PlaceOverrideTargetAtCamera();
             }
-            ImGui::TextDisabled("Aims at the shared movable target (one point for the whole path). Drag its "
-                                "red/green/blue gizmo in the world to move it.");
+            ImGui::SameLine();
+            DrawTargetKeyNav();
+            ImGui::TextDisabled("Aims at the shared movable target (one point for the whole path). Keyframe it to "
+                                "animate it; edit each axis in the Curve editor (Target X/Y/Z).");
         }
 
         // Numeric fields: type exact position/orientation values for the selected keyframe.
@@ -3850,6 +4423,27 @@ void CinematicCamPathWindow::DrawElement() {
         ImGui::SetTooltip("Add smooth handheld-style jitter to the moving camera. Deterministic, so it looks the "
                           "same every time you scrub or replay.");
     }
+    {
+        // Shake intensity is a keyframable multiplier on the amps below (ramp calm -> shaky over a shot).
+        ImGui::TextUnformatted("Intensity");
+        ImGui::SameLine();
+        float shVal = 1.0f;
+        if (sShakeTrack.enabled) {
+            float v;
+            if (EvalParamTrack(sShakeTrack, sPlayhead, v)) {
+                shVal = v;
+            }
+            ImGui::SetNextItemWidth(120.0f);
+            if (ImGui::SliderFloat("##shakeInt", &shVal, 0.0f, 2.0f, "%.2fx", ImGuiSliderFlags_NoRoundToFormat)) {
+                PushUndo();
+                TrackAddKey(sShakeTrack, sPlayhead, shVal);
+                sPreview = true;
+                CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
+            }
+            ImGui::SameLine();
+        }
+        DrawParamKeyNav(sShakeTrack, shVal);
+    }
     if (sShakeEnabled) {
         ImGui::SetNextItemWidth(130.0f);
         ImGui::SliderFloat("Position##shake", &sShakePosAmp, 0.0f, 30.0f, "%.1f");
@@ -3860,6 +4454,31 @@ void CinematicCamPathWindow::DrawElement() {
         ImGui::SliderFloat("Frequency##shake", &sShakeFreq, 0.5f, 20.0f, "%.1f Hz");
         ImGui::SameLine();
         ImGui::Checkbox("In preview too", &sShakeOnPreview);
+    }
+
+    // Hide HUD (keyframable): reveal or hide the HUD over a shot. Manual checkbox drives the CVar; with the track
+    // on it edits a key at the playhead instead.
+    {
+        bool hudAuto = sHudTrack.enabled;
+        bool hide = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.HideHud"), 1) != 0;
+        if (hudAuto) {
+            float v;
+            if (EvalParamTrack(sHudTrack, sPlayhead, v)) {
+                hide = v > 0.5f;
+            }
+        }
+        if (ImGui::Checkbox("Hide HUD", &hide)) {
+            if (hudAuto) {
+                PushUndo();
+                TrackAddKey(sHudTrack, sPlayhead, hide ? 1.0f : 0.0f);
+                sPreview = true;
+                CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
+            } else {
+                CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.HideHud"), hide);
+            }
+        }
+        ImGui::SameLine();
+        DrawParamKeyNav(sHudTrack, hide ? 1.0f : 0.0f);
     }
 
     // Path-level aim override: aim every keyframe at one target (fixes up recorded paths at once).
@@ -3878,6 +4497,8 @@ void CinematicCamPathWindow::DrawElement() {
         if (ImGui::Button("Place at camera")) {
             PlaceOverrideTargetAtCamera();
         }
+        ImGui::SameLine();
+        DrawTargetKeyNav();
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Drop the aim target in front of the free camera. With 'Show path in world' on you can "
                               "then drag its red/green/blue handles to reposition it, and the whole path aims at it.");
@@ -4005,9 +4626,14 @@ void CinematicCamPathWindow::DrawElement() {
 
     ImGui::EndChild(); // ##cineRight
 
-    // Dope-sheet timeline pinned across the bottom, full width of the editor.
+    // Dope-sheet timeline pinned across the bottom, with the collapsible curve editor docked beneath it.
     ImGui::BeginChild("##cineTimeline", ImVec2(0, cineBottomH), true);
     DrawTimeline();
+    ImGui::Separator();
+    sCurveEditorOpen = ImGui::CollapsingHeader("Curve editor");
+    if (sCurveEditorOpen) {
+        DrawCurveEditor();
+    }
     ImGui::EndChild();
 }
 

@@ -53,16 +53,18 @@ struct CineKeyframe {
 // A keyframable parameter on its OWN sub-timeline, independent of the camera path keyframes. This is the
 // foundation for automating any exposed parameter over time; the green screen is the first one wired up.
 
+// How the segment LEAVING a key is interpolated toward the next key.
+enum CineTrackInterp {
+    CINE_TRACK_STEP = 0,   // hold the value until the next key (discrete params: green screen, toggles, enums)
+    CINE_TRACK_LINEAR = 1, // straight line to the next key
+    CINE_TRACK_SMOOTH = 2, // auto-smoothed (Catmull-Rom) curve through the neighbors
+};
+
 // One key on a parameter track.
 struct CineParamKey {
     float time;  // seconds on the timeline
     float value; // parameter value (discrete params store an integer cast to float)
-};
-
-// How a track's value is read between keys.
-enum CineTrackInterp {
-    CINE_TRACK_STEP = 0,   // hold the most recent key (discrete params: green screen, toggles, enums)
-    CINE_TRACK_LINEAR = 1, // linearly interpolate between keys (continuous params)
+    int interp;  // CineTrackInterp for the segment leaving this key (-1 = use the track's default)
 };
 
 // Editor window for building and playing back cinematic camera paths.
