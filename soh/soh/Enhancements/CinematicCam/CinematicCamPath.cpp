@@ -2987,9 +2987,11 @@ static bool DrawParamKeyNav(CineParamTrack& t, float value) {
     return true;
 }
 
-// Curve editor: a value-over-time graph for the enabled continuous tracks (time of day, shake intensity). Drag a
-// point in 2D to retime + revalue it; right-click a point to delete; "Add key at playhead" drops one. The dope
-// sheet handles retiming/overview; this panel is where you shape the value.
+// Curve editor: a value-over-time graph overlaying the enabled continuous parameter tracks (time of day, shake,
+// target X/Y/Z) and any camera channels (Eye / Look-at / Roll / FOV) switched on via the "Camera:" chips. Drag a
+// parameter point in 2D to retime + revalue it (right-click to delete; "Add key at playhead" drops one); camera
+// points are locked in time to their keyframe, so dragging only changes the value. The dope sheet handles
+// retiming/overview; this panel is where you shape the value.
 // Combined inline keyframe control for the 3-axis movable aim target (keys X/Y/Z together at the playhead).
 static void DrawTargetKeyNav() {
     ImGui::PushID("targetkey");
@@ -3075,34 +3077,152 @@ static void DrawTargetKeyNav() {
     ImGui::PopID();
 }
 
+// --- Camera channels (curve editor) -----------------------------------------------------------------------
+// The curve editor can also graph the camera keyframes themselves as value-over-time channels (Eye / Look-at /
+// Roll / FOV). These are read from sKeyframes and LOCKED in time to their keyframe (you retime/add/remove them on
+// the main timeline); only their value is editable in the curve editor. Kept distinct from the "Aim target"
+// parameter tracks - hence the "Cam:" labels (e.g. "Cam: Look-at X" vs the "Target X" automation track).
+enum CamChan { CAM_EYE_X = 0, CAM_EYE_Y, CAM_EYE_Z, CAM_AT_X, CAM_AT_Y, CAM_AT_Z, CAM_ROLL, CAM_FOV, CAM_CHAN_COUNT };
+static const char* kCamChanName[CAM_CHAN_COUNT] = { "Cam: Eye X",     "Cam: Eye Y",     "Cam: Eye Z", "Cam: Look-at X",
+                                                    "Cam: Look-at Y", "Cam: Look-at Z", "Cam: Roll",  "Cam: FOV" };
+static const char* kCamChanShort[CAM_CHAN_COUNT] = { "EyeX", "EyeY", "EyeZ", "AtX", "AtY", "AtZ", "Roll", "FOV" };
+static const ImU32 kCamPalette[CAM_CHAN_COUNT] = {
+    IM_COL32(235, 110, 110, 255), IM_COL32(245, 165, 90, 255),  IM_COL32(240, 215, 110, 255),
+    IM_COL32(110, 170, 245, 255), IM_COL32(110, 220, 235, 255), IM_COL32(120, 235, 190, 255),
+    IM_COL32(205, 140, 240, 255), IM_COL32(150, 235, 130, 255),
+};
+static float CamChanGet(const CineKeyframe& k, int c) {
+    switch (c) {
+        case CAM_EYE_X:
+            return k.eye[0];
+        case CAM_EYE_Y:
+            return k.eye[1];
+        case CAM_EYE_Z:
+            return k.eye[2];
+        case CAM_AT_X:
+            return k.at[0];
+        case CAM_AT_Y:
+            return k.at[1];
+        case CAM_AT_Z:
+            return k.at[2];
+        case CAM_ROLL:
+            return k.roll;
+        case CAM_FOV:
+            return k.fov;
+    }
+    return 0.0f;
+}
+static void CamChanSet(CineKeyframe& k, int c, float v) {
+    switch (c) {
+        case CAM_EYE_X:
+            k.eye[0] = v;
+            break;
+        case CAM_EYE_Y:
+            k.eye[1] = v;
+            break;
+        case CAM_EYE_Z:
+            k.eye[2] = v;
+            break;
+        case CAM_AT_X:
+            k.at[0] = v;
+            break;
+        case CAM_AT_Y:
+            k.at[1] = v;
+            break;
+        case CAM_AT_Z:
+            k.at[2] = v;
+            break;
+        case CAM_ROLL:
+            k.roll = v;
+            break;
+        case CAM_FOV:
+            k.fov = v;
+            break;
+    }
+}
+
 static void DrawCurveEditor() {
-    std::vector<const TrackDef*> curves;
-    for (const TrackDef& d : AllTrackDefs()) {
-        if (d.continuous && d.track->enabled) {
-            curves.push_back(&d);
-        }
-    }
-    if (curves.empty()) {
-        ImGui::TextDisabled("Enable a continuous parameter (Time of day, Shake, Target X/Y/Z) to shape its curve.");
-        return;
-    }
+    // A channel is either a parameter automation track (free keys on its own sub-timeline) or a CAMERA channel
+    // (Eye / Look-at / Roll / FOV) read straight from the camera keyframes. Camera points are locked in time to
+    // their keyframe - you retime/add/remove them on the main timeline; here only their VALUE is editable, letting
+    // you fine-tune a position or FOV against the curve. Both kinds overlay together, each scaled to its own range.
+    struct CurveChannel {
+        const char* name;
+        ImU32 col;
+        bool isCam;
+        CineParamTrack* track; // parameter channel (null for camera channels)
+        int camChan;           // CamChan index (camera channels; -1 otherwise)
+        float vmin, vmax;      // fixed range (vmax > vmin) or 0,0 = auto-fit to the keys
+    };
     static const ImU32 kChanCol[6] = { IM_COL32(120, 200, 255, 255), IM_COL32(255, 180, 90, 255),
                                        IM_COL32(150, 230, 120, 255), IM_COL32(230, 130, 230, 255),
                                        IM_COL32(240, 220, 90, 255),  IM_COL32(120, 230, 230, 255) };
-    static int active = 0;
-    static int lastActive = -1;
-    static int keySel = -1;
-    static int drag = -1;
-    if (active >= (int)curves.size()) {
-        active = 0;
+    static bool sCamShow[CAM_CHAN_COUNT] = { false, false, false, false, false, false, false, false };
+
+    // Camera-channel visibility chips - always offered (even with no parameter track enabled) so you can pull a
+    // camera curve up on its own. A lit chip is overlaid; click its legend entry below to make it editable.
+    ImGui::TextDisabled("Camera:");
+    ImGui::SameLine();
+    for (int c = 0; c < CAM_CHAN_COUNT; c++) {
+        ImGui::PushID(2000 + c);
+        bool on = sCamShow[c];
+        ImGui::PushStyleColor(ImGuiCol_Text,
+                              on ? ImGui::ColorConvertU32ToFloat4(kCamPalette[c]) : ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
+        if (ImGui::SmallButton(kCamChanShort[c])) {
+            sCamShow[c] = !sCamShow[c];
+        }
+        ImGui::PopStyleColor();
+        ImGui::PopID();
+        if (c != CAM_CHAN_COUNT - 1) {
+            ImGui::SameLine();
+        }
     }
 
-    // Legend: every enabled continuous track is drawn at once (overlay); click one to make it the editable curve.
+    std::vector<CurveChannel> curves;
+    int pc = 0;
+    for (const TrackDef& d : AllTrackDefs()) {
+        if (d.continuous && d.track->enabled) {
+            curves.push_back({ d.name, kChanCol[pc % 6], false, d.track, -1, d.vmin, d.vmax });
+            pc++;
+        }
+    }
+    for (int c = 0; c < CAM_CHAN_COUNT; c++) {
+        if (sCamShow[c] && !sKeyframes.empty()) {
+            curves.push_back({ kCamChanName[c], kCamPalette[c], true, nullptr, c, 0.0f, 0.0f });
+        }
+    }
+    if (curves.empty()) {
+        ImGui::TextDisabled("Enable a continuous parameter (Time of day, Shake, Target X/Y/Z) or switch on a camera "
+                            "channel above to shape its curve.");
+        return;
+    }
+
+    // The active (editable) channel is tracked by identity, so toggling another channel's visibility doesn't shift
+    // which curve you're editing.
+    static bool sActIsCam = false;
+    static CineParamTrack* sActTrack = nullptr;
+    static int sActCam = -1;
+    static int keySel = -1;
+    static int drag = -1;
+    int active = -1;
+    for (int i = 0; i < (int)curves.size(); i++) {
+        if (curves[i].isCam == sActIsCam && (sActIsCam ? curves[i].camChan == sActCam : curves[i].track == sActTrack)) {
+            active = i;
+            break;
+        }
+    }
+    if (active < 0) { // the previously active channel is gone (disabled/hidden) - fall back and reset selection
+        active = 0;
+        keySel = -1;
+        drag = -1;
+    }
+
+    // Legend: every visible channel; click one to make it the editable (bright) curve, the rest stay faded.
     for (int i = 0; i < (int)curves.size(); i++) {
         ImGui::PushID(i);
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(kChanCol[i % 6]));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(curves[i].col));
         char lbl[64];
-        snprintf(lbl, sizeof(lbl), "%s%s", (i == active) ? "* " : "", curves[i]->name);
+        snprintf(lbl, sizeof(lbl), "%s%s", (i == active) ? "* " : "", curves[i].name);
         if (ImGui::SmallButton(lbl)) {
             active = i;
             keySel = -1;
@@ -3112,28 +3232,41 @@ static void DrawCurveEditor() {
         ImGui::SameLine();
     }
     ImGui::NewLine();
-    if (active != lastActive) { // switching the active curve clears the point selection (indices differ)
-        keySel = -1;
-        drag = -1;
-        lastActive = active;
+    { // remember the active channel's identity for next frame
+        const CurveChannel& A = curves[active];
+        sActIsCam = A.isCam;
+        sActTrack = A.track;
+        sActCam = A.camChan;
     }
-    const TrackDef* AL = curves[active];
-    CineParamTrack* tr = AL->track;
+    const CurveChannel& AL = curves[active];
 
     float total = EffectiveTotal();
     if (total < 0.001f) {
         total = 1.0f;
     }
+
+    // Generic key accessors spanning both channel kinds.
+    auto keyCount = [&](const CurveChannel& C) -> int {
+        return C.isCam ? (int)sKeyframes.size() : (int)C.track->keys.size();
+    };
+    auto keyTime = [&](const CurveChannel& C, int i) -> float {
+        return C.isCam ? sKeyframes[i].time : C.track->keys[i].time;
+    };
+    auto keyValue = [&](const CurveChannel& C, int i) -> float {
+        return C.isCam ? CamChanGet(sKeyframes[i], C.camChan) : C.track->keys[i].value;
+    };
     // Display range for a channel: its fixed range if it has one (vmax > vmin), otherwise auto-fit to the keys
     // (with padding) - needed for unbounded values like positions.
-    auto rangeOf = [](const TrackDef* C) -> std::pair<float, float> {
-        if (C->vmax > C->vmin) {
-            return { C->vmin, C->vmax };
+    auto rangeOf = [&](const CurveChannel& C) -> std::pair<float, float> {
+        if (C.vmax > C.vmin) {
+            return { C.vmin, C.vmax };
         }
         float lo = 1e30f, hi = -1e30f;
-        for (const CineParamKey& k : C->track->keys) {
-            lo = std::min(lo, k.value);
-            hi = std::max(hi, k.value);
+        int n = keyCount(C);
+        for (int i = 0; i < n; i++) {
+            float v = keyValue(C, i);
+            lo = std::min(lo, v);
+            hi = std::max(hi, v);
         }
         if (lo > hi) {
             lo = 0.0f;
@@ -3149,7 +3282,8 @@ static void DrawCurveEditor() {
     std::pair<float, float> ar = rangeOf(AL);
     float vmin = ar.first, vmax = ar.second;
     float vspan = (vmax > vmin) ? (vmax - vmin) : 1.0f;
-    if (keySel >= (int)tr->keys.size()) {
+    int activeN = keyCount(AL);
+    if (keySel >= activeN) {
         keySel = -1;
     }
 
@@ -3196,22 +3330,60 @@ static void DrawCurveEditor() {
     float phx = timeToX(std::min(sPlayhead, total));
     dl->AddLine(ImVec2(phx, gy0), ImVec2(phx, gy1), IM_COL32(60, 255, 90, 150), 1.5f);
 
-    // Draw every channel PER SEGMENT so each interpolation type renders exactly: step = hold + vertical drop,
-    // linear = a straight line, smooth = a polyline sub-sampled by the segment's on-screen width (so curves
-    // between close keyframes stay smooth instead of collapsing to a line). Each channel is scaled to its own
-    // range; the active one is bright, the rest are faded overlays.
+    // Camera channels share one pose sampling across the visible range (so the drawn curve matches what actually
+    // plays back - ease and spline shaping included); computed once here and reused by every visible camera channel.
+    bool anyCam = false;
+    for (const CurveChannel& C : curves) {
+        if (C.isCam) {
+            anyCam = true;
+            break;
+        }
+    }
+    std::vector<float> camT;
+    std::vector<CineKeyframe> camP;
+    if (anyCam) {
+        int ns = (int)((gx1 - gx0) / 3.0f);
+        if (ns < 24) {
+            ns = 24;
+        }
+        if (ns > 400) {
+            ns = 400;
+        }
+        camT.reserve(ns + 1);
+        camP.reserve(ns + 1);
+        for (int s = 0; s <= ns; s++) {
+            float tt = total * (float)s / (float)ns;
+            camT.push_back(tt);
+            camP.push_back(SampleAt(tt));
+        }
+    }
+
+    // Draw every channel. Camera channels are a polyline sampled straight from the camera evaluation. Parameter
+    // channels render PER SEGMENT so each interpolation type is exact: step = hold + vertical drop, linear = a
+    // straight line, smooth = a polyline sub-sampled by the segment's on-screen width (so curves between close
+    // keyframes stay smooth instead of collapsing to a line). Each channel is scaled to its own range; the active
+    // one is bright, the rest are faded overlays.
     for (int ci = 0; ci < (int)curves.size(); ci++) {
-        const TrackDef* C = curves[ci];
-        CineParamTrack* ct = C->track;
+        const CurveChannel& C = curves[ci];
         bool isAct = (ci == active);
-        ImU32 col = isAct ? kChanCol[ci % 6] : ((kChanCol[ci % 6] & 0x00FFFFFF) | 0x55000000);
+        ImU32 col = isAct ? C.col : ((C.col & 0x00FFFFFF) | 0x55000000);
         float w = isAct ? 2.0f : 1.3f;
         std::pair<float, float> cr = rangeOf(C);
         float lo = cr.first, hi = cr.second;
-        int nk = (int)ct->keys.size();
+        int nk = keyCount(C);
         if (nk == 0) {
             continue;
         }
+        if (C.isCam) {
+            ImVec2 prev(timeToX(camT[0]), valToY(CamChanGet(camP[0], C.camChan), lo, hi));
+            for (size_t s = 1; s < camT.size(); s++) {
+                ImVec2 cur(timeToX(camT[s]), valToY(CamChanGet(camP[s], C.camChan), lo, hi));
+                dl->AddLine(prev, cur, col, w);
+                prev = cur;
+            }
+            continue;
+        }
+        CineParamTrack* ct = C.track;
         // Flat "hold" extensions before the first and after the last key.
         dl->AddLine(ImVec2(gx0, valToY(ct->keys[0].value, lo, hi)),
                     ImVec2(timeToX(ct->keys[0].time), valToY(ct->keys[0].value, lo, hi)), col, w);
@@ -3248,11 +3420,11 @@ static void DrawCurveEditor() {
             }
         }
     }
-    // Active channel's key points (draggable).
-    for (int i = 0; i < (int)tr->keys.size(); i++) {
-        ImVec2 c(timeToX(tr->keys[i].time), valToY(tr->keys[i].value, vmin, vmax));
+    // Active channel's key points (draggable). Camera points are locked in time (vertical drag only).
+    for (int i = 0; i < activeN; i++) {
+        ImVec2 c(timeToX(keyTime(AL, i)), valToY(keyValue(AL, i), vmin, vmax));
         bool s = (i == keySel);
-        dl->AddCircleFilled(c, s ? 5.5f : 4.0f, s ? IM_COL32(255, 220, 80, 255) : kChanCol[active % 6]);
+        dl->AddCircleFilled(c, s ? 5.5f : 4.0f, s ? IM_COL32(255, 220, 80, 255) : AL.col);
         dl->AddCircle(c, s ? 7.0f : 5.0f, IM_COL32(255, 255, 255, s ? 220 : 120));
     }
 
@@ -3261,8 +3433,8 @@ static void DrawCurveEditor() {
     auto nearestKey = [&]() {
         int hit = -1;
         float best = 11.0f;
-        for (int i = 0; i < (int)tr->keys.size(); i++) {
-            float dxp = timeToX(tr->keys[i].time) - mx, dyp = valToY(tr->keys[i].value, vmin, vmax) - my;
+        for (int i = 0; i < activeN; i++) {
+            float dxp = timeToX(keyTime(AL, i)) - mx, dyp = valToY(keyValue(AL, i), vmin, vmax) - my;
             float dd = std::sqrt(dxp * dxp + dyp * dyp);
             if (dd < best) {
                 best = dd;
@@ -3281,65 +3453,88 @@ static void DrawCurveEditor() {
             keySel = -1;
         }
     }
-    if (ImGui::IsItemActive() && drag >= 0 && drag < (int)tr->keys.size()) {
-        float lo = (drag > 0) ? tr->keys[drag - 1].time + 1e-3f : 0.0f;
-        float hi = (drag < (int)tr->keys.size() - 1) ? tr->keys[drag + 1].time - 1e-3f : total;
-        tr->keys[drag].time = std::min(std::max(xToTime(mx), lo), hi);
-        tr->keys[drag].value = yToValActive(my);
+    if (ImGui::IsItemActive() && drag >= 0 && drag < activeN) {
+        if (AL.isCam) {
+            CamChanSet(sKeyframes[drag], AL.camChan, yToValActive(my)); // time stays locked to the keyframe
+        } else {
+            CineParamTrack* tr = AL.track;
+            float lo = (drag > 0) ? tr->keys[drag - 1].time + 1e-3f : 0.0f;
+            float hi = (drag < (int)tr->keys.size() - 1) ? tr->keys[drag + 1].time - 1e-3f : total;
+            tr->keys[drag].time = std::min(std::max(xToTime(mx), lo), hi);
+            tr->keys[drag].value = yToValActive(my);
+        }
     }
     if (ImGui::IsItemDeactivated()) {
         drag = -1;
     }
-    if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+    // Right-click deletes a key - parameter channels only (camera keyframes are deleted on the main timeline).
+    if (!AL.isCam && ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
         int hit = nearestKey();
         if (hit >= 0) {
             PushUndo();
-            tr->keys.erase(tr->keys.begin() + hit);
+            AL.track->keys.erase(AL.track->keys.begin() + hit);
             keySel = -1;
         }
     }
 
-    // Toolbar: add a key at the playhead; when a point is selected, its interp / time / value / delete.
-    if (ImGui::SmallButton("Add key at playhead")) {
-        float v;
-        if (!EvalParamTrack(*tr, sPlayhead, v)) {
-            v = (vmin + vmax) * 0.5f;
-        }
-        PushUndo();
-        TrackAddKey(*tr, sPlayhead, v);
-    }
-    ImGui::SameLine();
-    if (keySel >= 0 && keySel < (int)tr->keys.size()) {
-        const char* im[] = { "Step", "Linear", "Smooth" };
-        int mode = (tr->keys[keySel].interp < 0) ? tr->interp : tr->keys[keySel].interp;
-        ImGui::SetNextItemWidth(90.0f);
-        if (ImGui::Combo("##ckinterp", &mode, im, 3)) {
-            tr->keys[keySel].interp = mode; // per-key spline type for the segment leaving this key
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Spline type for the segment after this key: Step / Linear / Smooth.");
-        }
-        ImGui::SameLine();
-        float kt = tr->keys[keySel].time, kv = tr->keys[keySel].value;
-        float lo = (keySel > 0) ? tr->keys[keySel - 1].time + 1e-3f : 0.0f;
-        float hi = (keySel < (int)tr->keys.size() - 1) ? tr->keys[keySel + 1].time - 1e-3f : total;
-        ImGui::SetNextItemWidth(70.0f);
-        if (ImGui::InputFloat("t##ck", &kt, 0.0f, 0.0f, "%.2f")) {
-            tr->keys[keySel].time = std::min(std::max(kt, lo), hi);
-        }
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(80.0f);
-        if (ImGui::InputFloat("val##ck", &kv, 0.0f, 0.0f, "%.2f")) {
-            tr->keys[keySel].value = std::min(std::max(kv, vmin), vmax);
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Delete##ck")) {
+    // Toolbar. Parameter channels can add keys at the playhead and edit a selected key's interp / time / value /
+    // delete. Camera channels are value-only here (their timing and existence live on the main timeline).
+    if (!AL.isCam) {
+        if (ImGui::SmallButton("Add key at playhead")) {
+            float v;
+            if (!EvalParamTrack(*AL.track, sPlayhead, v)) {
+                v = (vmin + vmax) * 0.5f;
+            }
             PushUndo();
-            tr->keys.erase(tr->keys.begin() + keySel);
-            keySel = -1;
+            TrackAddKey(*AL.track, sPlayhead, v);
+        }
+        ImGui::SameLine();
+    }
+    if (keySel >= 0 && keySel < activeN) {
+        if (AL.isCam) {
+            ImGui::Text("%s  key %d", AL.name, keySel + 1);
+            ImGui::SameLine();
+            float kv = keyValue(AL, keySel);
+            ImGui::SetNextItemWidth(90.0f);
+            if (ImGui::InputFloat("val##cck", &kv, 0.0f, 0.0f, "%.3f")) {
+                CamChanSet(sKeyframes[keySel], AL.camChan, kv);
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("t=%.2f (locked - retime on the timeline)", keyTime(AL, keySel));
+        } else {
+            CineParamTrack* tr = AL.track;
+            const char* im[] = { "Step", "Linear", "Smooth" };
+            int mode = (tr->keys[keySel].interp < 0) ? tr->interp : tr->keys[keySel].interp;
+            ImGui::SetNextItemWidth(90.0f);
+            if (ImGui::Combo("##ckinterp", &mode, im, 3)) {
+                tr->keys[keySel].interp = mode; // per-key spline type for the segment leaving this key
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Spline type for the segment after this key: Step / Linear / Smooth.");
+            }
+            ImGui::SameLine();
+            float kt = tr->keys[keySel].time, kv = tr->keys[keySel].value;
+            float lo = (keySel > 0) ? tr->keys[keySel - 1].time + 1e-3f : 0.0f;
+            float hi = (keySel < (int)tr->keys.size() - 1) ? tr->keys[keySel + 1].time - 1e-3f : total;
+            ImGui::SetNextItemWidth(70.0f);
+            if (ImGui::InputFloat("t##ck", &kt, 0.0f, 0.0f, "%.2f")) {
+                tr->keys[keySel].time = std::min(std::max(kt, lo), hi);
+            }
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(80.0f);
+            if (ImGui::InputFloat("val##ck", &kv, 0.0f, 0.0f, "%.2f")) {
+                tr->keys[keySel].value = std::min(std::max(kv, vmin), vmax);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Delete##ck")) {
+                PushUndo();
+                tr->keys.erase(tr->keys.begin() + keySel);
+                keySel = -1;
+            }
         }
     } else {
-        ImGui::TextDisabled("click point = select, drag = move value/time, right-click = delete");
+        ImGui::TextDisabled("%s", AL.isCam ? "click point = select, drag = move value (time locked to keyframe)"
+                                           : "click point = select, drag = move value/time, right-click = delete");
     }
 }
 
