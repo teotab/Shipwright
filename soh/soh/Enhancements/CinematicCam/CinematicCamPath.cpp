@@ -50,8 +50,9 @@ static bool sHookRegistered = false;
 
 // --- Parameter automation tracks -----------------------------------------------------------------------------
 // A track holds keyframes for one exposed parameter on its own sub-timeline. To add another keyframable
-// parameter later: declare a CineParamTrack, evaluate it in PlaybackTick, save/load it, and draw it in the
-// Automation section (DrawParamTrackEditor does the generic key-list UI).
+// parameter: declare a CineParamTrack, add it to AllTrackDefs() with an apply hook, and place a
+// DrawParamKeyNav() inline next to that parameter's own widget. The registry then wires it into the dope sheet,
+// curve editor, save/load, playback and undo automatically.
 struct CineParamTrack {
     const char* id;                 // stable key for save/load
     int interp;                     // CineTrackInterp (step for discrete params)
@@ -2618,9 +2619,27 @@ static void DrawTimeline() {
         float lyBot = laneTop(1 + li) + laneH - 4.0f;
         float ly = laneMid(1 + li);
         if (L->continuous) {
-            float span = (L->vmax > L->vmin) ? (L->vmax - L->vmin) : 1.0f;
+            // Fixed range when the track has one; otherwise auto-fit to the keys (e.g. unbounded positions).
+            float lo = L->vmin, hi = L->vmax;
+            if (!(hi > lo)) {
+                lo = 1e30f;
+                hi = -1e30f;
+                for (const CineParamKey& k : L->track->keys) {
+                    lo = std::min(lo, k.value);
+                    hi = std::max(hi, k.value);
+                }
+                if (lo > hi) {
+                    lo = 0.0f;
+                    hi = 1.0f;
+                }
+                if (hi - lo < 1e-3f) {
+                    lo -= 1.0f;
+                    hi += 1.0f;
+                }
+            }
+            float span = (hi > lo) ? (hi - lo) : 1.0f;
             auto valToY = [&](float v) {
-                float u = (v - L->vmin) / span;
+                float u = (v - lo) / span;
                 u = std::min(std::max(u, 0.0f), 1.0f);
                 return lyBot - u * (lyBot - lyTop);
             };
@@ -3064,7 +3083,7 @@ static void DrawCurveEditor() {
         }
     }
     if (curves.empty()) {
-        ImGui::TextDisabled("Enable a continuous parameter (Time of day, Shake intensity) to shape its curve.");
+        ImGui::TextDisabled("Enable a continuous parameter (Time of day, Shake, Target X/Y/Z) to shape its curve.");
         return;
     }
     static const ImU32 kChanCol[6] = { IM_COL32(120, 200, 255, 255), IM_COL32(255, 180, 90, 255),
