@@ -10,7 +10,9 @@
 #include <clocale>
 #include <fstream>
 #include <filesystem>
+#include <chrono>
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 #include "soh/cvar_prefixes.h"
 #include "soh/Enhancements/game-interactor/GameInteractor.h"
@@ -23,6 +25,39 @@ void CinematicCam_SetPlayback(int active, float* eye, float* at, float roll, flo
 int CinematicCam_WorldToNdc(float* world, float* outNdcX, float* outNdcY);
 int CinematicCam_GetPlayerPos(float* out);
 }
+
+// ---------------------------------------------------------------------------
+// Perf diagnostic (hunt the UI freeze)
+// ---------------------------------------------------------------------------
+// PlaybackTick() runs every frame via the camera hook, so the wall-clock gap between consecutive ticks is the
+// true frame period (game logic + render + present). We separately time our own editor draw, the world overlay
+// and the letterbox update, so each frame can be split into "our code" vs "engine / GPU". When enabled
+// (CinematicCam.PerfDiag), a corner HUD shows it live and every spike over the threshold is logged with the
+// current state - so when it freezes, we can see WHETHER it's us and WHAT the game was doing.
+static double CineNowMs() {
+    using namespace std::chrono;
+    return duration<double, std::milli>(steady_clock::now().time_since_epoch()).count();
+}
+static bool sPerfOn = false;        // CVar mirror, refreshed each tick
+static double sPerfTickPrev = 0.0;  // timestamp of the previous PlaybackTick (frame boundary)
+static double sPerfFrameMs = 0.0;   // last frame period
+static double sPerfPeakMs = 0.0;    // rolling max frame period (reset ~every 2 s)
+static double sPerfPeakAt = 0.0;    // when the current peak window started
+static double sPerfDrawMs = 0.0;    // last DrawElement() duration (includes the world overlay)
+static double sPerfOverlayMs = 0.0; // last DrawWorldOverlay() duration (a subset of draw)
+static double sPerfUpdateMs = 0.0;  // last UpdateElement() duration (letterbox / grid / HUD)
+static int sPerfSpikeCount = 0;     // spikes logged since enable (also shown on the HUD)
+
+// Draw heartbeat: UpdateElement() runs EVERY frame (unconditionally), but DrawElement() only runs when the
+// window's ImGui::Begin returns true. If the window visually "freezes" while the rest of the UI is fine, this
+// tells us which layer: if sDrawStaleMs climbs (DrawElement skipped while UpdateElement keeps ticking) the
+// window's Begin is returning false; if DrawElement keeps running yet the screen is stale, it's viewport present.
+static uint64_t sUpdateCalls = 0;      // ++ each UpdateElement (every frame, regardless of Begin)
+static uint64_t sDrawCalls = 0;        // ++ each DrawElement (only when the window content is actually drawn)
+static uint64_t sLastDrawAtUpdate = 0; // sUpdateCalls value when DrawElement last ran
+static double sLastDrawTimeMs = 0.0;   // wall-clock of the last DrawElement
+static double sDrawStaleMs = 0.0;      // time since the last DrawElement (climbs while the window isn't redrawing)
+static double sWorstDrawStaleMs = 0.0; // worst redraw gap observed since enable
 
 // ---------------------------------------------------------------------------
 // Path state
@@ -900,6 +935,34 @@ static void RecordKeyframe(float t) {
 static void PlaybackTick() {
     static bool wasActive = false;
     sLoopMarkerFrame = false; // only true for the single frame a loop restarts (set below)
+
+    // Perf probe: this hook fires once per frame, so the gap to the previous call is the whole frame period
+    // (logic + render + present). Splitting it against our own measured draw tells us if a hitch is us or engine.
+    sPerfOn = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.PerfDiag"), 0) != 0;
+    if (sPerfOn) {
+        double now = CineNowMs();
+        if (sPerfTickPrev > 0.0) {
+            sPerfFrameMs = now - sPerfTickPrev;
+            if (now - sPerfPeakAt > 2000.0) { // refresh the rolling peak window every couple of seconds
+                sPerfPeakMs = sPerfFrameMs;
+                sPerfPeakAt = now;
+            } else if (sPerfFrameMs > sPerfPeakMs) {
+                sPerfPeakMs = sPerfFrameMs;
+            }
+            if (sPerfFrameMs > 60.0) { // ~below 16 fps for one frame: a visible hitch worth recording
+                sPerfSpikeCount++;
+                double engine = sPerfFrameMs - sPerfDrawMs - sPerfUpdateMs;
+                SPDLOG_WARN("[CinePerf] SPIKE {:.0f}ms (draw {:.1f} [overlay {:.1f}] | update {:.1f} | engine/gpu "
+                            "{:.1f})  play={} preview={} rec={} kf={} overlay={} freecam={} follow={} aimOv={}",
+                            sPerfFrameMs, sPerfDrawMs, sPerfOverlayMs, sPerfUpdateMs, engine, (int)sPlaying,
+                            (int)sPreview, (int)sRecording, (int)sKeyframes.size(), (int)sShowPath,
+                            CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 0), sFollowMode, sAimOverride);
+            }
+        }
+        sPerfTickPrev = now;
+    } else {
+        sPerfTickPrev = 0.0;
+    }
 
     // If the user left camera mode (toggled it off), stop any playback/preview/recording so the normal game
     // camera returns to Link. Without this, a still-running (e.g. looping) cinematic keeps gCineCamPlaybackActive
@@ -2888,7 +2951,7 @@ static void DrawTimeline() {
         ImGui::TextDisabled("%d keyframes selected - drag any to move them together.", SelectionCount());
     } else {
         ImGui::TextDisabled("Camera: drag = move, Ctrl+click = multi-select, Shift+drag = ripple. Track keys: drag to "
-                            "retime (add/remove in Automation).");
+                            "retime (add/remove via each parameter's keyframe button or the curve editor).");
     }
 }
 
@@ -3078,66 +3141,22 @@ static void DrawTargetKeyNav() {
 }
 
 // --- Camera channels (curve editor) -----------------------------------------------------------------------
-// The curve editor can also graph the camera keyframes themselves as value-over-time channels (Eye / Look-at /
-// Roll / FOV). These are read from sKeyframes and LOCKED in time to their keyframe (you retime/add/remove them on
-// the main timeline); only their value is editable in the curve editor. Kept distinct from the "Aim target"
-// parameter tracks - hence the "Cam:" labels (e.g. "Cam: Look-at X" vs the "Target X" automation track).
-enum CamChan { CAM_EYE_X = 0, CAM_EYE_Y, CAM_EYE_Z, CAM_AT_X, CAM_AT_Y, CAM_AT_Z, CAM_ROLL, CAM_FOV, CAM_CHAN_COUNT };
-static const char* kCamChanName[CAM_CHAN_COUNT] = { "Cam: Eye X",     "Cam: Eye Y",     "Cam: Eye Z", "Cam: Look-at X",
-                                                    "Cam: Look-at Y", "Cam: Look-at Z", "Cam: Roll",  "Cam: FOV" };
-static const char* kCamChanShort[CAM_CHAN_COUNT] = { "EyeX", "EyeY", "EyeZ", "AtX", "AtY", "AtZ", "Roll", "FOV" };
-static const ImU32 kCamPalette[CAM_CHAN_COUNT] = {
-    IM_COL32(235, 110, 110, 255), IM_COL32(245, 165, 90, 255),  IM_COL32(240, 215, 110, 255),
-    IM_COL32(110, 170, 245, 255), IM_COL32(110, 220, 235, 255), IM_COL32(120, 235, 190, 255),
-    IM_COL32(205, 140, 240, 255), IM_COL32(150, 235, 130, 255),
-};
+// The curve editor can graph the SCALAR camera values - Roll and FOV - as value-over-time channels, read from the
+// camera keyframes and LOCKED in time to their keyframe (you retime/add/remove them on the main timeline); only
+// the value is editable here. Eye / Look-at are deliberately NOT channels: positions belong to the world gizmos,
+// and graphing them just clutters the editor. Labeled "Cam:" to stay distinct from the "Target X/Y/Z" tracks.
+enum CamChan { CAM_ROLL = 0, CAM_FOV, CAM_CHAN_COUNT };
+static const char* kCamChanName[CAM_CHAN_COUNT] = { "Cam: Roll", "Cam: FOV" };
+static const char* kCamChanShort[CAM_CHAN_COUNT] = { "Roll", "FOV" };
+static const ImU32 kCamPalette[CAM_CHAN_COUNT] = { IM_COL32(205, 140, 240, 255), IM_COL32(150, 235, 130, 255) };
 static float CamChanGet(const CineKeyframe& k, int c) {
-    switch (c) {
-        case CAM_EYE_X:
-            return k.eye[0];
-        case CAM_EYE_Y:
-            return k.eye[1];
-        case CAM_EYE_Z:
-            return k.eye[2];
-        case CAM_AT_X:
-            return k.at[0];
-        case CAM_AT_Y:
-            return k.at[1];
-        case CAM_AT_Z:
-            return k.at[2];
-        case CAM_ROLL:
-            return k.roll;
-        case CAM_FOV:
-            return k.fov;
-    }
-    return 0.0f;
+    return (c == CAM_FOV) ? k.fov : k.roll;
 }
 static void CamChanSet(CineKeyframe& k, int c, float v) {
-    switch (c) {
-        case CAM_EYE_X:
-            k.eye[0] = v;
-            break;
-        case CAM_EYE_Y:
-            k.eye[1] = v;
-            break;
-        case CAM_EYE_Z:
-            k.eye[2] = v;
-            break;
-        case CAM_AT_X:
-            k.at[0] = v;
-            break;
-        case CAM_AT_Y:
-            k.at[1] = v;
-            break;
-        case CAM_AT_Z:
-            k.at[2] = v;
-            break;
-        case CAM_ROLL:
-            k.roll = v;
-            break;
-        case CAM_FOV:
-            k.fov = v;
-            break;
+    if (c == CAM_FOV) {
+        k.fov = v;
+    } else {
+        k.roll = v;
     }
 }
 
@@ -3157,7 +3176,7 @@ static void DrawCurveEditor() {
     static const ImU32 kChanCol[6] = { IM_COL32(120, 200, 255, 255), IM_COL32(255, 180, 90, 255),
                                        IM_COL32(150, 230, 120, 255), IM_COL32(230, 130, 230, 255),
                                        IM_COL32(240, 220, 90, 255),  IM_COL32(120, 230, 230, 255) };
-    static bool sCamShow[CAM_CHAN_COUNT] = { false, false, false, false, false, false, false, false };
+    static bool sCamShow[CAM_CHAN_COUNT] = { false, false };
 
     // Camera-channel visibility chips - always offered (even with no parameter track enabled) so you can pull a
     // camera curve up on its own. A lit chip is overlaid; click its legend entry below to make it editable.
@@ -3188,7 +3207,15 @@ static void DrawCurveEditor() {
     }
     for (int c = 0; c < CAM_CHAN_COUNT; c++) {
         if (sCamShow[c] && !sKeyframes.empty()) {
-            curves.push_back({ kCamChanName[c], kCamPalette[c], true, nullptr, c, 0.0f, 0.0f });
+            // FOV is genuinely bounded, so a fixed range gives the graph height a sensible, precise scale. Roll is
+            // left AUTO-fit (range floored to +-180 in rangeOf) so the dial reads naturally but barrel rolls past a
+            // half-turn still expand the view instead of clamping.
+            float cvmin = 0.0f, cvmax = 0.0f;
+            if (c == CAM_FOV) {
+                cvmin = 1.0f;
+                cvmax = 120.0f;
+            }
+            curves.push_back({ kCamChanName[c], kCamPalette[c], true, nullptr, c, cvmin, cvmax });
         }
     }
     if (curves.empty()) {
@@ -3204,6 +3231,8 @@ static void DrawCurveEditor() {
     static int sActCam = -1;
     static int keySel = -1;
     static int drag = -1;
+    static float sDragLo = 0.0f, sDragHi = 1.0f; // active channel's value range, frozen for the duration of a drag
+    static bool sDragRange = false;
     int active = -1;
     for (int i = 0; i < (int)curves.size(); i++) {
         if (curves[i].isCam == sActIsCam && (sActIsCam ? curves[i].camChan == sActCam : curves[i].track == sActTrack)) {
@@ -3268,6 +3297,10 @@ static void DrawCurveEditor() {
             lo = std::min(lo, v);
             hi = std::max(hi, v);
         }
+        if (C.isCam && C.camChan == CAM_ROLL) { // floor the roll view to a full half-turn each way (barrel rolls
+            lo = std::min(lo, -180.0f);         // past +-180 still expand it; they're never clamped)
+            hi = std::max(hi, 180.0f);
+        }
         if (lo > hi) {
             lo = 0.0f;
             hi = 1.0f;
@@ -3281,6 +3314,13 @@ static void DrawCurveEditor() {
     };
     std::pair<float, float> ar = rangeOf(AL);
     float vmin = ar.first, vmax = ar.second;
+    // While dragging a point, freeze the active channel's value range (captured at grab time). This keeps the drag
+    // sensitivity constant and stops the graph from shifting under the cursor as the dragged value sets a new
+    // extreme - the auto-ranged position channels would otherwise run away.
+    if (drag >= 0 && sDragRange) {
+        vmin = sDragLo;
+        vmax = sDragHi;
+    }
     float vspan = (vmax > vmin) ? (vmax - vmin) : 1.0f;
     int activeN = keyCount(AL);
     if (keySel >= activeN) {
@@ -3370,6 +3410,10 @@ static void DrawCurveEditor() {
         float w = isAct ? 2.0f : 1.3f;
         std::pair<float, float> cr = rangeOf(C);
         float lo = cr.first, hi = cr.second;
+        if (isAct) { // the active channel shares the (possibly drag-frozen) range used for its points and drag math
+            lo = vmin;
+            hi = vmax;
+        }
         int nk = keyCount(C);
         if (nk == 0) {
             continue;
@@ -3448,6 +3492,9 @@ static void DrawCurveEditor() {
         if (hit >= 0) {
             keySel = hit;
             drag = hit;
+            sDragLo = vmin; // snapshot the (still-live) range so this drag keeps a constant value-to-pixel scale
+            sDragHi = vmax;
+            sDragRange = true;
             PushUndo();
         } else {
             keySel = -1;
@@ -3466,6 +3513,7 @@ static void DrawCurveEditor() {
     }
     if (ImGui::IsItemDeactivated()) {
         drag = -1;
+        sDragRange = false;
     }
     // Right-click deletes a key - parameter channels only (camera keyframes are deleted on the main timeline).
     if (!AL.isCam && ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
@@ -3539,6 +3587,24 @@ static void DrawCurveEditor() {
 }
 
 void CinematicCamPathWindow::DrawElement() {
+    double cinePerfT0 = sPerfOn ? CineNowMs() : 0.0; // perf probe: time the whole editor draw (see CinePerf notes)
+    if (sPerfOn) {
+        // Draw heartbeat: this only runs when ImGui::Begin returned true. Measure how long the window went WITHOUT
+        // redrawing (i.e. how long Begin was returning false / Draw was skipped) - that is the visual "freeze".
+        double now = CineNowMs();
+        double stale = (sLastDrawTimeMs > 0.0) ? now - sLastDrawTimeMs : 0.0;
+        if (stale > 250.0) { // resumed after >0.25s without a redraw: a real freeze, now ended
+            if (stale > sWorstDrawStaleMs) {
+                sWorstDrawStaleMs = stale;
+            }
+            SPDLOG_WARN("[CineDraw] window resumed after {:.0f}ms without redraw ({} frames skipped) - DrawElement/"
+                        "Begin was skipped while UpdateElement kept running (so the rest of the UI was alive)",
+                        stale, (long long)(sUpdateCalls - sLastDrawAtUpdate));
+        }
+        sLastDrawTimeMs = now;
+        sLastDrawAtUpdate = sUpdateCalls;
+    }
+    sDrawCalls++;
     // Status strip: always shows the current mode at a glance.
     {
         char st[96];
@@ -3596,10 +3662,30 @@ void CinematicCamPathWindow::DrawElement() {
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Draw the spline, keyframe markers, and the editing gizmo over the game view.");
     }
+    ImGui::SameLine();
+    {
+        bool diag = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.PerfDiag"), 0) != 0;
+        if (ImGui::Checkbox("Perf diag", &diag)) {
+            CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.PerfDiag"), diag);
+            sPerfSpikeCount = 0;
+            sPerfPeakMs = 0.0;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Diagnose the freeze: shows a live frame-time HUD (top-right) splitting each frame into "
+                              "our editor draw vs engine/GPU, and logs every hitch over 60 ms to the SoH log "
+                              "(soh.log) with the current state.");
+        }
+    }
 
     if (sShowPath) {
         HandleOverlayInput();
+        double ovT0 = sPerfOn ? CineNowMs() : 0.0;
         DrawWorldOverlay();
+        if (sPerfOn) {
+            sPerfOverlayMs = CineNowMs() - ovT0;
+        }
+    } else if (sPerfOn) {
+        sPerfOverlayMs = 0.0;
     }
 
     // Keyboard shortcuts (only while this window is focused and not typing into a field).
@@ -3673,17 +3759,20 @@ void CinematicCamPathWindow::DrawElement() {
         }
     }
     static bool sCurveEditorOpen = false; // remembered from last frame to size the bottom region
-    // Size the TOP first (clamped) and give the bottom the remainder, so the two regions always sum to the
-    // window height - the bottom can never overflow past the window edge. The curve-editor graph then adapts to
-    // fill whatever space the bottom has.
-    float cineTimelineH = (15.0f + 22.0f * cineLanes + 6.0f) + 80.0f; // dope-sheet region
-    float cineWantBottom = cineTimelineH + (sCurveEditorOpen ? 260.0f : 0.0f);
+    // Reserve the bottom region for everything it actually holds - the dope-sheet timeline, the separator + the
+    // "Curve editor" collapsing header, and (when open) the curve editor itself - then give the top the remainder.
+    // The earlier estimate under-budgeted the header, so the bottom child scrolled and clipped it behind the edge.
+    float cineTimelineH = (15.0f + 22.0f * cineLanes + 6.0f) + 80.0f; // dope-sheet canvas + toolbar + hint row
+    float cineHeaderH = 34.0f;                                        // separator + "Curve editor" header + spacing
+    float cineCurveH = 280.0f;                                        // chips + legend + adaptive graph + toolbar
+    float cineWantBottom = cineTimelineH + cineHeaderH + (sCurveEditorOpen ? cineCurveH : 0.0f);
     float cineMinTop = 160.0f;
-    float cineMaxTop = cineAvail.y - cineTimelineH - 8.0f;
-    if (cineMaxTop < cineMinTop) {
-        cineMaxTop = cineMinTop;
+    // Give the bottom exactly what it wants; only when the window is too short to fit both do we cap the top at its
+    // minimum and let the bottom take the (smaller) remainder.
+    float cineTopH = cineAvail.y - cineWantBottom - 8.0f;
+    if (cineTopH < cineMinTop) {
+        cineTopH = cineMinTop;
     }
-    float cineTopH = std::min(std::max(cineAvail.y - cineWantBottom - 8.0f, cineMinTop), cineMaxTop);
     float cineBottomH = cineAvail.y - cineTopH - 8.0f;
     if (cineBottomH < 60.0f) {
         cineBottomH = 60.0f;
@@ -4849,12 +4938,58 @@ void CinematicCamPathWindow::DrawElement() {
         DrawCurveEditor();
     }
     ImGui::EndChild();
+
+    if (sPerfOn) {
+        sPerfDrawMs = CineNowMs() - cinePerfT0;
+    }
+}
+
+// Live perf HUD (top-right), shown whenever CinematicCam.PerfDiag is on - even when the cinematic camera is idle,
+// since the freeze "happens all the time". Splits each frame into our editor draw vs the engine/GPU remainder.
+static void DrawPerfHud() {
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImDrawList* dl = ImGui::GetForegroundDrawList(vp);
+    double engine = sPerfFrameMs - sPerfDrawMs - sPerfUpdateMs;
+    if (engine < 0.0) {
+        engine = 0.0;
+    }
+    double fps = (sPerfFrameMs > 0.001) ? 1000.0 / sPerfFrameMs : 0.0;
+    char l1[160], l2[224], l3[200];
+    snprintf(l1, sizeof(l1), "CINE PERF  frame %.1fms (%.0f fps)  peak(2s) %.0fms  spikes %d", sPerfFrameMs, fps,
+             sPerfPeakMs, sPerfSpikeCount);
+    snprintf(l2, sizeof(l2), "draw %.1f [overlay %.1f]  update %.1f  engine/gpu %.1f   kf %d %s%s%s", sPerfDrawMs,
+             sPerfOverlayMs, sPerfUpdateMs, engine, (int)sKeyframes.size(),
+             sPlaying ? "PLAY " : (sPreview ? "PREVIEW " : ""), sRecording ? "REC " : "", sShowPath ? "overlay" : "");
+    // Heartbeat: drawStale = ms since the window content last redrew. Climbs during a freeze (= Begin skipped);
+    // worst = the longest freeze seen. draws/updates show whether DrawElement is keeping pace with the frame loop.
+    snprintf(l3, sizeof(l3), "drawStale %.0fms (worst %.0fms)   draws %llu / updates %llu", sDrawStaleMs,
+             sWorstDrawStaleMs, (unsigned long long)sDrawCalls, (unsigned long long)sUpdateCalls);
+    float w = 580.0f;
+    ImVec2 p(vp->Pos.x + vp->Size.x - w - 12.0f, vp->Pos.y + 12.0f);
+    dl->AddRectFilled(ImVec2(p.x - 6.0f, p.y - 4.0f), ImVec2(p.x + w, p.y + 56.0f), IM_COL32(0, 0, 0, 160), 4.0f);
+    ImU32 col = (sPerfFrameMs > 40.0) ? IM_COL32(255, 140, 120, 255) : IM_COL32(150, 235, 150, 255);
+    dl->AddText(p, col, l1);
+    dl->AddText(ImVec2(p.x, p.y + 18.0f), IM_COL32(220, 220, 225, 255), l2);
+    ImU32 hcol = (sDrawStaleMs > 250.0) ? IM_COL32(255, 90, 90, 255) : IM_COL32(140, 200, 255, 255);
+    dl->AddText(ImVec2(p.x, p.y + 36.0f), hcol, l3);
 }
 
 // Called every frame (even when the window is hidden): draw the cinematic letterbox bars and grid overlay.
 void CinematicCamPathWindow::UpdateElement() {
+    double upT0 = sPerfOn ? CineNowMs() : 0.0;
+    sUpdateCalls++; // runs every frame regardless of the window's Begin (our external "is the window redrawing?" clock)
+    if (sPerfOn) {
+        if (sLastDrawTimeMs > 0.0) {
+            sDrawStaleMs = CineNowMs() - sLastDrawTimeMs;
+        }
+        DrawPerfHud(); // live frame-time HUD, drawn even when the cinematic camera is idle
+    }
+
     bool camActive = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 0) || sPlaying || sPreview;
     if (!camActive) {
+        if (sPerfOn) {
+            sPerfUpdateMs = CineNowMs() - upT0;
+        }
         return;
     }
     ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -4908,5 +5043,9 @@ void CinematicCamPathWindow::UpdateElement() {
         ImVec2 b(a.x + 40.0f, a.y + 40.0f);
         dl->AddRectFilled(a, b, IM_COL32(255, 0, 255, 255));
         dl->AddRect(a, b, IM_COL32(255, 255, 255, 255), 0.0f, 0, 2.0f);
+    }
+
+    if (sPerfOn) {
+        sPerfUpdateMs = CineNowMs() - upT0;
     }
 }
