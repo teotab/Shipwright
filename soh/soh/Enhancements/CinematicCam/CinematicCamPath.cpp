@@ -1,6 +1,7 @@
 #include "CinematicCamPath.h"
 
 #include <imgui.h>
+#include <imgui_internal.h> // DockBuilderGetNode: verify a saved dock node still exists before re-docking
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -87,6 +88,37 @@ static uint64_t sLastDrawAtUpdate = 0; // sUpdateCalls value when DrawElement la
 static double sLastDrawTimeMs = 0.0;   // wall-clock of the last DrawElement
 static double sDrawStaleMs = 0.0;      // time since the last DrawElement (climbs while the window isn't redrawing)
 static double sWorstDrawStaleMs = 0.0; // worst redraw gap observed since enable
+
+// ---------------------------------------------------------------------------
+// Compact / single-monitor UI mode
+// ---------------------------------------------------------------------------
+// The full editor competes with the game for the screen (especially on a single monitor), so it can collapse
+// into a slim "shooting bar" (transport controls only) while the world gizmos + keyboard shortcuts carry the
+// actual shot work. Always available via "Minimize to bar"; Play also enters it automatically by default
+// (CinematicCam.AutoBarOnPlay) so takes are judged on a clean frame.
+static bool sBarMode = false;                    // editor currently collapsed to the shooting bar
+static bool sAutoBar = false;                    // the bar was entered automatically by Play (restore on stop)
+static int sBarSizeFrames = 0;                   // frames remaining to force the window size after a mode switch
+static unsigned int sSavedDockId = 0;            // dock node to return to when expanding (0 = was floating)
+static float sSavedSize[2] = { 440.0f, 600.0f }; // floating window size to restore on expand
+static int sPendingDock = 0;                     // one-shot: 1 = undock into the bar, 2 = re-dock on expand
+
+static void EnterBarMode(bool automatic) {
+    sBarMode = true;
+    sAutoBar = automatic;
+    sPendingDock = 1; // float free of any dock so the game reclaims the screen
+    sBarSizeFrames = 2;
+    CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.BarMode"), 1); // persisted: reopen as the bar next session
+    CVarSave();
+}
+static void ExitBarMode() {
+    sBarMode = false;
+    sAutoBar = false;
+    sPendingDock = 2; // return to the saved dock (or restore the floating size)
+    sBarSizeFrames = 2;
+    CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.BarMode"), 0);
+    CVarSave();
+}
 
 // ---------------------------------------------------------------------------
 // Path state
@@ -281,7 +313,7 @@ static float sShakeFreq = 6.0f;     // wobbles per second
 static bool sShakeOnPreview = true; // also shake while scrubbing/previewing (not just Play)
 
 // Path-level aim override: when set, every keyframe aims at this target instead of its own.
-static int sAimOverride = 0; // 0 none, 1 Link, 2 point, 3 actor
+static int sAimOverride = 0; // 0 none, 1 Link, 2 point, 3 actor, 4 rail (follow the travel direction)
 // sAimOverridePoint (the movable target) is declared earlier, next to its animation tracks.
 static int sAimOverrideActorId = 0;
 static void* sAimOverrideActorPtr = nullptr;
@@ -325,14 +357,16 @@ struct PathSnapshot {
     int selectedId;
     std::vector<int> selection;
     std::vector<std::vector<CineParamKey>> tracks; // keys of every automation track, in AllTrackDefs() order
+    std::vector<char> trackOn;                     // each track's enabled flag (parallel to `tracks`)
 };
 static std::vector<PathSnapshot> sUndo;
 static std::vector<PathSnapshot> sRedo;
 
 static PathSnapshot MakeSnapshot() {
-    PathSnapshot s{ sKeyframes, sIds, sSelectedId, sSelection, {} };
+    PathSnapshot s{ sKeyframes, sIds, sSelectedId, sSelection, {}, {} };
     for (const TrackDef& d : AllTrackDefs()) {
         s.tracks.push_back(d.track->keys);
+        s.trackOn.push_back(d.track->enabled ? 1 : 0);
     }
     return s;
 }
@@ -344,6 +378,9 @@ static void RestoreSnapshot(const PathSnapshot& s) {
     const std::vector<TrackDef>& defs = AllTrackDefs();
     for (size_t i = 0; i < defs.size() && i < s.tracks.size(); i++) {
         defs[i].track->keys = s.tracks[i];
+        if (i < s.trackOn.size()) {
+            defs[i].track->enabled = s.trackOn[i] != 0;
+        }
     }
 }
 
@@ -369,12 +406,22 @@ static float EffectiveTotal() {
     return t;
 }
 
+// Dirty tracking: every mutating edit goes through PushUndo, so it doubles as the "unsaved changes" signal.
+// sDirty drives the * marker (cleared by Save/Load); sDirtyForAutosave arms the next autosave (cleared by
+// Save and by the autosave itself, so an idle editor doesn't rewrite an identical backup every minute).
+static bool sDirty = false;
+static bool sDirtyForAutosave = false;
+static char sFileStatus[160] = ""; // last save/load/autosave result, shown in the Save/Load section
+static double sLastAutosaveMs = 0.0;
+
 static void PushUndo() {
     sUndo.push_back(MakeSnapshot());
     if (sUndo.size() > 64) {
         sUndo.erase(sUndo.begin());
     }
     sRedo.clear();
+    sDirty = true;
+    sDirtyForAutosave = true;
 }
 
 static void Undo() {
@@ -1356,6 +1403,29 @@ static float InvertEasedProgress(float target) {
     return (lo + hi) * 0.5f;
 }
 
+// Start/stop playback from the current playhead (shared by the Space shortcut and the shooting bar's Play).
+static void TogglePlay() {
+    if (sKeyframes.size() < 2) {
+        return;
+    }
+    if (sPlaying) {
+        sPlaying = false;
+        return;
+    }
+    float pt = EffectiveTotal();
+    if (sPlayhead >= pt) {
+        sPlayhead = 0.0f;
+    }
+    sPlayU = InvertEasedProgress((pt > 0.0f) ? (sPlayhead / pt) : 0.0f); // resume exactly at the playhead
+    sPlayDir = 1;
+    if (sPlayhead == 0.0f && CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.SyncIdleAnim"), 0)) {
+        CinematicCam_SyncLinkIdleAnim(); // anchor Link's idle anim when starting from the top
+    }
+    sPlaying = true;
+    sPreview = false;
+    CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
+}
+
 // Smooth sum-of-sines pseudo-noise in roughly [-1, 1] for one shake channel (phase separates channels).
 static float ShakeNoise(float t, float phase) {
     return std::sin(t * 1.00f + phase) * 0.55f + std::sin(t * 2.13f + phase * 1.7f) * 0.30f +
@@ -2076,17 +2146,44 @@ static void SavePath() {
     j["keyframes"] = arr;
     j["target"] = { sAimOverridePoint[0], sAimOverridePoint[1], sAimOverridePoint[2] };
     // Optionally bind the current location (entrance = scene + spawn) so loading the path warps you back here.
-    sPathEntrance = sBindLocation ? CinematicCam_GetCurrentEntrance() : -1;
+    if (bindEntrance) {
+        sPathEntrance = sBindLocation ? CinematicCam_GetCurrentEntrance() : -1;
+    }
     j["entrance"] = sPathEntrance;
+    // Playback settings that define how the path MOVES, not just where: without these, loading a path in a fresh
+    // session could play back visibly differently than authored (the spline parameterization even changes the
+    // curve shape). Old files without this block simply keep the session's current settings.
+    j["playback"] = { { "loop", sLoop },
+                      { "loopMode", sLoopMode },
+                      { "loopReturn", sLoopReturnTime },
+                      { "easeMode", sEaseMode },
+                      { "easeAmount", sEaseAmount },
+                      { "speed", sPlaySpeed },
+                      { "aimOverride", sAimOverride },
+                      { "aimOverrideActorId", sAimOverrideActorId },
+                      { "shakeOn", sShakeEnabled },
+                      { "shakePosAmp", sShakePosAmp },
+                      { "shakeRotAmp", sShakeRotAmp },
+                      { "shakeFreq", sShakeFreq } };
     // Parameter automation tracks (each keyed by its stable id).
     for (const TrackDef& d : AllTrackDefs()) {
         j["tracks"][d.track->id] = TrackToJson(*d.track);
     }
     std::filesystem::create_directories("cinematics");
-    std::ofstream f(std::string("cinematics/") + sFilename + ".json");
+    std::ofstream f(std::string("cinematics/") + base + ".json");
     if (f.good()) {
         f << j.dump(2);
     }
+}
+
+static void SavePath() {
+    SavePathTo(sFilename, true);
+    sDirty = false;
+    sDirtyForAutosave = false;
+    time_t tt = time(nullptr);
+    struct tm* lt = localtime(&tt);
+    snprintf(sFileStatus, sizeof(sFileStatus), "Saved %s.json at %02d:%02d", sFilename, lt ? lt->tm_hour : 0,
+             lt ? lt->tm_min : 0);
 }
 
 static void LoadPath() {
@@ -2112,6 +2209,24 @@ static void LoadPath() {
             sAimOverridePoint[2] = j["target"][2];
         }
         sPathEntrance = j.value("entrance", -1);
+        // Restore the authored playback settings (see SavePath). Defaults are the CURRENT session values, so old
+        // files without this block change nothing.
+        if (j.contains("playback")) {
+            const nlohmann::json& p = j["playback"];
+            sLoop = p.value("loop", sLoop);
+            sLoopMode = p.value("loopMode", sLoopMode);
+            sLoopReturnTime = p.value("loopReturn", sLoopReturnTime);
+            sEaseMode = p.value("easeMode", sEaseMode);
+            sEaseAmount = p.value("easeAmount", sEaseAmount);
+            sPlaySpeed = p.value("speed", sPlaySpeed);
+            sAimOverride = p.value("aimOverride", sAimOverride);
+            sAimOverrideActorId = p.value("aimOverrideActorId", sAimOverrideActorId);
+            sAimOverrideActorPtr = nullptr; // stale across sessions - re-resolved live by id
+            sShakeEnabled = p.value("shakeOn", sShakeEnabled);
+            sShakePosAmp = p.value("shakePosAmp", sShakePosAmp);
+            sShakeRotAmp = p.value("shakeRotAmp", sShakeRotAmp);
+            sShakeFreq = p.value("shakeFreq", sShakeFreq);
+        }
         if (j.contains("tracks")) {
             for (const TrackDef& d : AllTrackDefs()) {
                 if (j["tracks"].contains(d.track->id)) {
@@ -2188,6 +2303,9 @@ static void LoadPath() {
     }
     SortByTime();
     SelectOnly(sIds.empty() ? -1 : sIds[0]);
+    sDirty = false;
+    sDirtyForAutosave = false;
+    snprintf(sFileStatus, sizeof(sFileStatus), "Loaded %s.json (%d keyframes)", sFilename, (int)sKeyframes.size());
 
     // If this path is bound to a location, warp there - unless we're already in that scene (avoids a needless
     // fade reload when re-loading a path in its home area).
@@ -4330,6 +4448,13 @@ void CinematicCamPathWindow::InitElement() {
         setlocale(LC_NUMERIC, "C");
         sHookRegistered = true;
     }
+    // Bar mode is persisted: quitting while collapsed leaves the BAR's slim geometry in imgui.ini, so the next
+    // session must come back up as the bar too - otherwise the full editor would open squeezed into that strip.
+    if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.BarMode"), 0)) {
+        sBarMode = true;
+        sAutoBar = false;
+        sBarSizeFrames = 2; // window geometry already restored by imgui.ini; just enforce the strip size
+    }
 }
 
 // Inline Premiere-style keyframe control, placed next to a parameter's own widget. The first button toggles
@@ -5409,26 +5534,62 @@ void CinematicCamPathWindow::DrawElement() {
         CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), enabled);
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Detached free camera. Left stick: move; right stick: look; plus rebindable "
-                          "ascend/descend/boost/FOV/roll. Bindings are in Dev Tools > Cinematic Cam > Controls.");
+        CineTooltip("Detached free camera. Left stick: move; right stick: look; plus rebindable "
+                    "ascend/descend/boost/FOV/roll. Bindings are in Dev Tools > Cinematic Cam > Controls.");
     }
     ImGui::SameLine();
     ImGui::Checkbox("Show path in world", &sShowPath);
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Draw the spline, keyframe markers, and the editing gizmo over the game view.");
+        CineTooltip("Draw the spline, keyframe markers, and the editing gizmo over the game view.");
     }
     ImGui::SameLine();
     {
         bool diag = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.PerfDiag"), 0) != 0;
         if (ImGui::Checkbox("Perf diag", &diag)) {
             CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.PerfDiag"), diag);
+            CVarSave();
             sPerfSpikeCount = 0;
             sPerfPeakMs = 0.0;
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Diagnose the freeze: shows a live frame-time HUD (top-right) splitting each frame into "
-                              "our editor draw vs engine/GPU, and logs every hitch over 60 ms to the SoH log "
-                              "(soh.log) with the current state.");
+            CineTooltip("Diagnose the freeze: shows a live frame-time HUD (top-right) splitting each frame into "
+                        "our editor draw vs engine/GPU, and logs every hitch over 60 ms to the SoH log "
+                        "(soh.log) with the current state.");
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Minimize to bar")) {
+        EnterBarMode(false);
+    }
+    if (ImGui::IsItemHovered()) {
+        CineTooltip("Collapse the editor to a slim transport bar so the game keeps the screen. World "
+                    "gizmos and keyboard shortcuts stay active.");
+    }
+    ImGui::SameLine();
+    CineHint("|");
+    ImGui::SameLine();
+    {
+        bool autoBar = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.AutoBarOnPlay"), 1) != 0;
+        if (ImGui::Checkbox("Bar on Play", &autoBar)) {
+            CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.AutoBarOnPlay"), autoBar);
+            CVarSave(); // raw CVarSet does NOT persist on its own - without this the setting resets on quit/crash
+        }
+        if (ImGui::IsItemHovered()) {
+            CineTooltip("Minimize to the bar automatically while playing (judge the take on a clean frame) "
+                        "and expand back when playback stops.");
+        }
+        ImGui::SameLine();
+        float alpha = CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.BgAlpha"), 1.0f);
+        ImGui::SetNextItemWidth(110.0f);
+        if (ImGui::SliderFloat("##cineBgAlpha", &alpha, 0.35f, 1.0f, "opacity %.2f")) {
+            CVarSetFloat(CVAR_ENHANCEMENT("CinematicCam.BgAlpha"), alpha);
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            CVarSave(); // persist once when the drag ends (raw CVarSet alone is lost on quit)
+        }
+        if (ImGui::IsItemHovered()) {
+            CineTooltip("Editor background opacity - lower it so the game reads through the window. "
+                        "Most effective while the window floats over the game view.");
         }
     }
 
@@ -5566,16 +5727,16 @@ void CinematicCamPathWindow::DrawElement() {
             CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.SpectateUseFocus"), useFocus);
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Ride the actor's animated focus point (its head) so head bob/turn shows in the POV. "
-                              "Falls back to the actor's base position for actors that don't set a focus point. "
-                              "With this on, you'll usually want a lower Eye height.");
+            CineTooltip("Ride the actor's animated focus point (its head) so head bob/turn shows in the POV. "
+                        "Falls back to the actor's base position for actors that don't set a focus point. "
+                        "With this on, you'll usually want a lower Eye height.");
         }
         float h = CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.SpectateHeight"), 40.0f);
         if (ImGui::SliderFloat("Eye height", &h, -100.0f, 200.0f, "%.2f", ImGuiSliderFlags_NoRoundToFormat)) {
             CVarSetFloat(CVAR_ENHANCEMENT("CinematicCam.SpectateHeight"), h);
         }
-        ImGui::TextDisabled("Locks the camera to the actor's viewpoint (aimed along its facing). "
-                            "The world keeps running so you see what it sees.");
+        CineHint("Locks the camera to the actor's viewpoint (aimed along its facing). "
+                 "The world keeps running so you see what it sees.");
     }
 
     // Follow actor: the FREE camera rides along with a moving actor (keeps its offset); you still fly + aim.
@@ -5589,7 +5750,7 @@ void CinematicCamPathWindow::DrawElement() {
                 CinematicCam_SetFreecamFollow(nullptr, 0);
             }
         } else {
-            ImGui::TextDisabled("Not following. Pick an actor to attach the free camera to it.");
+            CineHint("Not following. Pick an actor to attach the free camera to it.");
         }
         if (ImGui::Button("Pick actor##follow")) {
             ImGui::OpenPopup("Pick follow actor");
@@ -5608,16 +5769,16 @@ void CinematicCamPathWindow::DrawElement() {
             CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.FollowControlsLink"), ctrlLink);
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("The best of both: the controller plays Link normally while the camera rides the "
-                              "followed actor and automatically keeps Link in frame. You give up manual camera "
-                              "control during the take (it's hands-off). Turn off to fly/aim the camera yourself.");
+            CineTooltip("The best of both: the controller plays Link normally while the camera rides the "
+                        "followed actor and automatically keeps Link in frame. You give up manual camera "
+                        "control during the take (it's hands-off). Turn off to fly/aim the camera yourself.");
         }
         if (ctrlLink) {
-            ImGui::TextDisabled("Hands-off camera: follows the actor + auto-aims at Link. You play Link normally; "
-                                "the world runs (this overrides Freeze World).");
+            CineHint("Hands-off camera: follows the actor + auto-aims at Link. You play Link normally; "
+                     "the world runs (this overrides Freeze World).");
         } else {
-            ImGui::TextDisabled("The camera keeps its position relative to the actor as it moves - fly to set the "
-                                "offset (e.g. behind it) and aim wherever you like. Needs the world unfrozen.");
+            CineHint("The camera keeps its position relative to the actor as it moves - fly to set the "
+                     "offset (e.g. behind it) and aim wherever you like. Needs the world unfrozen.");
         }
     }
 
@@ -5643,7 +5804,7 @@ void CinematicCamPathWindow::DrawElement() {
         if (ImGui::Button("Go")) {
             CinematicCam_TeleportTo(sTpSel);
         }
-        ImGui::TextDisabled("Fades to the chosen area (spawn point 0). Only works while in-game.");
+        CineHint("Fades to the chosen area (spawn point 0). Only works while in-game.");
     }
 
     // Sky & time: freeze the sky for clean loops and scrub the time of day directly.
@@ -5671,8 +5832,8 @@ void CinematicCamPathWindow::DrawElement() {
             }
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Replace the sky with a solid chroma-key color (and hide the sun/moon/sky glow) so you "
-                              "can key it out when compositing. Scene geometry still renders over it.");
+            CineTooltip("Replace the sky with a solid chroma-key color (and hide the sun/moon/sky glow) so you "
+                        "can key it out when compositing. Scene geometry still renders over it.");
         }
         ImGui::SameLine();
         DrawParamKeyNav(sGreenScreenTrack, (float)greenScreen);
@@ -5682,12 +5843,12 @@ void CinematicCamPathWindow::DrawElement() {
             CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.FreezeSky"), freezeSky);
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Stop cloud drift and time-of-day progression so looping clips/GIFs line up.");
+            CineTooltip("Stop cloud drift and time-of-day progression so looping clips/GIFs line up.");
         }
 
         int liveDt = CinematicCam_GetDayTime();
         if (liveDt < 0) {
-            ImGui::TextDisabled("Time of day available in-game only.");
+            CineHint("Time of day available in-game only.");
         } else {
             bool todAuto = sTodTrack.enabled;
             int dt = liveDt;
@@ -5715,8 +5876,8 @@ void CinematicCamPathWindow::DrawElement() {
                 setTod(dt);
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Set the sun/moon position and lighting. Keyframe it for a sunrise/sunset across a "
-                                  "shot, or turn on Freeze to hold it.");
+                CineTooltip("Set the sun/moon position and lighting. Keyframe it for a sunrise/sunset across a "
+                            "shot, or turn on Freeze to hold it.");
             }
             ImGui::SameLine();
             DrawParamKeyNav(sTodTrack, (float)dt);
@@ -5737,7 +5898,7 @@ void CinematicCamPathWindow::DrawElement() {
     if (ImGui::CollapsingHeader("Pose Link")) {
         int yaw = CinematicCam_GetLinkYaw();
         if (yaw < 0) {
-            ImGui::TextDisabled("Available in-game only.");
+            CineHint("Available in-game only.");
         } else {
             const float kPi = 3.14159265358979f;
             const float radius = 58.0f;
@@ -5800,7 +5961,7 @@ void CinematicCamPathWindow::DrawElement() {
                 CinematicCam_FaceLinkToCamera(1);
             }
             ImGui::EndGroup();
-            ImGui::TextDisabled("Drag the dial or type degrees to aim Link. Best while he stands idle.");
+            CineHint("Drag the dial or type degrees to aim Link. Best while he stands idle.");
         }
     }
 
@@ -5840,15 +6001,15 @@ void CinematicCamPathWindow::DrawElement() {
     }
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered() && !sClipboardValid) {
-        ImGui::SetTooltip("Copy a keyframe first.");
+        CineTooltip("Copy a keyframe first.");
     }
     ImGui::SameLine();
     if (ImGui::Button("Insert @ playhead")) {
         InsertAtPlayhead();
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Add a keyframe at the current playhead time (on the existing curve, or the live "
-                          "freecam pose if there's no path yet).");
+        CineTooltip("Add a keyframe at the current playhead time (on the existing curve, or the live "
+                    "freecam pose if there's no path yet).");
     }
 
     // Record the live freecam motion into keyframes.
@@ -5870,7 +6031,7 @@ void CinematicCamPathWindow::DrawElement() {
         }
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered() && !enabled) {
-            ImGui::SetTooltip("Enable the free camera first.");
+            CineTooltip("Enable the free camera first.");
         }
     } else {
         if (ImGui::Button("Stop recording")) {
@@ -6003,8 +6164,7 @@ void CinematicCamPathWindow::DrawElement() {
             if (oCenter == 0 || oCenter == 1) {
                 ImGui::Checkbox("Follow it as it moves", &oFollow);
                 if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip(
-                        "The whole orbit tracks the target's movement during playback, keeping it framed.");
+                    CineTooltip("The whole orbit tracks the target's movement during playback, keeping it framed.");
                 }
             }
             if (ImGui::Button("Generate orbit")) {
@@ -6042,8 +6202,8 @@ void CinematicCamPathWindow::DrawElement() {
                 }
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Replace the path with a circle/arc of keyframes around the chosen center, each "
-                                  "aimed at it. A full 360 arc turns on looping. Great for establishing shots.");
+                CineTooltip("Replace the path with a circle/arc of keyframes around the chosen center, each "
+                            "aimed at it. A full 360 arc turns on looping. Great for establishing shots.");
             }
         } // Auto-orbit collapsible
     }
@@ -6052,7 +6212,7 @@ void CinematicCamPathWindow::DrawElement() {
     ImGui::Text("Keyframes: %d", (int)sKeyframes.size());
     if (SelectionCount() > 1) {
         ImGui::SameLine();
-        ImGui::TextDisabled("(%d selected)", SelectionCount());
+        CineHint("(%d selected)", SelectionCount());
     }
     ImGui::BeginChild("##kflist", ImVec2(0, 160), true);
     // Clipper: only build widgets for visible rows (keeps long/recorded paths responsive).
@@ -6062,8 +6222,11 @@ void CinematicCamPathWindow::DrawElement() {
         for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) {
             ImGui::PushID(i);
             char label[64];
-            snprintf(label, sizeof(label), "#%d   t=%.2fs   %s", i + 1, sKeyframes[i].time,
-                     sKeyframes[i].interp == CINE_INTERP_LINEAR ? "[Linear]" : "");
+            bool kfPinned = sKeyframes[i].hasTangent || sKeyframes[i].hasTangentIn || sKeyframes[i].tanWOut > 0.0f ||
+                            sKeyframes[i].tanWIn > 0.0f;
+            snprintf(label, sizeof(label), "#%d   t=%.2fs   %s%s", i + 1, sKeyframes[i].time,
+                     sKeyframes[i].interp == CINE_INTERP_LINEAR ? "[Linear]" : "",
+                     kfPinned ? "*" : ""); // * = custom/pinned tangents (see Bend gizmo / Reset tangent)
             if (ImGui::Selectable(label, IsSelected(sIds[i]))) {
                 if (ImGui::GetIO().KeyCtrl) {
                     ToggleSelect(sIds[i]); // ctrl-click extends the selection
@@ -6084,9 +6247,9 @@ void CinematicCamPathWindow::DrawElement() {
     int sel = SelectedIndex();
     if (SelectionCount() > 1) {
         ImGui::SeparatorText("Selected keyframes");
-        ImGui::TextDisabled("%d keyframes selected. Per-keyframe fields are hidden while multiple are selected - "
-                            "drag on the timeline to move them together, or Ctrl+click to narrow the selection.",
-                            SelectionCount());
+        CineHint("%d keyframes selected. Per-keyframe fields are hidden while multiple are selected - "
+                 "drag on the timeline to move them together, or Ctrl+click to narrow the selection.",
+                 SelectionCount());
     } else if (sel >= 0) {
         ImGui::SeparatorText("Selected keyframe");
 
@@ -6198,7 +6361,7 @@ void CinematicCamPathWindow::DrawElement() {
                 PushUndo();
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Higher = tighter/straighter through the keyframe; lower = rounder, wider arcs.");
+                CineTooltip("Higher = tighter/straighter through the keyframe; lower = rounder, wider arcs.");
             }
             sKeyframes[sel].tension = tens;
 
@@ -6208,7 +6371,7 @@ void CinematicCamPathWindow::DrawElement() {
                 PushUndo();
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("0 = smooth pass-through; away from 0 sharpens the corner at the keyframe.");
+                CineTooltip("0 = smooth pass-through; away from 0 sharpens the corner at the keyframe.");
             }
             sKeyframes[sel].continuity = cont;
 
@@ -6218,8 +6381,7 @@ void CinematicCamPathWindow::DrawElement() {
                 PushUndo();
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip(
-                    "Lean the curve toward the previous (+) or the next (-) keyframe (overshoot/undershoot).");
+                CineTooltip("Lean the curve toward the previous (+) or the next (-) keyframe (overshoot/undershoot).");
             }
             sKeyframes[sel].bias = bias;
 
@@ -6241,7 +6403,7 @@ void CinematicCamPathWindow::DrawElement() {
             PushUndo();
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Decelerate as the camera arrives at this keyframe (slows the segment before it).");
+            CineTooltip("Decelerate as the camera arrives at this keyframe (slows the segment before it).");
         }
         ImGui::SameLine();
         ImGui::SetNextItemWidth(130.0f);
@@ -6250,8 +6412,8 @@ void CinematicCamPathWindow::DrawElement() {
             PushUndo();
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Accelerate gently as the camera leaves this keyframe (slows the segment after it). "
-                              "Set Ease in + Ease out high to pause on this keyframe.");
+            CineTooltip("Accelerate gently as the camera leaves this keyframe (slows the segment after it). "
+                        "Set Ease in + Ease out high to pause on this keyframe.");
         }
         sKeyframes[sel].easeIn = eIn;
         sKeyframes[sel].easeOut = eOut;
@@ -6320,9 +6482,9 @@ void CinematicCamPathWindow::DrawElement() {
                     sKeyframes[sel].at[2] = p[2];
                 }
             }
-            ImGui::TextDisabled("Drag the orange crosshair in the world to place the target.");
+            CineHint("Drag the orange crosshair in the world to place the target.");
         } else if (sKeyframes[sel].aimMode == CINE_AIM_PLAYER) {
-            ImGui::TextDisabled("Tracks Link's position (live during playback).");
+            CineHint("Tracks Link's position (live during playback).");
         } else if (sKeyframes[sel].aimMode == CINE_AIM_ACTOR) {
             // Cheap id->name lookup (no per-frame enumeration of all actors).
             const char* curName =
@@ -6344,7 +6506,7 @@ void CinematicCamPathWindow::DrawElement() {
                 }
                 ImGui::EndPopup();
             }
-            ImGui::TextDisabled("Tracks the actor live. Saved by id (re-acquired on load).");
+            CineHint("Tracks the actor live. Saved by id (re-acquired on load).");
         } else if (sKeyframes[sel].aimMode == CINE_AIM_TARGET) {
             bool tgtAuto = sTargetXTrack.enabled;
             float tgt[3] = { sAimOverridePoint[0], sAimOverridePoint[1], sAimOverridePoint[2] };
@@ -6380,8 +6542,8 @@ void CinematicCamPathWindow::DrawElement() {
             }
             ImGui::SameLine();
             DrawTargetKeyNav();
-            ImGui::TextDisabled("Aims at the shared movable target (one point for the whole path). Keyframe it to "
-                                "animate it; edit each axis in the Curve editor (Target X/Y/Z).");
+            CineHint("Aims at the shared movable target (one point for the whole path). Keyframe it to "
+                     "animate it; edit each axis in the Curve editor (Target X/Y/Z).");
         }
 
         // Numeric fields: type exact position/orientation values for the selected keyframe.
@@ -6389,19 +6551,18 @@ void CinematicCamPathWindow::DrawElement() {
         if (sShowFields) {
             CineKeyframe& kf = sKeyframes[sel];
 
-            float pos[3] = { kf.eye[0], kf.eye[1], kf.eye[2] };
-            bool posCh = ImGui::InputFloat3("Position", pos, "%.1f");
-            if (ImGui::IsItemActivated()) {
-                PushUndo();
-            }
-            if (posCh) {
-                float dxp = pos[0] - kf.eye[0], dyp = pos[1] - kf.eye[1], dzp = pos[2] - kf.eye[2];
-                kf.eye[0] = pos[0];
-                kf.eye[1] = pos[1];
-                kf.eye[2] = pos[2];
-                kf.at[0] += dxp; // move the look-at rigidly with the eye
-                kf.at[1] += dyp;
-                kf.at[2] += dzp;
+            // Per-axis rows (not InputFloat3) so each gets -/+ step buttons like yaw/pitch/roll below.
+            static const char* kPosAxis[3] = { "Pos X", "Pos Y", "Pos Z" };
+            for (int ax = 0; ax < 3; ax++) {
+                float v = kf.eye[ax];
+                ImGui::InputFloat(kPosAxis[ax], &v, 1.0f, 25.0f, "%.1f");
+                if (ImGui::IsItemActivated()) {
+                    PushUndo();
+                }
+                if (v != kf.eye[ax]) {
+                    kf.at[ax] += v - kf.eye[ax]; // move the look-at rigidly with the eye
+                    kf.eye[ax] = v;
+                }
             }
 
             float yaw, pitch, dist;
@@ -6494,8 +6655,8 @@ void CinematicCamPathWindow::DrawElement() {
         CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.PlaybackControlsLink"), controlLink);
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("While a path plays, the controller moves Link and the world keeps running "
-                          "(the camera follows the path). Pairs well with 'Look at Link'.");
+        CineTooltip("While a path plays, the controller moves Link and the world keeps running "
+                    "(the camera follows the path). Pairs well with 'Look at Link'.");
     }
 
     // Path follow status: when set (e.g. by an orbit), the whole path tracks a moving target.
@@ -6518,7 +6679,7 @@ void CinematicCamPathWindow::DrawElement() {
             sFollowMode = prev;
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Recenter the follow offset on the target's current position.");
+            CineTooltip("Recenter the follow offset on the target's current position.");
         }
     }
 
@@ -6527,8 +6688,8 @@ void CinematicCamPathWindow::DrawElement() {
         const char* loopModes[] = { "Forward (wrap)", "Ping-pong (reverse)" };
         ImGui::Combo("Loop style", &sLoopMode, loopModes, 2);
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Forward: glide from the last keyframe back to the first and repeat. "
-                              "Ping-pong: play to the end, then play back in reverse, and repeat.");
+            CineTooltip("Forward: glide from the last keyframe back to the first and repeat. "
+                        "Ping-pong: play to the end, then play back in reverse, and repeat.");
         }
         if (sLoopMode == 0) {
             ImGui::SameLine();
@@ -6543,9 +6704,9 @@ void CinematicCamPathWindow::DrawElement() {
             CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.LoopStartMarker"), loopMark);
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Flash a magenta square in the top-left for the single frame each loop restarts. "
-                              "Lets you find the exact loop boundary in a recording and trim there (off by "
-                              "default - it's only an editing aid, delete that frame in post).");
+            CineTooltip("Flash a magenta square in the top-left for the single frame each loop restarts. "
+                        "Lets you find the exact loop boundary in a recording and trim there (off by "
+                        "default - it's only an editing aid, delete that frame in post).");
         }
     }
 
@@ -6554,23 +6715,23 @@ void CinematicCamPathWindow::DrawElement() {
     ImGui::SetNextItemWidth(160.0f);
     ImGui::Combo("Easing", &sEaseMode, easeModes, 4);
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Playback timing: accelerate/decelerate the whole move instead of moving at a "
-                          "constant rate. Affects Play only, not scrubbing.");
+        CineTooltip("Playback timing: accelerate/decelerate the whole move instead of moving at a "
+                    "constant rate. Affects Play only, not scrubbing.");
     }
     if (sEaseMode != 0) {
         ImGui::SameLine();
         ImGui::SetNextItemWidth(140.0f);
         ImGui::SliderFloat("Amount##ease", &sEaseAmount, 0.0f, 1.0f, "%.2f");
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("How strong the easing is (0 = linear, 1 = full).");
+            CineTooltip("How strong the easing is (0 = linear, 1 = full).");
         }
     }
 
     // Camera shake / handheld: organic jitter layered on top of playback.
     ImGui::Checkbox("Camera shake", &sShakeEnabled);
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Add smooth handheld-style jitter to the moving camera. Deterministic, so it looks the "
-                          "same every time you scrub or replay.");
+        CineTooltip("Add smooth handheld-style jitter to the moving camera. Deterministic, so it looks the "
+                    "same every time you scrub or replay.");
     }
     {
         // Shake intensity is a keyframable multiplier on the amps below (ramp calm -> shaky over a shot).
@@ -6651,10 +6812,10 @@ void CinematicCamPathWindow::DrawElement() {
         ImGui::SameLine();
         DrawTargetKeyNav();
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Drop the aim target in front of the free camera. With 'Show path in world' on you can "
-                              "then drag its red/green/blue handles to reposition it, and the whole path aims at it.");
+            CineTooltip("Drop the aim target in front of the free camera. With 'Show path in world' on you can "
+                        "then drag its red/green/blue handles to reposition it, and the whole path aims at it.");
         }
-        ImGui::TextDisabled("Movable aim target: the whole path looks at this point. Drag its gizmo in the world.");
+        CineHint("Movable aim target: the whole path looks at this point. Drag its gizmo in the world.");
     } else if (sAimOverride == 3) {
         ImGui::SameLine();
         if (ImGui::Button("Pick##aimov")) {
@@ -6692,39 +6853,54 @@ void CinematicCamPathWindow::DrawElement() {
             ImGui::OpenPopup("Cinematic files");
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Browse, load, or delete saved cinematics in the cinematics/ folder.");
+            CineTooltip("Browse, load, or delete saved cinematics in the cinematics/ folder.");
         }
         ImGui::SameLine();
-        ImGui::TextDisabled("(cinematics/<name>.json)");
+        CineHint("(cinematics/<name>.json)");
+        if (sDirty) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "*");
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("Unsaved changes (autosaved to cinematics/<name>_autosave.json once a minute).");
+            }
+        }
+        if (sFileStatus[0]) {
+            CineHint("%s", sFileStatus);
+        }
 
         // Path-bound location: tie the current scene/spawn to the path so loading warps you straight back.
         ImGui::Checkbox("Bind location to path", &sBindLocation);
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("When saving, remember the current scene/spawn so loading this path warps you here.");
+            CineTooltip("When saving, remember the current scene/spawn so loading this path warps you here.");
         }
         ImGui::SameLine();
         ImGui::Checkbox("Teleport on load", &sTeleportOnLoad);
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("When loading a path with a bound location, fade-warp to it (skipped if already there).");
+            CineTooltip("When loading a path with a bound location, fade-warp to it (skipped if already there).");
         }
         if (sPathEntrance >= 0) {
             bool here = (CinematicCam_GetCurrentEntrance() == sPathEntrance);
-            ImGui::TextDisabled("Bound location: entrance %d%s", sPathEntrance, here ? "  (you are here)" : "");
+            CineHint("Bound location: entrance %d%s", sPathEntrance, here ? "  (you are here)" : "");
         } else {
-            ImGui::TextDisabled("Bound location: none");
+            CineHint("Bound location: none");
         }
 
         if (ImGui::BeginPopup("Cinematic files")) {
-            ImGui::TextDisabled("Saved cinematics  (* = current)");
+            CineHint("Saved cinematics  (* = current)");
             ImGui::Separator();
-            std::vector<std::string> files = ListCinematics();
-            if (files.empty()) {
-                ImGui::TextDisabled("(none yet - Save one first)");
+            // Snapshot the directory listing when the popup opens (re-reading + sorting it every frame was a
+            // per-frame disk hit); refreshed after a delete so the list stays truthful.
+            static std::vector<std::string> sFileList;
+            if (ImGui::IsWindowAppearing()) {
+                sFileList = ListCinematics();
+            }
+            if (sFileList.empty()) {
+                CineHint("(none yet - Save one first)");
             }
             static std::string sConfirmDelete; // name awaiting delete confirmation, or empty
             bool closePopup = false;
             ImGui::BeginChild("##cinelist", ImVec2(320, 240), false);
-            for (auto& name : files) {
+            for (auto& name : sFileList) {
                 ImGui::PushID(name.c_str());
                 // Buttons first (a full-width Selectable would otherwise swallow their clicks).
                 if (ImGui::SmallButton("Load")) {
@@ -6739,6 +6915,9 @@ void CinematicCamPathWindow::DrawElement() {
                         std::error_code ec;
                         std::filesystem::remove(std::string("cinematics/") + name + ".json", ec);
                         sConfirmDelete.clear();
+                        sFileList = ListCinematics(); // refresh: iterators into the old list are done this frame
+                        ImGui::PopID();
+                        break; // the list we're iterating changed; redraw next frame
                     }
                     ImGui::SameLine();
                     if (ImGui::SmallButton("no")) {
@@ -6833,6 +7012,54 @@ void CinematicCamPathWindow::UpdateElement() {
         DrawPerfHud(); // live frame-time HUD, drawn even when the cinematic camera is idle
     }
 
+    // Shooting-bar housekeeping: with "Bar on Play" enabled, Play collapses the editor to the bar and stopping
+    // restores it - but only if the bar was entered automatically (a manual expand mid-playback sticks, and the
+    // restore still runs even if the checkbox was turned off during playback).
+    static bool sWasPlaying = false;
+    if (sPlaying && !sWasPlaying && !sBarMode && CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.AutoBarOnPlay"), 1)) {
+        EnterBarMode(true);
+    } else if (!sPlaying && sWasPlaying && sAutoBar && sBarMode) {
+        ExitBarMode();
+    }
+    sWasPlaying = sPlaying;
+
+    // Autosave: back up edited-but-unsaved work to cinematics/_autosave.json once a minute. Skipped while a
+    // take is playing/recording (no disk hit mid-shot); the first backup lands a minute after the first edit.
+    if (sDirtyForAutosave && !sPlaying && !sRecording && sKeyframes.size() >= 2) {
+        double now = CineNowMs();
+        if (sLastAutosaveMs <= 0.0) {
+            sLastAutosaveMs = now;
+        } else if (now - sLastAutosaveMs > 60000.0) {
+            char autoName[96]; // per-path backup slot: editing one path never overwrites another's autosave
+            snprintf(autoName, sizeof(autoName), "%s_autosave", sFilename);
+            SavePathTo(autoName, false);
+            sDirtyForAutosave = false;
+            sLastAutosaveMs = now;
+            snprintf(sFileStatus, sizeof(sFileStatus), "Autosaved to %s.json (unsaved changes remain)", autoName);
+        }
+    }
+
+    // Window styling that must land on OUR ImGui::Begin: Update() runs immediately before this window's Draw()
+    // (no other Begin in between), and both are gated on visibility so nothing leaks onto another window.
+    if (IsVisible()) {
+        float alpha = CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.BgAlpha"), 1.0f);
+        if (alpha < 0.999f) {
+            ImGui::SetNextWindowBgAlpha(alpha);
+        }
+        if (sPendingDock == 1) { // entering the bar: float free so the game reclaims the dock space
+            ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
+            sPendingDock = 0;
+        } else if (sPendingDock == 2) { // expanding: return to the dock the full editor lived in
+            // Only if that dock node still exists - a node is destroyed when its last window undocks, and
+            // SetNextWindowDockID with a dead id would re-"dock" the window into a phantom node that keeps the
+            // bar's size. If it is gone, stay floating; DrawElement restores the saved floating size.
+            if (sSavedDockId != 0 && ImGui::DockBuilderGetNode((ImGuiID)sSavedDockId) != nullptr) {
+                ImGui::SetNextWindowDockID((ImGuiID)sSavedDockId, ImGuiCond_Always);
+            }
+            sPendingDock = 0;
+        }
+    }
+
     bool camActive = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 0) || sPlaying || sPreview;
     if (!camActive) {
         if (sPerfOn) {
@@ -6843,9 +7070,12 @@ void CinematicCamPathWindow::UpdateElement() {
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImDrawList* dl = ImGui::GetForegroundDrawList(vp);
 
-    // Letterbox bars.
-    if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Letterbox"), 0)) {
-        float amount = CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.LetterboxAmount"), 0.12f);
+    // Letterbox bars. The Letterbox automation track overrides the manual setting while it drives (and shows
+    // the bars even with the checkbox off, so the amount can be animated from zero).
+    if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Letterbox"), 0) || sLetterboxOverride >= 0.0f) {
+        float amount = (sLetterboxOverride >= 0.0f)
+                           ? sLetterboxOverride
+                           : CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.LetterboxAmount"), 0.12f);
         if (amount > 0.0f) {
             float barH = vp->Size.y * amount;
             dl->AddRectFilled(vp->Pos, ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + barH), IM_COL32(0, 0, 0, 255));
