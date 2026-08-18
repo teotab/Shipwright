@@ -166,9 +166,103 @@ static int KeyInterp(const CineParamTrack& t, int i) {
     return (m < 0) ? t.interp : m;
 }
 
+// --- Bezier handle helpers --------------------------------------------------------------------------------
+// Default (auto-smooth) tangent handles for key i: a Catmull-Rom-style slope, handle length 1/3 of the adjacent
+// segment in time. Used to seed handles when a key is switched to Bezier (so the shape doesn't jump) and as a
+// fallback when a key's handles are unset.
+static void DefaultBezierHandles(const CineParamTrack& t, int i, float& outT, float& outV, float& inT, float& inV) {
+    int n = (int)t.keys.size();
+    const CineParamKey& k = t.keys[i];
+    float prevT = (i > 0) ? t.keys[i - 1].time : k.time;
+    float prevV = (i > 0) ? t.keys[i - 1].value : k.value;
+    float nextT = (i < n - 1) ? t.keys[i + 1].time : k.time;
+    float nextV = (i < n - 1) ? t.keys[i + 1].value : k.value;
+    float span = nextT - prevT;
+    float slope = (span > 1e-5f) ? (nextV - prevV) / span : 0.0f;
+    float segNext = (i < n - 1) ? (t.keys[i + 1].time - k.time) : (k.time - prevT);
+    float segPrev = (i > 0) ? (k.time - t.keys[i - 1].time) : (nextT - k.time);
+    outT = segNext / 3.0f;
+    outV = slope * outT;
+    inT = -segPrev / 3.0f;
+    inV = slope * inT;
+}
+// Effective handles for a key (stored if set, else default-derived).
+static void GetBezierHandles(const CineParamTrack& t, int i, float& outT, float& outV, float& inT, float& inV) {
+    const CineParamKey& k = t.keys[i];
+    if (k.hasHandles) {
+        outT = k.hOutT;
+        outV = k.hOutV;
+        inT = k.hInT;
+        inV = k.hInV;
+    } else {
+        DefaultBezierHandles(t, i, outT, outV, inT, inV);
+    }
+}
+// Solve for the Bezier parameter u in [0,1] where the curve's TIME coordinate equals `x`. With the control points'
+// time coordinates kept inside [x0,x3] (we clamp the handles), time is monotonic in u, so bisection is robust.
+static float BezierSolveU(float x, float x0, float x1, float x2, float x3) {
+    float lo = 0.0f, hi = 1.0f;
+    for (int it = 0; it < 26; it++) {
+        float u = 0.5f * (lo + hi);
+        float omu = 1.0f - u;
+        float bx = omu * omu * omu * x0 + 3.0f * omu * omu * u * x1 + 3.0f * omu * u * u * x2 + u * u * u * x3;
+        if (bx < x) {
+            lo = u;
+        } else {
+            hi = u;
+        }
+    }
+    return 0.5f * (lo + hi);
+}
+static float BezierEval1(float u, float p0, float p1, float p2, float p3) {
+    float omu = 1.0f - u;
+    return omu * omu * omu * p0 + 3.0f * omu * omu * u * p1 + 3.0f * omu * u * u * p2 + u * u * u * p3;
+}
+// Evaluate a Bezier segment between keys a (index i) and b (index i+1) at absolute time `time`.
+static float EvalBezierSegment(const CineParamTrack& t, int i, float time) {
+    const CineParamKey& a = t.keys[i];
+    const CineParamKey& b = t.keys[i + 1];
+    float segDur = b.time - a.time;
+    float aOutT, aOutV, aInT, aInV, bOutT, bOutV, bInT, bInV;
+    GetBezierHandles(t, i, aOutT, aOutV, aInT, aInV);
+    GetBezierHandles(t, i + 1, bOutT, bOutV, bInT, bInV);
+    // Keep the control points' time inside the segment so time stays monotonic (a proper function of time).
+    float x1 = a.time + std::min(std::max(aOutT, 0.0f), segDur);
+    float x2 = b.time + std::max(std::min(bInT, 0.0f), -segDur);
+    float u = BezierSolveU(time, a.time, x1, x2, b.time);
+    return BezierEval1(u, a.value, a.value + aOutV, b.value + bInV, b.value);
+}
+
+// Evaluate the segment LEAVING key i (keys[i] -> keys[i+1]) at absolute `time` (assumed within the segment),
+// honoring that key's interpolation: step (hold), linear, smooth (uniform Catmull-Rom through the neighbors) or
+// Bezier. Split out of EvalParamTrack so callers that already know the segment (the curve-editor's per-segment
+// render subsampling) don't re-search the key list for every sample.
+static float EvalTrackSegment(const CineParamTrack& t, size_t i, float time) {
+    const CineParamKey& a = t.keys[i];
+    const CineParamKey& b = t.keys[i + 1];
+    float d = b.time - a.time;
+    float s = (d > 1e-5f) ? (time - a.time) / d : 0.0f;
+    int mode = KeyInterp(t, (int)i);
+    if (mode == CINE_TRACK_STEP) {
+        return a.value;
+    }
+    if (mode == CINE_TRACK_BEZIER) {
+        return EvalBezierSegment(t, (int)i, time);
+    }
+    if (mode == CINE_TRACK_SMOOTH) {
+        float p0 = (i > 0) ? t.keys[i - 1].value : a.value;
+        float p1 = a.value;
+        float p2 = b.value;
+        float p3 = (i + 2 < t.keys.size()) ? t.keys[i + 2].value : b.value;
+        float s2 = s * s, s3 = s2 * s;
+        return 0.5f * ((2.0f * p1) + (-p0 + p2) * s + (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * s2 +
+                       (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * s3);
+    }
+    return a.value + (b.value - a.value) * s; // linear
+}
+
 // Evaluate a track at a time. Returns false (no value) when the track is disabled or empty. Clamps before the
-// first / after the last key. The segment uses the LEFT key's interpolation: step (hold), linear, or smooth
-// (uniform Catmull-Rom through the neighbors).
+// first / after the last key. The segment uses the LEFT key's interpolation.
 static bool EvalParamTrack(const CineParamTrack& t, float time, float& out) {
     if (!t.enabled || t.keys.empty()) {
         return false;
@@ -185,39 +279,99 @@ static bool EvalParamTrack(const CineParamTrack& t, float time, float& out) {
     while (i + 1 < t.keys.size() && t.keys[i + 1].time <= time) {
         i++;
     }
-    const CineParamKey& a = t.keys[i];
-    const CineParamKey& b = t.keys[i + 1];
-    float d = b.time - a.time;
-    float s = (d > 1e-5f) ? (time - a.time) / d : 0.0f;
-    int mode = KeyInterp(t, (int)i);
-    if (mode == CINE_TRACK_STEP) {
-        out = a.value;
-    } else if (mode == CINE_TRACK_SMOOTH) {
-        float p0 = (i > 0) ? t.keys[i - 1].value : a.value;
-        float p1 = a.value;
-        float p2 = b.value;
-        float p3 = (i + 2 < t.keys.size()) ? t.keys[i + 2].value : b.value;
-        float s2 = s * s, s3 = s2 * s;
-        out = 0.5f * ((2.0f * p1) + (-p0 + p2) * s + (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * s2 +
-                      (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * s3);
-    } else {
-        out = a.value + (b.value - a.value) * s; // linear
-    }
+    out = EvalTrackSegment(t, i, time);
     return true;
 }
 
+// Seed key i's handles from the auto-smooth default and mark them explicit (called when switching a key to Bezier
+// so its shape starts matching the previous Smooth curve, then becomes hand-editable).
+static void SeedBezierHandles(CineParamKey& k, const CineParamTrack& t, int i) {
+    DefaultBezierHandles(t, i, k.hOutT, k.hOutV, k.hInT, k.hInV);
+    k.hasHandles = 1;
+}
+
+static int sNextParamKeyId = 1; // monotonic; assigns CineParamKey::id so multi-selection survives re-sorting
+
 // Insert (or overwrite a near-coincident) key, keeping the track sorted by time. New keys inherit the track's
-// default interpolation (interp = -1).
-static void TrackAddKey(CineParamTrack& t, float time, float value) {
+// default interpolation (interp = -1) and a fresh stable id. Returns the id of the added/updated key.
+static int TrackAddKey(CineParamTrack& t, float time, float value) {
     for (CineParamKey& k : t.keys) {
         if (std::fabs(k.time - time) < 1e-3f) {
             k.value = value;
+            return k.id;
+        }
+    }
+    int id = sNextParamKeyId++;
+    t.keys.push_back({ time, value, -1, id });
+    std::sort(t.keys.begin(), t.keys.end(),
+              [](const CineParamKey& a, const CineParamKey& b) { return a.time < b.time; });
+    return id;
+}
+
+// --- Parameter-key multi-selection (parity with the camera-keyframe selection). A selected key is identified by
+// (track, id) so it survives retiming / re-sorting. Shared by the curve editor and the dope sheet. ---
+struct ParamKeyRef {
+    CineParamTrack* track;
+    int id;
+};
+static std::vector<ParamKeyRef> sParamSel; // selected parameter keys, across tracks (last entry = most recent)
+
+static int ParamKeyIndexById(const CineParamTrack* t, int id) {
+    for (int i = 0; i < (int)t->keys.size(); i++) {
+        if (t->keys[i].id == id) {
+            return i;
+        }
+    }
+    return -1;
+}
+static bool IsParamKeySel(const CineParamTrack* t, int id) {
+    for (const ParamKeyRef& r : sParamSel) {
+        if (r.track == t && r.id == id) {
+            return true;
+        }
+    }
+    return false;
+}
+static int ParamSelCountInTrack(const CineParamTrack* t) {
+    int n = 0;
+    for (const ParamKeyRef& r : sParamSel) {
+        if (r.track == t) {
+            n++;
+        }
+    }
+    return n;
+}
+static void ParamSelClear() {
+    sParamSel.clear();
+}
+static void ParamSelOnly(CineParamTrack* t, int id) {
+    sParamSel.clear();
+    sParamSel.push_back({ t, id });
+}
+static void ParamSelToggle(CineParamTrack* t, int id) {
+    for (size_t i = 0; i < sParamSel.size(); i++) {
+        if (sParamSel[i].track == t && sParamSel[i].id == id) {
+            sParamSel.erase(sParamSel.begin() + i);
             return;
         }
     }
-    t.keys.push_back({ time, value, -1 });
-    std::sort(t.keys.begin(), t.keys.end(),
-              [](const CineParamKey& a, const CineParamKey& b) { return a.time < b.time; });
+    sParamSel.push_back({ t, id });
+}
+// Drop selected refs whose key no longer exists (after deletes / loads).
+static void PruneParamSel() {
+    sParamSel.erase(std::remove_if(sParamSel.begin(), sParamSel.end(),
+                                   [](const ParamKeyRef& r) { return ParamKeyIndexById(r.track, r.id) < 0; }),
+                    sParamSel.end());
+}
+// Erase every selected parameter key (across all their tracks), then clear the selection. Caller does PushUndo.
+static void DeleteSelectedParamKeys() {
+    for (const ParamKeyRef& r : sParamSel) {
+        int idx = ParamKeyIndexById(r.track, r.id); // re-find by id each time (earlier erases shift indices)
+        if (idx >= 0) {
+            r.track->keys.erase(r.track->keys.begin() + idx);
+        }
+    }
+    sParamSel.clear();
 }
 
 // Bridge for z_play.c: the green screen mode to actually render this frame - the track's value while a cinematic
@@ -254,6 +408,21 @@ static CineParamTrack sTargetXTrack = { "targetX", CINE_TRACK_LINEAR, false, {} 
 static CineParamTrack sTargetYTrack = { "targetY", CINE_TRACK_LINEAR, false, {} };
 static CineParamTrack sTargetZTrack = { "targetZ", CINE_TRACK_LINEAR, false, {} };
 
+// Camera roll / FOV as their OWN automation tracks: independent keys on their own sub-timeline, fully editable
+// in the curve editor (retime, per-key interpolation, Bezier handles). When enabled they OVERRIDE the camera
+// keyframes' interpolated roll / FOV during playback; the keyframes keep their values for when the track is off.
+static CineParamTrack sRollTrack = { "camRoll", CINE_TRACK_SMOOTH, false, {} };
+static CineParamTrack sFovTrack = { "camFov", CINE_TRACK_SMOOTH, false, {} };
+static float sRollTrackVal = 0.0f;
+static int sRollTrackOn = 0; // value forced by the track this frame (reset each tick)
+static float sFovTrackVal = 0.0f;
+static int sFovTrackOn = 0;
+
+// Letterbox amount (0..0.45): animate the cinematic bars in/out over a shot. Overrides the manual setting
+// while driving (and draws the bars even if the Letterbox checkbox is off).
+static CineParamTrack sLetterboxTrack = { "letterbox", CINE_TRACK_LINEAR, false, {} };
+static float sLetterboxOverride = -1.0f;
+
 // Per-track apply hooks, run during playback/preview with the track's value at the playhead.
 static void ApplyGreenScreen(float v) {
     sGreenScreenOverride = (int)(v + 0.5f);
@@ -276,6 +445,17 @@ static void ApplyTargetY(float v) {
 static void ApplyTargetZ(float v) {
     sAimOverridePoint[2] = v;
 }
+static void ApplyCamRoll(float v) {
+    sRollTrackVal = v;
+    sRollTrackOn = 1;
+}
+static void ApplyCamFov(float v) {
+    sFovTrackVal = v;
+    sFovTrackOn = 1;
+}
+static void ApplyLetterbox(float v) {
+    sLetterboxOverride = std::min(std::max(v, 0.0f), 0.45f);
+}
 
 // Registry of every keyframable parameter. Listing a parameter here makes it appear on the dope sheet and flow
 // through save/load, playback and undo automatically; its inline keyframe control sits next to its own widget.
@@ -297,6 +477,9 @@ static const std::vector<TrackDef>& AllTrackDefs() {
         { &sTargetXTrack, "Target X", true, 0.0f, 0.0f, nullptr, 0, &ApplyTargetX }, // 0,0 = auto-range
         { &sTargetYTrack, "Target Y", true, 0.0f, 0.0f, nullptr, 0, &ApplyTargetY },
         { &sTargetZTrack, "Target Z", true, 0.0f, 0.0f, nullptr, 0, &ApplyTargetZ },
+        { &sRollTrack, "Cam roll", true, 0.0f, 0.0f, nullptr, 0, &ApplyCamRoll }, // auto-range: barrel rolls expand
+        { &sFovTrack, "Cam FOV", true, 1.0f, 120.0f, nullptr, 0, &ApplyCamFov },
+        { &sLetterboxTrack, "Letterbox", true, 0.0f, 0.45f, nullptr, 0, &ApplyLetterbox },
     };
     return defs;
 }
@@ -2106,14 +2289,29 @@ static void TrackFromJson(CineParamTrack& t, const nlohmann::json& j) {
     t.enabled = j.value("enabled", false);
     if (j.contains("keys")) {
         for (const auto& e : j["keys"]) {
-            t.keys.push_back({ e.value("time", 0.0f), e.value("value", 0.0f), e.value("interp", -1) });
+            CineParamKey k{};
+            k.time = e.value("time", 0.0f);
+            k.value = e.value("value", 0.0f);
+            k.interp = e.value("interp", -1);
+            k.id = sNextParamKeyId++;
+            if (e.contains("h") && e["h"].size() >= 4) {
+                k.hOutT = e["h"][0];
+                k.hOutV = e["h"][1];
+                k.hInT = e["h"][2];
+                k.hInV = e["h"][3];
+                k.hasHandles = 1;
+                k.brokenHandles = e.value("hb", 0);
+            }
+            t.keys.push_back(k);
         }
         std::sort(t.keys.begin(), t.keys.end(),
                   [](const CineParamKey& a, const CineParamKey& b) { return a.time < b.time; });
     }
 }
 
-static void SavePath() {
+// Write the whole path to cinematics/<base>.json. `bindEntrance` updates the path-bound location from the
+// current scene (manual saves only - the autosave must not silently rebind or unbind it).
+static void SavePathTo(const char* base, bool bindEntrance) {
     nlohmann::json arr = nlohmann::json::array();
     for (auto& k : sKeyframes) {
         arr.push_back({ { "time", k.time },
@@ -5183,9 +5381,7 @@ static void DrawCurveEditor() {
     }
     float vspan = (vmax > vmin) ? (vmax - vmin) : 1.0f;
     int activeN = keyCount(AL);
-    if (keySel >= activeN) {
-        keySel = -1;
-    }
+    PruneParamSel(); // drop selected param keys that no longer exist (deletes / loads)
 
     float graphH = ImGui::GetContentRegionAvail().y - 30.0f; // leave a row for the toolbar below
     if (graphH < 80.0f) {
@@ -5197,16 +5393,18 @@ static void DrawCurveEditor() {
     }
     ImVec2 p0 = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton("##curvegraph", size);
+    ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelY); // wheel zooms the graph instead of scrolling the window
     ImVec2 p1(p0.x + size.x, p0.y + size.y);
     ImDrawList* dl = ImGui::GetWindowDrawList();
     dl->AddRectFilled(p0, p1, IM_COL32(24, 24, 27, 255), 4.0f);
     dl->AddRect(p0, p1, IM_COL32(90, 90, 95, 255), 4.0f);
     float gx0 = p0.x + 6.0f, gx1 = p1.x - 6.0f, gy0 = p0.y + 8.0f, gy1 = p1.y - 8.0f;
-    auto timeToX = [&](float t) { return gx0 + (t / total) * (gx1 - gx0); };
+    auto timeToX = [&](float t) { return gx0 + ((t - vt0) / (vt1 - vt0)) * (gx1 - gx0); };
     auto xToTime = [&](float x) {
         float u = (x - gx0) / (gx1 - gx0);
-        return std::min(std::max(u, 0.0f), 1.0f) * total;
+        return vt0 + std::min(std::max(u, 0.0f), 1.0f) * (vt1 - vt0);
     };
+    dl->PushClipRect(p0, p1, true); // zoomed-out keys/curves must not paint past the graph frame
     auto valToY = [&](float v, float lo, float hi) {
         float sp = (hi > lo) ? (hi - lo) : 1.0f;
         float u = std::min(std::max((v - lo) / sp, 0.0f), 1.0f);
@@ -5285,8 +5483,7 @@ static void DrawCurveEditor() {
                 ImVec2 prev(xa, ya);
                 for (int sN = 1; sN <= sub; sN++) {
                     float tt = a.time + (b.time - a.time) * (float)sN / (float)sub;
-                    float vv;
-                    EvalParamTrack(*ct, tt, vv);
+                    float vv = EvalTrackSegment(*ct, (size_t)i, tt); // segment already known - no re-search
                     ImVec2 cur(timeToX(tt), valToY(vv, lo, hi));
                     dl->AddLine(prev, cur, col, w);
                     prev = cur;
@@ -5367,103 +5564,471 @@ static void DrawCurveEditor() {
         }
         return hit;
     };
-    if (ImGui::IsItemActivated()) {
-        int hit = nearestKey();
-        if (hit >= 0) {
-            keySel = hit;
-            drag = hit;
-            sDragLo = vmin; // snapshot the (still-live) range so this drag keeps a constant value-to-pixel scale
+
+    // Drag snapshot: the start time/value of every key being moved, so a multi-key drag stays rigid even as the
+    // track re-sorts under it. Keys are tracked by stable id (param) or camera id, not index.
+    static std::vector<int> sCdIds;
+    static std::vector<float> sCdT0, sCdV0;
+    static float sCdGrabT0 = 0.0f, sCdGrabV0 = 0.0f;
+    static bool sCdRipple = false;
+    static bool sHDrag = false; // dragging a Bezier handle endpoint
+    static int sHKeyId = -1;    // param key id whose handle is being dragged
+    static int sHWhich = 0;     // 0 = out handle, 1 = in handle
+
+    if (ImGui::IsItemActivated() && !sSpHot) { // a hovered/dragged Speed handle owns the click
+        // A Bezier handle grab takes priority over selecting/moving keys.
+        int hKey = -1, hWhich = 0;
+        float hBest = 10.0f;
+        for (const HandleHit& h : handles) {
+            float dxp = h.pos.x - mx, dyp = h.pos.y - my;
+            float dd = std::sqrt(dxp * dxp + dyp * dyp);
+            if (dd < hBest) {
+                hBest = dd;
+                hKey = h.keyId;
+                hWhich = h.which;
+            }
+        }
+        if (hKey >= 0) {
+            sHDrag = true;
+            sHKeyId = hKey;
+            sHWhich = hWhich;
+            if (io.KeyAlt) { // Alt breaks the pair apart; without it the two handles stay mirrored
+                int bi = ParamKeyIndexById(AL.track, hKey);
+                if (bi >= 0) {
+                    AL.track->keys[bi].brokenHandles = 1;
+                }
+            }
+            sDragLo = vmin; // freeze the value range so the handle's value-to-pixel scale stays constant
             sDragHi = vmax;
             sDragRange = true;
             PushUndo();
+            drag = -1;
         } else {
-            keySel = -1;
+            int hit = nearestKey();
+            if (hit < 0) {
+                if (!io.KeyCtrl) { // click on empty space clears the selection - curve keys AND camera
+                    ParamSelClear();
+                    sSelection.clear();
+                    sSelectedId = -1;
+                }
+                drag = -1;
+            } else if (io.KeyCtrl) { // Ctrl-click toggles this key in/out of the selection, no drag (matches the
+                                     // timeline)
+                ParamSelToggle(AL.track, keyIdAt(hit));
+                drag = -1;
+            } else {
+                if (!isSelIdx(hit)) { // clicking an unselected point selects only it; a selected one keeps the group
+                    ParamSelOnly(AL.track, keyIdAt(hit));
+                }
+                // Begin a drag of the whole selection (Shift ripples this key + all later ones).
+                PushUndo();
+                sDragLo = vmin;
+                sDragHi = vmax;
+                sDragRange = true;
+                sCdRipple = io.KeyShift;
+                sCdGrabT0 = keyTime(AL, hit);
+                sCdGrabV0 = keyValue(AL, hit);
+                sCdIds.clear();
+                sCdT0.clear();
+                sCdV0.clear();
+                for (int i = 0; i < activeN; i++) {
+                    bool take = sCdRipple ? (keyTime(AL, i) >= sCdGrabT0 - 1e-4f) : isSelIdx(i);
+                    if (take) {
+                        sCdIds.push_back(keyIdAt(i));
+                        sCdT0.push_back(keyTime(AL, i));
+                        sCdV0.push_back(keyValue(AL, i));
+                    }
+                }
+                drag = hit;
+            }
         }
     }
-    if (ImGui::IsItemActive() && drag >= 0 && drag < activeN) {
-        if (AL.isCam) {
-            CamChanSet(sKeyframes[drag], AL.camChan, yToValActive(my)); // time stays locked to the keyframe
+    // Bezier handle drag: move the grabbed in/out handle in (time, value), clamped so time stays inside the
+    // adjacent segment (keeps the curve a proper function of time).
+    if (ImGui::IsItemActive() && sHDrag) {
+        int idx = ParamKeyIndexById(AL.track, sHKeyId);
+        if (idx >= 0) {
+            CineParamKey& k = AL.track->keys[idx];
+            if (!k.hasHandles) {
+                SeedBezierHandles(k, *AL.track, idx);
+            }
+            float nt = xToTime(mx) - k.time;
+            float nv = yToValActive(my) - k.value;
+            if (sHWhich == 0) { // out handle: time in [0, next segment duration]
+                float segNext = (idx < activeN - 1) ? (AL.track->keys[idx + 1].time - k.time) : std::max(nt, 0.0f);
+                k.hOutT = std::min(std::max(nt, 0.0f), std::max(segNext, 0.0f));
+                k.hOutV = nv;
+            } else { // in handle: time in [-prev segment duration, 0]
+                float segPrev = (idx > 0) ? (k.time - AL.track->keys[idx - 1].time) : std::max(-nt, 0.0f);
+                k.hInT = std::max(std::min(nt, 0.0f), -std::max(segPrev, 0.0f));
+                k.hInV = nv;
+            }
+            // Unless the pair is broken (Alt-drag), the opposite handle mirrors this one's DIRECTION while
+            // keeping its own arm length - so the curve passes through the key smoothly, which is what you
+            // want almost every time. Alt while grabbing breaks the pair and each side moves alone.
+            if (!k.brokenHandles) {
+                float dt = (sHWhich == 0) ? k.hOutT : -k.hInT;
+                float dv = (sHWhich == 0) ? k.hOutV : -k.hInV;
+                float len = std::sqrt(dt * dt + dv * dv);
+                if (len > 1e-6f) {
+                    float oT = (sHWhich == 0) ? -k.hInT : k.hOutT;
+                    float oV = (sHWhich == 0) ? -k.hInV : k.hOutV;
+                    float oLen = std::sqrt(oT * oT + oV * oV);
+                    if (oLen < 1e-6f) {
+                        oLen = len;
+                    }
+                    float ux = dt / len * oLen, uy = dv / len * oLen;
+                    if (sHWhich == 0) { // mirror onto the in side
+                        float segPrev = (idx > 0) ? (k.time - AL.track->keys[idx - 1].time) : ux;
+                        k.hInT = -std::min(ux, std::max(segPrev, 0.0f));
+                        k.hInV = -uy;
+                    } else { // mirror onto the out side
+                        float segNext = (idx < activeN - 1) ? (AL.track->keys[idx + 1].time - k.time) : ux;
+                        k.hOutT = std::min(ux, std::max(segNext, 0.0f));
+                        k.hOutV = uy;
+                    }
+                }
+            }
+        }
+    }
+    if (ImGui::IsItemActive() && drag >= 0) {
+        float dtime = xToTime(mx) - sCdGrabT0;
+        float dval = yToValActive(my) - sCdGrabV0;
+        for (size_t k = 0; k < sCdIds.size(); k++) {
+            int idx = ParamKeyIndexById(AL.track, sCdIds[k]);
+            if (idx < 0) {
+                continue;
+            }
+            AL.track->keys[idx].time = std::min(std::max(sCdT0[k] + dtime, 0.0f), total);
+            if (!sCdRipple) { // ripple moves time only; a plain move also carries the value
+                AL.track->keys[idx].value = std::min(std::max(sCdV0[k] + dval, sDragLo), sDragHi);
+            }
+        }
+        std::sort(AL.track->keys.begin(), AL.track->keys.end(),
+                  [](const CineParamKey& a, const CineParamKey& b) { return a.time < b.time; });
+        // Live readout at the cursor - the grabbed key's exact numbers, no squinting at the graph.
+        if (sCdRipple) {
+            CineTooltip("ripple  %+.2fs", dtime);
         } else {
-            CineParamTrack* tr = AL.track;
-            float lo = (drag > 0) ? tr->keys[drag - 1].time + 1e-3f : 0.0f;
-            float hi = (drag < (int)tr->keys.size() - 1) ? tr->keys[drag + 1].time - 1e-3f : total;
-            tr->keys[drag].time = std::min(std::max(xToTime(mx), lo), hi);
-            tr->keys[drag].value = yToValActive(my);
+            CineTooltip("t %.2fs   v %.2f", std::min(std::max(sCdGrabT0 + dtime, 0.0f), total),
+                        std::min(std::max(sCdGrabV0 + dval, sDragLo), sDragHi));
         }
     }
     if (ImGui::IsItemDeactivated()) {
         drag = -1;
+        sHDrag = false;
         sDragRange = false;
     }
-    // Right-click deletes a key - parameter channels only (camera keyframes are deleted on the main timeline).
-    if (!AL.isCam && ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+    // Time-axis zoom (mouse wheel, centered on the cursor) and pan (middle-drag). Zooming right out snaps back
+    // to the full timeline.
+    if (ImGui::IsItemHovered() && io.MouseWheel != 0.0f && drag < 0 && !sHDrag) {
+        float mt = xToTime(mx);
+        float fz = std::pow(0.8f, io.MouseWheel); // wheel up = zoom in
+        float nt0 = mt - (mt - vt0) * fz;
+        float nt1 = mt + (vt1 - mt) * fz;
+        float minSpan = total * 0.02f;
+        if (nt1 - nt0 < minSpan) {
+            float c = (nt0 + nt1) * 0.5f;
+            nt0 = c - minSpan * 0.5f;
+            nt1 = c + minSpan * 0.5f;
+        }
+        nt0 = std::max(nt0, 0.0f);
+        nt1 = std::min(nt1, total);
+        if (nt1 - nt0 >= total * 0.999f) {
+            sCvT0 = 0.0f;
+            sCvT1 = -1.0f; // back to the full timeline
+        } else {
+            sCvT0 = nt0;
+            sCvT1 = nt1;
+        }
+    }
+    if (ImGui::IsItemHovered() && ImGui::IsMouseDown(ImGuiMouseButton_Middle) && sCvT1 > sCvT0) {
+        float dt = -io.MouseDelta.x * (vt1 - vt0) / std::max(gx1 - gx0, 1.0f);
+        dt = std::min(std::max(dt, -vt0), total - vt1); // keep the window inside the timeline
+        sCvT0 = vt0 + dt;
+        sCvT1 = vt1 + dt;
+    }
+    // Double-click empty graph space drops a key right there ("empty" also means clear of Bezier handle
+    // endpoints - those sit away from their key, and double-clicking one must stay a handle grab).
+    auto nearAnyHandle = [&]() {
+        for (const HandleHit& h : handles) {
+            float dxp = h.pos.x - mx, dyp = h.pos.y - my;
+            if (dxp * dxp + dyp * dyp < 100.0f) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (ImGui::IsItemHovered() && !sSpHot && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && nearestKey() < 0 &&
+        !nearAnyHandle()) {
+        PushUndo();
+        float nt = std::min(std::max(xToTime(mx), 0.0f), total);
+        float nv = std::min(std::max(yToValActive(my), vmin), vmax);
+        ParamSelOnly(AL.track, TrackAddKey(*AL.track, nt, nv));
+    }
+    // Right-click deletes: the whole selection when you right-click a selected point, otherwise just the one
+    // under the cursor. primIdx was computed BEFORE this erase, so it must be invalidated - the toolbar below
+    // would otherwise index past the shrunken key list (this was a crash).
+    if (ImGui::IsItemHovered() && !sSpHot && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
         int hit = nearestKey();
         if (hit >= 0) {
             PushUndo();
-            AL.track->keys.erase(AL.track->keys.begin() + hit);
-            keySel = -1;
+            if (isSelIdx(hit)) {
+                DeleteSelectedParamKeys();
+            } else {
+                AL.track->keys.erase(AL.track->keys.begin() + hit);
+                PruneParamSel();
+            }
+            primIdx = -1;
         }
     }
+    dl->PopClipRect();
 
-    // Toolbar. Parameter channels can add keys at the playhead and edit a selected key's interp / time / value /
-    // delete. Camera channels are value-only here (their timing and existence live on the main timeline).
-    if (!AL.isCam) {
+    // Toolbar: add keys at the playhead, delete the selection, zoom reset, and edit the primary key.
+    {
         if (ImGui::SmallButton("Add key at playhead")) {
             float v;
             if (!EvalParamTrack(*AL.track, sPlayhead, v)) {
                 v = (vmin + vmax) * 0.5f;
             }
             PushUndo();
-            TrackAddKey(*AL.track, sPlayhead, v);
+            ParamSelOnly(AL.track, TrackAddKey(*AL.track, sPlayhead, v)); // select the new key
         }
         ImGui::SameLine();
-    }
-    if (keySel >= 0 && keySel < activeN) {
-        if (AL.isCam) {
-            ImGui::Text("%s  key %d", AL.name, keySel + 1);
-            ImGui::SameLine();
-            float kv = keyValue(AL, keySel);
-            ImGui::SetNextItemWidth(90.0f);
-            if (ImGui::InputFloat("val##cck", &kv, 0.0f, 0.0f, "%.3f")) {
-                CamChanSet(sKeyframes[keySel], AL.camChan, kv);
-            }
-            ImGui::SameLine();
-            ImGui::TextDisabled("t=%.2f (locked - retime on the timeline)", keyTime(AL, keySel));
-        } else {
-            CineParamTrack* tr = AL.track;
-            const char* im[] = { "Step", "Linear", "Smooth" };
-            int mode = (tr->keys[keySel].interp < 0) ? tr->interp : tr->keys[keySel].interp;
-            ImGui::SetNextItemWidth(90.0f);
-            if (ImGui::Combo("##ckinterp", &mode, im, 3)) {
-                tr->keys[keySel].interp = mode; // per-key spline type for the segment leaving this key
+        if (sCvT1 > sCvT0) {
+            if (ImGui::SmallButton("Fit##cvzoom")) {
+                sCvT0 = 0.0f;
+                sCvT1 = -1.0f;
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Spline type for the segment after this key: Step / Linear / Smooth.");
+                CineTooltip("Reset the time zoom to the whole timeline (wheel = zoom, middle-drag = pan).");
             }
             ImGui::SameLine();
-            float kt = tr->keys[keySel].time, kv = tr->keys[keySel].value;
-            float lo = (keySel > 0) ? tr->keys[keySel - 1].time + 1e-3f : 0.0f;
-            float hi = (keySel < (int)tr->keys.size() - 1) ? tr->keys[keySel + 1].time - 1e-3f : total;
+        }
+        int nsel = ParamSelCountInTrack(AL.track);
+        if (nsel > 1) {
+            ImGui::Text("%d selected", nsel);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Delete sel")) {
+                PushUndo();
+                DeleteSelectedParamKeys();
+                primIdx = -1; // computed before the erase - stale (same crash as the right-click delete)
+            }
+            ImGui::SameLine();
+        }
+    }
+    // Bound against the LIVE key list, not the activeN captured before this frame's deletes.
+    if (primIdx >= 0 && primIdx < (int)AL.track->keys.size()) {
+        {
+            CineParamTrack* tr = AL.track;
+            const char* im[] = { "Step", "Linear", "Smooth", "Bezier" };
+            int mode = (tr->keys[primIdx].interp < 0) ? tr->interp : tr->keys[primIdx].interp;
+            // Set a key's interp, seeding default handles when switching to Bezier so the shape doesn't jump.
+            auto applyMode = [&](int idx, int m) {
+                tr->keys[idx].interp = m;
+                if (m == CINE_TRACK_BEZIER && !tr->keys[idx].hasHandles) {
+                    SeedBezierHandles(tr->keys[idx], *tr, idx);
+                }
+            };
+            ImGui::SetNextItemWidth(90.0f);
+            if (ImGui::Combo("##ckinterp", &mode, im, 4)) {
+                PushUndo(); // interp changes are undoable like any other key edit
+                // apply the per-key spline type to every selected key in this track (or just the primary)
+                if (ParamSelCountInTrack(tr) > 1) {
+                    for (const ParamKeyRef& r : sParamSel) {
+                        if (r.track == tr) {
+                            int idx = ParamKeyIndexById(tr, r.id);
+                            if (idx >= 0) {
+                                applyMode(idx, mode);
+                            }
+                        }
+                    }
+                } else {
+                    applyMode(primIdx, mode);
+                }
+            }
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("Spline type for the segment after this key: Step / Linear / Smooth / Bezier. "
+                            "Bezier shows draggable tangent handles on the selected key. Applies to all "
+                            "selected keys in this channel.");
+            }
+            ImGui::SameLine();
+            float kt = tr->keys[primIdx].time, kv = tr->keys[primIdx].value;
+            float lo = (primIdx > 0) ? tr->keys[primIdx - 1].time + 1e-3f : 0.0f;
+            float hi = (primIdx < (int)tr->keys.size() - 1) ? tr->keys[primIdx + 1].time - 1e-3f : total;
             ImGui::SetNextItemWidth(70.0f);
-            if (ImGui::InputFloat("t##ck", &kt, 0.0f, 0.0f, "%.2f")) {
-                tr->keys[keySel].time = std::min(std::max(kt, lo), hi);
+            bool ktCh = ImGui::InputFloat("t##ck", &kt, 0.0f, 0.0f, "%.2f");
+            if (ImGui::IsItemActivated()) {
+                PushUndo(); // snapshot pre-edit so the whole typed edit is one undo step (inspector convention)
+            }
+            if (ktCh) {
+                tr->keys[primIdx].time = std::min(std::max(kt, lo), hi);
             }
             ImGui::SameLine();
             ImGui::SetNextItemWidth(80.0f);
-            if (ImGui::InputFloat("val##ck", &kv, 0.0f, 0.0f, "%.2f")) {
-                tr->keys[keySel].value = std::min(std::max(kv, vmin), vmax);
+            bool kvCh = ImGui::InputFloat("val##ck", &kv, 0.0f, 0.0f, "%.2f");
+            if (ImGui::IsItemActivated()) {
+                PushUndo();
+            }
+            if (kvCh) {
+                tr->keys[primIdx].value = std::min(std::max(kv, vmin), vmax);
             }
             ImGui::SameLine();
             if (ImGui::SmallButton("Delete##ck")) {
                 PushUndo();
-                tr->keys.erase(tr->keys.begin() + keySel);
-                keySel = -1;
+                tr->keys.erase(tr->keys.begin() + primIdx);
+                PruneParamSel();
             }
         }
     } else {
-        ImGui::TextDisabled("%s", AL.isCam ? "click point = select, drag = move value (time locked to keyframe)"
-                                           : "click point = select, drag = move value/time, right-click = delete");
+        ImGui::PushTextWrapPos(0.0f);
+        CineHint("click = select, Ctrl+click = multi, drag = move, Shift+drag = ripple, right-click / "
+                 "double-click = delete / add. Wheel = zoom, middle-drag = pan. Set a key to Bezier to "
+                 "drag its tangent handles.");
+        ImGui::PopTextWrapPos();
     }
+}
+
+// Keyboard shortcuts (active while the editor window - full or bar - is focused and not typing into a field).
+static void HandleEditorShortcuts() {
+    if (!ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) || ImGui::GetIO().WantTextInput) {
+        return;
+    }
+    ImGuiIO& io = ImGui::GetIO();
+    auto goTo = [&](float t) {
+        sPlayhead = std::min(std::max(t, 0.0f), EffectiveTotal());
+        sPreview = true;
+        CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
+    };
+    auto selectAdjacent = [&](int dir) {
+        if (sIds.empty()) {
+            return;
+        }
+        int idx = SelectedIndex();
+        idx = (idx < 0) ? 0 : std::min(std::max(idx + dir, 0), (int)sIds.size() - 1);
+        SelectOnly(sIds[idx]);
+        goTo(sKeyframes[idx].time); // jump the playhead to it so the camera frames the selection
+    };
+    if (ImGui::IsKeyPressed(ImGuiKey_Space)) {
+        TogglePlay();
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Comma)) {
+        goTo(sPlayhead - kTickSeconds);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Period)) {
+        goTo(sPlayhead + kTickSeconds);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket)) {
+        selectAdjacent(-1);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_RightBracket)) {
+        selectAdjacent(1);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_K) && FreeCamEnabled()) {
+        AddKeyframe();
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Delete)) {
+        PruneParamSel();          // stale refs (keys removed while the curve editor was collapsed) must not eat the Del
+        if (!sParamSel.empty()) { // parameter keys first: if any are selected in the curve editor, Del means those
+            PushUndo();
+            DeleteSelectedParamKeys();
+        } else if (SelectedIndex() >= 0) {
+            DeleteSelected();
+        }
+    }
+    // (No Esc shortcut: Esc is the game's menu key, so it can't double as clear-selection. Clicking empty
+    // timeline/graph space clears instead.)
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A)) { // select every camera keyframe (group drags/ripples)
+        sSelection.assign(sIds.begin(), sIds.end());
+        if (!sIds.empty() && SelectedIndex() < 0) {
+            sSelectedId = sIds[0];
+        }
+    }
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z)) {
+        Undo();
+    }
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y)) {
+        Redo();
+    }
+}
+
+// The compact "shooting bar": one slim transport strip replacing the whole editor while flying/framing on a
+// single monitor. The world overlay (spline, markers, gizmos) and every keyboard shortcut stay active - this is
+// the mode you LIVE in; expand back to the full editor for curve / parameter / file work.
+static void DrawShootingBar() {
+    if (ImGui::SmallButton("Expand")) {
+        ExitBarMode();
+    }
+    if (ImGui::IsItemHovered()) {
+        CineTooltip("Back to the full editor (timeline, curves, parameters, files).");
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(sKeyframes.size() < 2);
+    if (ImGui::SmallButton(sPlaying ? "Stop" : "Play")) {
+        TogglePlay();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    float total = EffectiveTotal();
+    auto scrubTo = [&](float t) {
+        sPlayhead = std::min(std::max(t, 0.0f), total);
+        sPreview = true;
+        CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
+    };
+    if (ImGui::SmallButton("|<")) {
+        float best = 0.0f;
+        for (const CineKeyframe& k : sKeyframes) {
+            if (k.time < sPlayhead - 1e-3f && k.time > best) {
+                best = k.time;
+            }
+        }
+        scrubTo(best);
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(std::max(ImGui::GetContentRegionAvail().x - 250.0f, 120.0f));
+    float ph = sPlayhead;
+    if (ImGui::SliderFloat("##barscrub", &ph, 0.0f, std::max(total, 0.01f), "%.2fs",
+                           ImGuiSliderFlags_NoRoundToFormat)) {
+        scrubTo(ph);
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton(">|")) {
+        float best = total;
+        for (const CineKeyframe& k : sKeyframes) {
+            if (k.time > sPlayhead + 1e-3f && k.time < best) {
+                best = k.time;
+            }
+        }
+        scrubTo(best);
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!FreeCamEnabled());
+    if (ImGui::SmallButton("+KF")) {
+        AddKeyframe();
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered()) {
+        CineTooltip("Add a keyframe at the current camera pose (K).");
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(SelectedIndex() < 0 || !FreeCamEnabled());
+    if (ImGui::SmallButton("Upd")) {
+        UpdateSelected();
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered()) {
+        CineTooltip("Update the selected keyframe to the current camera pose.");
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(sUndo.empty());
+    if (ImGui::SmallButton("Undo")) {
+        Undo();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImVec4 col = sPlaying ? ImVec4(0.4f, 1.0f, 0.5f, 1.0f)
+                          : (sPreview ? ImVec4(1.0f, 0.85f, 0.3f, 1.0f) : ImVec4(0.7f, 0.7f, 0.7f, 1.0f));
+    ImGui::TextColored(col, "%d kf", (int)sKeyframes.size());
 }
 
 void CinematicCamPathWindow::DrawElement() {
@@ -5485,6 +6050,50 @@ void CinematicCamPathWindow::DrawElement() {
         sLastDrawAtUpdate = sUpdateCalls;
     }
     sDrawCalls++;
+
+    // Shooting bar: remember the state to return to while in the full editor, and render the bar instead of
+    // everything else when collapsed. The capture must NOT run during the expand transition (sBarSizeFrames /
+    // sPendingDock still active) - on the first expanded frame the window still has the bar's size, and saving
+    // that would make the restore a no-op (the window would stay bar-sized forever).
+    if (!sBarMode && sBarSizeFrames == 0 && sPendingDock == 0) {
+        sSavedDockId = (unsigned int)ImGui::GetWindowDockID();
+        if (!ImGui::IsWindowDocked()) {
+            ImVec2 ws = ImGui::GetWindowSize();
+            sSavedSize[0] = ws.x;
+            sSavedSize[1] = ws.y;
+        }
+    }
+    if (sBarMode) {
+        if (sBarSizeFrames > 0) { // shrink to a slim strip (width fixed, height auto-fit)
+            ImGui::SetWindowSize(ImVec2(660.0f, 0.0f));
+            sBarSizeFrames--;
+        }
+        DrawShootingBar();
+        if (sShowPath) { // the world overlay + gizmos are the whole point of shooting mode
+            HandleOverlayInput();
+            double ovT0 = sPerfOn ? CineNowMs() : 0.0;
+            DrawWorldOverlay();
+            if (sPerfOn) {
+                sPerfOverlayMs = CineNowMs() - ovT0;
+            }
+        } else if (sPerfOn) {
+            sPerfOverlayMs = 0.0;
+        }
+        HandleEditorShortcuts();
+        if (sPerfOn) {
+            sPerfDrawMs = CineNowMs() - cinePerfT0;
+        }
+        return;
+    }
+    if (sBarSizeFrames > 0) { // just expanded: restore the saved size unless a dock took over the sizing
+        // (re-docking is attempted in UpdateElement; if the old dock node no longer exists - it is destroyed
+        // when its last window undocks - the window stays floating and gets its saved floating size back).
+        if (!ImGui::IsWindowDocked()) {
+            ImGui::SetWindowSize(ImVec2(sSavedSize[0], sSavedSize[1]));
+        }
+        sBarSizeFrames--;
+    }
+
     // Status strip: always shows the current mode at a glance.
     {
         char st[96];
@@ -5522,10 +6131,12 @@ void CinematicCamPathWindow::DrawElement() {
         ImGui::TextUnformatted("Boost = RB, Precision = L, Ascend = R, Descend = Z, FOV = D-pad up/down, "
                                "Roll = D-pad left/right.");
         ImGui::Unindent();
-        ImGui::BulletText("Timeline: drag a marker to move; Ctrl+click = multi-select; Shift+drag = ripple "
-                          "(push this + later). -/+/Fit zoom the ruler.");
+        ImGui::BulletText("Timeline: drag a marker to move; Ctrl+click = multi-select; Ctrl+Shift+click = "
+                          "select range; Shift+drag = ripple (push this + later); Alt+drag a selection's end "
+                          "= compress/expand it. -/+/Fit zoom the ruler.");
         ImGui::BulletText("Keyboard (this window focused): Space = play/stop, , / . = step a tick, "
-                          "[ / ] = prev/next keyframe, K = add keyframe, Del = delete, Ctrl+Z / Ctrl+Y = undo/redo.");
+                          "[ / ] = prev/next keyframe, K = add keyframe, Del = delete (curve-editor keys first), "
+                          "Ctrl+A = select all, Ctrl+Z / Ctrl+Y = undo/redo.");
     }
     ImGui::Separator();
 
@@ -5604,66 +6215,7 @@ void CinematicCamPathWindow::DrawElement() {
         sPerfOverlayMs = 0.0;
     }
 
-    // Keyboard shortcuts (only while this window is focused and not typing into a field).
-    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !ImGui::GetIO().WantTextInput) {
-        ImGuiIO& io = ImGui::GetIO();
-        auto goTo = [&](float t) {
-            sPlayhead = std::min(std::max(t, 0.0f), EffectiveTotal());
-            sPreview = true;
-            CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
-        };
-        auto selectAdjacent = [&](int dir) {
-            if (sIds.empty()) {
-                return;
-            }
-            int idx = SelectedIndex();
-            idx = (idx < 0) ? 0 : std::min(std::max(idx + dir, 0), (int)sIds.size() - 1);
-            SelectOnly(sIds[idx]);
-            goTo(sKeyframes[idx].time); // jump the playhead to it so the camera frames the selection
-        };
-        if (ImGui::IsKeyPressed(ImGuiKey_Space) && sKeyframes.size() >= 2) {
-            if (sPlaying) {
-                sPlaying = false;
-            } else {
-                float pt = EffectiveTotal();
-                if (sPlayhead >= pt) {
-                    sPlayhead = 0.0f;
-                }
-                sPlayU = InvertEasedProgress((pt > 0.0f) ? (sPlayhead / pt) : 0.0f); // resume exactly at playhead
-                sPlayDir = 1;
-                if (sPlayhead == 0.0f && CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.SyncIdleAnim"), 0)) {
-                    CinematicCam_SyncLinkIdleAnim(); // anchor Link's idle anim when starting from the top
-                }
-                sPlaying = true;
-                sPreview = false;
-                CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
-            }
-        }
-        if (ImGui::IsKeyPressed(ImGuiKey_Comma)) {
-            goTo(sPlayhead - kTickSeconds);
-        }
-        if (ImGui::IsKeyPressed(ImGuiKey_Period)) {
-            goTo(sPlayhead + kTickSeconds);
-        }
-        if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket)) {
-            selectAdjacent(-1);
-        }
-        if (ImGui::IsKeyPressed(ImGuiKey_RightBracket)) {
-            selectAdjacent(1);
-        }
-        if (ImGui::IsKeyPressed(ImGuiKey_K) && enabled) {
-            AddKeyframe();
-        }
-        if (ImGui::IsKeyPressed(ImGuiKey_Delete) && SelectedIndex() >= 0) {
-            DeleteSelected();
-        }
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z)) {
-            Undo();
-        }
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y)) {
-            Redo();
-        }
-    }
+    HandleEditorShortcuts();
 
     // Phase 1 layout: a left controls column, a right column (inspector + playback + library), and the dope-sheet
     // timeline pinned across the bottom. Sized from the remaining space so the timeline always stays in view.
@@ -5680,7 +6232,20 @@ void CinematicCamPathWindow::DrawElement() {
     // The earlier estimate under-budgeted the header, so the bottom child scrolled and clipped it behind the edge.
     float cineTimelineH = (15.0f + 22.0f * cineLanes + 6.0f) + 80.0f; // dope-sheet canvas + toolbar + hint row
     float cineHeaderH = 34.0f;                                        // separator + "Curve editor" header + spacing
-    float cineCurveH = 280.0f;                                        // chips + legend + adaptive graph + toolbar
+    // With no curve to show (no continuous track enabled) the open editor is just the camera key-row + a hint,
+    // so only reserve that much instead of leaving a large empty region.
+    bool cineHaveCurves = false;
+    for (const TrackDef& d : AllTrackDefs()) {
+        if (d.continuous && d.track->enabled) {
+            cineHaveCurves = true;
+            break;
+        }
+    }
+    // key row + legend + adaptive graph + toolbar (84 = row + hint when there is no curve). With no curve but
+    // the speed graph on, the standalone graph needs its own slice budgeted or the bottom region scrolls and
+    // the timeline and the graph can't be on screen at the same time.
+    bool cineSpeedGraph = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.SpeedGraph"), 0) != 0;
+    float cineCurveH = cineHaveCurves ? 280.0f : (cineSpeedGraph ? 84.0f + 158.0f : 84.0f);
     float cineWantBottom = cineTimelineH + cineHeaderH + (sCurveEditorOpen ? cineCurveH : 0.0f);
     float cineMinTop = 160.0f;
     // Give the bottom exactly what it wants; only when the window is too short to fit both do we cap the top at its

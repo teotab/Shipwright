@@ -91,6 +91,7 @@ enum CineTrackInterp {
     CINE_TRACK_STEP = 0,   // hold the value until the next key (discrete params: green screen, toggles, enums)
     CINE_TRACK_LINEAR = 1, // straight line to the next key
     CINE_TRACK_SMOOTH = 2, // auto-smoothed (Catmull-Rom) curve through the neighbors
+    CINE_TRACK_BEZIER = 3, // hand-shaped cubic Bezier using this key's out-handle and the next key's in-handle
 };
 
 // One key on a parameter track.
@@ -98,6 +99,16 @@ struct CineParamKey {
     float time;  // seconds on the timeline
     float value; // parameter value (discrete params store an integer cast to float)
     int interp;  // CineTrackInterp for the segment leaving this key (-1 = use the track's default)
+    int id;      // runtime-only stable id for multi-selection (survives re-sorting; not saved). 0 = unassigned
+
+    // Bezier tangent handles, offsets from the key in (time, value) space. The OUT handle shapes the segment
+    // leaving this key (toward the next, hOutT >= 0); the IN handle shapes the segment arriving at it (toward the
+    // previous, hInT <= 0). Only used when the relevant segment's interp is CINE_TRACK_BEZIER.
+    float hOutT, hOutV;
+    float hInT, hInV;
+    int hasHandles;    // 0 = derive default (auto-smooth) handles, 1 = explicit handles set by the user
+    int brokenHandles; // 0 = the two handles mirror each other (smooth through the key); 1 = independent
+                       // (set by Alt-dragging a handle), so the curve can corner here
 };
 
 // Editor window for building and playing back cinematic camera paths.
