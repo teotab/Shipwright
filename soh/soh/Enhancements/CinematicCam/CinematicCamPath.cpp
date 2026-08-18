@@ -3767,7 +3767,7 @@ static bool DrawActorPicker(CineActorInfo* out) {
         }
     }
     ImGui::InputTextWithHint("##actorfilter", "filter by name...", filter, sizeof(filter));
-    ImGui::TextDisabled("List frozen while open - press Refresh to re-read positions.");
+    CineHint("List frozen while open - press Refresh to re-read positions.");
 
     bool picked = false;
     ImGui::BeginChild("##actorlist", ImVec2(390, 320), true);
@@ -3802,9 +3802,13 @@ static void DrawTimeline() {
     // Interaction state (persists across frames). Declared up top so the view-duration logic can tell whether
     // an edit is in progress and avoid rescaling the ruler mid-drag.
     static bool sTlScrub = false;
-    static int sTlDragMode = 0;          // 0 none, 1 move selection, 2 ripple (this kf + everything after)
+    // 0 none, 1 move selection, 2 ripple (this kf + everything after), 3 scale selection
+    static int sTlDragMode = 0;
+    static float sTlPressX = 0.0f;       // screen x at press, for the shift click-vs-drag test
+    static bool sTlClickClear = false;   // pressed empty space: clear the selection IF this stays a click
     static float sTlGrabTime0 = 0.0f;    // timeline time under the cursor when the drag began
-    static float sTlGrabbedT0 = 0.0f;    // original time of the grabbed marker (ripple threshold)
+    static float sTlGrabbedT0 = 0.0f;    // original time of the grabbed marker (ripple threshold / scale end)
+    static float sTlScaleAnchorT = 0.0f; // scale drag: time of the selection's OPPOSITE end (the fixed point)
     static std::vector<int> sTlDragIds;  // snapshot of all ids at drag start...
     static std::vector<float> sTlDragT0; // ...and their original times
     static bool sTlNoDrag = false;       // true for a ctrl-click (toggle select, don't move)
@@ -3989,7 +3993,8 @@ static void DrawTimeline() {
     dl->AddTriangleFilled(ImVec2(px - 5.0f, rulerY1 + 1.0f), ImVec2(px + 5.0f, rulerY1 + 1.0f),
                           ImVec2(px, rulerY1 + 9.0f), IM_COL32(60, 255, 90, 255));
 
-    // Interaction: in the Camera lane, click/drag markers (ctrl-click multi-select, shift-drag ripple). In an
+    // Interaction: in the Camera lane, click/drag markers (ctrl-click multi-select, shift-click range select,
+    // shift-drag ripple, alt-drag an end of the selection to compress/expand it). In an
     // automation lane, drag a key to retime it (clamped between its neighbors so order stays stable). Empty lane
     // space or the ruler scrubs the playhead. Clicks in the header column are ignored.
     ImGuiIO& io = ImGui::GetIO();
@@ -4022,17 +4027,9 @@ static void DrawTimeline() {
             }
             if (hit >= 0) {
                 int hitId = sIds[hit];
-                if (io.KeyCtrl) {
-                    ToggleSelect(hitId); // add/remove from the multi-selection, no drag
-                    sTlNoDrag = true;
-                } else {
-                    if (!IsSelected(hitId)) {
-                        SelectOnly(hitId); // clicking an unselected marker selects just it
-                    } else {
-                        sSelectedId = hitId; // keep the group, make this the primary
-                    }
+                auto beginDrag = [&](int mode) {
                     PushUndo();
-                    sTlDragMode = io.KeyShift ? 2 : 1;
+                    sTlDragMode = mode;
                     sTlGrabTime0 = xToTime(mx);
                     sTlGrabbedT0 = sKeyframes[hit].time;
                     sTlDragIds = sIds;
@@ -4040,8 +4037,71 @@ static void DrawTimeline() {
                     for (int i = 0; i < n; i++) {
                         sTlDragT0[i] = sKeyframes[i].time;
                     }
+                };
+                if (io.KeyShift && io.KeyCtrl) {
+                    // Ctrl+Shift+click: select every keyframe between the primary and this one. (Range select
+                    // lives here, NOT on plain shift, so shift+drag stays the pure ripple it always was.)
+                    int anchor = -1;
+                    for (int i = 0; i < n; i++) {
+                        if (sIds[i] == sSelectedId) {
+                            anchor = i;
+                            break;
+                        }
+                    }
+                    if (anchor < 0) {
+                        SelectOnly(hitId);
+                    } else {
+                        for (int i = std::min(anchor, hit); i <= std::max(anchor, hit); i++) {
+                            if (!IsSelected(sIds[i])) {
+                                sSelection.push_back(sIds[i]);
+                            }
+                        } // the primary stays the anchor, so further clicks extend from the same spot
+                    }
+                    sTlNoDrag = true;
+                } else if (io.KeyShift) {
+                    if (!IsSelected(hitId)) {
+                        SelectOnly(hitId);
+                    } else {
+                        sSelectedId = hitId;
+                    }
+                    beginDrag(2); // ripple: this keyframe and everything after it, immediately
+                } else if (io.KeyCtrl) {
+                    ToggleSelect(hitId); // add/remove from the multi-selection, no drag
+                    sTlNoDrag = true;
+                } else if (io.KeyAlt && IsSelected(hitId) && SelectionCount() >= 2) {
+                    // Alt-drag on the FIRST or LAST selected keyframe: compress/expand the selection about its
+                    // opposite end (the group's internal rhythm is preserved; only its total duration changes).
+                    float tMin = 1e30f, tMax = -1e30f;
+                    for (int i = 0; i < n; i++) {
+                        if (IsSelected(sIds[i])) {
+                            tMin = std::min(tMin, sKeyframes[i].time);
+                            tMax = std::max(tMax, sKeyframes[i].time);
+                        }
+                    }
+                    float tHit = sKeyframes[hit].time;
+                    bool atMin = std::fabs(tHit - tMin) < 1e-4f;
+                    bool atMax = std::fabs(tHit - tMax) < 1e-4f;
+                    if ((atMin || atMax) && tMax - tMin > 1e-3f) {
+                        sSelectedId = hitId;
+                        sTlScaleAnchorT = atMax ? tMin : tMax;
+                        beginDrag(3);
+                    } else {
+                        sSelectedId = hitId; // alt on a middle key: plain group move
+                        beginDrag(1);
+                    }
+                } else {
+                    if (!IsSelected(hitId)) {
+                        SelectOnly(hitId); // clicking an unselected marker selects just it
+                    } else {
+                        sSelectedId = hitId; // keep the group, make this the primary
+                    }
+                    beginDrag(1);
                 }
             } else {
+                if (!io.KeyCtrl && !io.KeyShift) { // a CLICK on empty space clears; a scrub drag must not
+                    sTlClickClear = true;
+                    sTlPressX = mx;
+                }
                 sTlScrub = true;
                 sPreview = true;
                 CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
@@ -4062,18 +4122,56 @@ static void DrawTimeline() {
                 sTlTrackDrag = lane - 1;
                 sTlKeyDrag = hit;
             } else {
+                if (!io.KeyCtrl && !io.KeyShift) {
+                    sTlClickClear = true;
+                    sTlPressX = mx;
+                }
                 sTlScrub = true;
                 sPreview = true;
                 CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
             }
         } else if (lane == -1) {
-            sTlScrub = true; // ruler / empty area below the lanes
+            if (!io.KeyCtrl && !io.KeyShift) { // ruler / empty area below the lanes also clears
+                sTlClickClear = true;
+                sTlPressX = mx;
+            }
+            sTlScrub = true;
             sPreview = true;
             CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
         }
     }
     if (ImGui::IsItemActive()) {
-        if (sTlDragMode != 0) {
+        if (sTlDragMode == 3) {
+            // Scale the selection about its fixed end: the grabbed end follows the cursor, every selected
+            // keyframe keeps its relative position within the group.
+            // Delta-based like the move modes: the hit test accepts clicks up to 8px off the marker, so mapping
+            // the end key straight to the cursor's absolute time would snap the group on the first drag frame.
+            float endT = sTlGrabbedT0 + (xToTime(mx) - sTlGrabTime0);
+            float denom = sTlGrabbedT0 - sTlScaleAnchorT;
+            float scale = (std::fabs(denom) > 1e-4f) ? (endT - sTlScaleAnchorT) / denom : 1.0f;
+            scale = std::min(std::max(scale, 0.02f), 50.0f); // no collapsing to a point, no flipping past the anchor
+            // Cap the scale so no key would land before t=0 - clamping keys individually would pile them up at
+            // 0 and silently destroy the group's internal ratios.
+            for (size_t s = 0; s < sTlDragIds.size(); s++) {
+                float off = sTlDragT0[s] - sTlScaleAnchorT;
+                if (IsSelected(sTlDragIds[s]) && off < -1e-6f) {
+                    scale = std::min(scale, sTlScaleAnchorT / -off);
+                }
+            }
+            for (size_t s = 0; s < sTlDragIds.size(); s++) {
+                if (!IsSelected(sTlDragIds[s])) {
+                    continue;
+                }
+                float nt = std::max(sTlScaleAnchorT + (sTlDragT0[s] - sTlScaleAnchorT) * scale, 0.0f);
+                for (int i = 0; i < (int)sIds.size(); i++) {
+                    if (sIds[i] == sTlDragIds[s]) {
+                        sKeyframes[i].time = nt;
+                        break;
+                    }
+                }
+            }
+            SortByTime();
+        } else if (sTlDragMode != 0) {
             float delta = xToTime(mx) - sTlGrabTime0;
             for (size_t s = 0; s < sTlDragIds.size(); s++) {
                 bool affected = (sTlDragMode == 2) ? (sTlDragT0[s] >= sTlGrabbedT0 - 1e-4f) : IsSelected(sTlDragIds[s]);
@@ -4112,6 +4210,12 @@ static void DrawTimeline() {
         }
     }
     if (ImGui::IsItemDeactivated()) {
+        // Empty-space press: only a real CLICK clears the selection - scrubbing the playhead must keep it.
+        if (sTlClickClear && std::fabs(mx - sTlPressX) < 4.0f) {
+            sSelection.clear();
+            sSelectedId = -1;
+        }
+        sTlClickClear = false;
         sTlDragMode = 0;
         sTlScrub = false;
         sTlNoDrag = false;
@@ -4127,7 +4231,7 @@ static void DrawTimeline() {
         sTlViewDur *= 1.35f;
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Zoom out (show more time)");
+        CineTooltip("Zoom out (show more time)");
     }
     ImGui::SameLine();
     if (ImGui::SmallButton("+##tlzoom")) {
@@ -4135,17 +4239,17 @@ static void DrawTimeline() {
         sTlViewDur /= 1.35f;
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Zoom in (more precise dragging)");
+        CineTooltip("Zoom in (more precise dragging)");
     }
     ImGui::SameLine();
     if (ImGui::SmallButton("Fit")) {
         sTlAutoFit = true;
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Auto-fit the ruler to the path length");
+        CineTooltip("Auto-fit the ruler to the path length");
     }
     ImGui::SameLine();
-    ImGui::TextDisabled("|");
+    CineHint("|");
     ImGui::SameLine();
 
     // Step controls: prev keyframe, -1 tick, +1 tick, next keyframe.
@@ -4170,21 +4274,21 @@ static void DrawTimeline() {
         setPlayhead(best);
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Jump to the previous keyframe");
+        CineTooltip("Jump to the previous keyframe");
     }
     ImGui::SameLine();
     if (ImGui::SmallButton("< tick")) {
         setPlayhead(sPlayhead - kTickSeconds);
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Step back one tick (1/20 s)");
+        CineTooltip("Step back one tick (1/20 s)");
     }
     ImGui::SameLine();
     if (ImGui::SmallButton("tick >")) {
         setPlayhead(sPlayhead + kTickSeconds);
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Step forward one tick (1/20 s)");
+        CineTooltip("Step forward one tick (1/20 s)");
     }
     ImGui::SameLine();
     if (ImGui::SmallButton(">|")) {
@@ -4197,15 +4301,18 @@ static void DrawTimeline() {
         setPlayhead(best);
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Jump to the next keyframe");
+        CineTooltip("Jump to the next keyframe");
     }
     ImGui::SameLine();
     ImGui::Text("%.2fs / %.2fs%s", sPlayhead, total, sLoop ? " (loop)" : "");
     if (SelectionCount() > 1) {
-        ImGui::TextDisabled("%d keyframes selected - drag any to move them together.", SelectionCount());
+        CineHint("%d keyframes selected - drag any to move them together, Alt-drag the first/last to "
+                 "compress or expand the group.",
+                 SelectionCount());
     } else {
-        ImGui::TextDisabled("Camera: drag = move, Ctrl+click = multi-select, Shift+drag = ripple. Track keys: drag to "
-                            "retime (add/remove via each parameter's keyframe button or the curve editor).");
+        CineHint("Camera: drag = move, Ctrl+click = multi-select, Ctrl+Shift+click = select range, "
+                 "Shift+drag = ripple. Track keys: drag to retime (add/remove via each parameter's keyframe "
+                 "button or the curve editor).");
     }
 }
 
@@ -4245,9 +4352,9 @@ static bool DrawParamKeyNav(CineParamTrack& t, float value) {
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.26f, 0.66f, 0.40f, 1.0f));
     }
     if (ImGui::SmallButton(wasEnabled ? "Key on" : "Key")) {
+        PushUndo(); // the enabled flag is part of the undo state (snapshotted with the keys)
         t.enabled = !t.enabled;
         if (t.enabled && t.keys.empty()) {
-            PushUndo();
             TrackAddKey(t, sPlayhead, value); // seed a key so it holds the current value
         }
     }
@@ -4255,7 +4362,7 @@ static bool DrawParamKeyNav(CineParamTrack& t, float value) {
         ImGui::PopStyleColor(2);
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Keyframe this parameter (animate it over the timeline).");
+        CineTooltip("Keyframe this parameter (animate it over the timeline).");
     }
     if (!t.enabled) {
         ImGui::PopID();
@@ -4292,7 +4399,7 @@ static bool DrawParamKeyNav(CineParamTrack& t, float value) {
         }
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip(atIdx >= 0 ? "Remove keyframe at playhead" : "Add keyframe at playhead");
+        CineTooltip(atIdx >= 0 ? "Remove keyframe at playhead" : "Add keyframe at playhead");
     }
     ImGui::SameLine();
     ImGui::BeginDisabled(nextT > 1e8f);
@@ -4336,8 +4443,8 @@ static void DrawTargetKeyNav() {
         ImGui::PopStyleColor(2);
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Keyframe the target position (animate it over the timeline); edit per-axis in the Curve "
-                          "editor.");
+        CineTooltip("Keyframe the target position (animate it over the timeline); edit per-axis in the Curve "
+                    "editor.");
     }
     if (!on) {
         ImGui::PopID();
