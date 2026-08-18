@@ -1668,6 +1668,7 @@ static void ClearPath() {
         d.track->keys.clear();
         d.track->enabled = false;
     }
+    ParamSelClear();
 }
 
 static void CopySelected() {
@@ -1681,8 +1682,10 @@ static void CopySelected() {
 
 // Add a new keyframe at the playhead, either from the clipboard (paste) or sampled from the existing
 // path / live freecam (insert).
-static void AddKeyframeAtPlayhead(const CineKeyframe& kf) {
-    PushUndo();
+static void AddKeyframeAtPlayhead(const CineKeyframe& kf, bool pushUndo = true) {
+    if (pushUndo) {
+        PushUndo();
+    }
     CineKeyframe k = kf;
     k.time = sPlayhead;
     k.aimActorPtr = nullptr; // runtime pointer is not copied
@@ -1702,19 +1705,328 @@ static void PasteAtPlayhead() {
 
 static void InsertAtPlayhead() {
     CineKeyframe kf{};
-    if (sKeyframes.size() >= 2) {
-        kf = SampleAt(sPlayhead); // a control point on the existing curve (shape preserved)
-    } else {
+    if (sKeyframes.size() < 2) {
         CinematicCam_GetPose(kf.eye, kf.at, &kf.roll, &kf.fov);
+        AddKeyframeAtPlayhead(kf);
+        return;
     }
-    AddKeyframeAtPlayhead(kf);
+    kf = SampleAt(sPlayhead); // a control point on the existing curve
+    PushUndo();               // one undo step covers BOTH the insert and the tangent baking on the neighbors below
+
+    // Shape-preserving split, in two phases. Adding a knot re-spaces the neighbors' automatic (centripetal)
+    // tangents, so a plain insert would nudge the curve near it. Phase 1 (before the insert): read the current
+    // curve's tangents - the four neighbor sides that will re-space, plus the curve direction/derivative at the
+    // split point. Phase 2 (after the insert): re-measure each side's automatic magnitude on the NEW arrangement
+    // and store the ratio wanted/auto as a per-side WEIGHT. Exact at insert time, and because weights are
+    // relative, later moves rescale the tangents naturally instead of leaving stale absolute lengths behind.
+    struct SideWant {
+        float len = -1.0f; // wanted absolute tangent length (<0 = leave automatic)
+        float dir[3] = { 0.0f, 0.0f, 0.0f };
+    };
+    SideWant wBIn, wBOut, wKIn, wKOut, wCIn, wCOut;
+    auto setWant = [](SideWant& w, const float* m, float len) {
+        float ml = v3len(m);
+        if (ml < 1e-5f || len < 1e-5f) {
+            return; // zero tangent (a hold): leave automatic, a hold pins itself
+        }
+        w.len = len;
+        w.dir[0] = m[0] / ml;
+        w.dir[1] = m[1] / ml;
+        w.dir[2] = m[2] / ml;
+    };
+
+    // Phase 1: read everything from the CURRENT curve.
+    int n = (int)sKeyframes.size();
+    float t = sPlayhead;
+    bool splitOk = false, linearSeg = false, hasPrev = false, hasNext = false;
+    int bId = -1, cId = -1;
+    // Aim bake: captured rates (deg/s) as {yawIn, yawOut, pitchIn, pitchOut} for b, the new key, and c. Once
+    // written as explicit values, nobody re-derives slopes from the new arrangement - so the insert cannot
+    // reshape the aim curve.
+    bool aimBake = false;
+    float aimB[4] = {}, aimK[4] = {}, aimC[4] = {};
+    // Speed bake: same idea for the pacing. The schedule derives its knot speeds from the (time, distance)
+    // knots, so a new knot re-derives the whole profile - the camera would visibly change speed around an
+    // insert even though the path and aim were preserved. Freezing the three keyframes' current speeds keeps
+    // the motion identical. (b's leaving speed and c's arriving speed are unchanged by an exact split; the
+    // new key takes the schedule's instantaneous speed at the split.)
+    bool speedBake = false;
+    float spB = -1.0f, spK = -1.0f, spC = -1.0f;
+    if (t > sKeyframes[0].time + 1e-4f && t < sKeyframes[n - 1].time - 1e-4f) {
+        int i1 = 0;
+        while (i1 < n - 1 && t >= sKeyframes[i1 + 1].time) {
+            i1++;
+        }
+        int i2 = i1 + 1;
+        CineKeyframe& b = sKeyframes[i1];
+        CineKeyframe& c = sKeyframes[i2];
+        float D = c.time - b.time;
+        // The GEOMETRIC split parameter: where on the segment's curve the camera visibly is at this playhead
+        // (the same speed-schedule mapping SampleAt used to place kf.eye).
+        float u = 0.0f;
+        if (D > 1e-3f) {
+            float p = (t - b.time) / D;
+            if (b.easeOut > 0.0f || c.easeIn > 0.0f) {
+                float m0e = 1.0f - std::min(std::max(b.easeOut, 0.0f), 1.0f);
+                float m1e = 1.0f - std::min(std::max(c.easeIn, 0.0f), 1.0f);
+                p = std::min(std::max(Hermite1(0.0f, 1.0f, m0e, m1e, p), 0.0f), 1.0f);
+            }
+            ArcEnsure();
+            u = ArcParamAtTime(i1, p);
+        }
+        // Degenerate split (the curve point essentially ON a keyframe): skip pinning - a nonzero weight baked
+        // onto a near-coincident pair would fight the hold the overshoot guard provides.
+        splitOk = D > 1e-3f && u > 1e-3f && u < 1.0f - 1e-3f;
+        if (splitOk && i1 < sArc.segs) { // capture the pacing before the insert re-derives it
+            float pt = (t - b.time) / D;
+            float pe = pt, dfac = 1.0f;
+            if (b.easeOut > 0.0f || c.easeIn > 0.0f) {
+                float m0e = 1.0f - std::min(std::max(b.easeOut, 0.0f), 1.0f);
+                float m1e = 1.0f - std::min(std::max(c.easeIn, 0.0f), 1.0f);
+                pe = std::min(std::max(Hermite1(0.0f, 1.0f, m0e, m1e, pt), 0.0f), 1.0f);
+                dfac = std::max(Hermite1Deriv(0.0f, 1.0f, m0e, m1e, pt), 0.0f);
+            }
+            float dur = SegDurAt(i1);
+            speedBake = true;
+            spB = sArc.mOut[i1];
+            spC = sArc.mIn[i1];
+            spK =
+                std::max(Hermite1Deriv(sArc.S[i1], sArc.S[i1 + 1], sArc.mOut[i1] * dur, sArc.mIn[i1] * dur, pe), 0.0f) *
+                dfac / D;
+        }
+        linearSeg = b.interp == CINE_INTERP_LINEAR;
+        hasPrev = splitOk && ((i1 > 0) || LoopCyclic());
+        hasNext = splitOk && ((i2 < n - 1) || LoopCyclic());
+        if (splitOk) {
+            bId = sIds[i1];
+            cId = sIds[i2];
+            float prevTd[3], prevTs[3], nextTd[3], nextTs[3];
+            if (hasPrev) {
+                int p1 = (i1 > 0) ? i1 - 1 : n - 1; // wraps only when looping
+                EyeSegmentTangents(p1, i1, prevTd, prevTs);
+                setWant(wBIn, prevTs, v3len(prevTs)); // b's arriving side re-spaces against the new key
+            }
+            if (hasNext) {
+                int n2 = (i2 < n - 1) ? i2 + 1 : 0;
+                EyeSegmentTangents(i2, n2, nextTd, nextTs);
+                setWant(wCOut, nextTd, v3len(nextTd)); // c's leaving side, same
+            }
+            if (linearSeg) {
+                // A linear segment splits into two linear halves along the same line - keep it linear (without
+                // this the new key's default Smooth mode would curve the second half).
+                kf.interp = CINE_INTERP_LINEAR;
+            } else {
+                float td[3], ts[3];
+                EyeSegmentTangents(i1, i2, td, ts);
+                float dv[3];
+                for (int k = 0; k < 3; k++) {
+                    dv[k] = Hermite1Deriv(b.eye[k], c.eye[k], td[k], ts[k], u);
+                }
+                // The original cubic H(s) restricted to [0,u], as a cubic in the first half's own parameter,
+                // needs endpoint tangents u*H'(0) and u*H'(u); the second half (1-u)*H'(u) and (1-u)*H'(1).
+                setWant(wBOut, td, v3len(td) * u);
+                setWant(wCIn, ts, v3len(ts) * (1.0f - u));
+                float dvLen = v3len(dv);
+                setWant(wKIn, dv, dvLen * u);
+                setWant(wKOut, dv, dvLen * (1.0f - u));
+                kf.interp = CINE_INTERP_SMOOTH;
+            }
+            // Aim: capture the current curve's rates at b, the split point, and c (skipped for locked/rail
+            // segments - they don't interpolate an aim curve - and for linear ones, whose halves lerp
+            // identically anyway). Rates at b/c are stored WITHOUT the ease factor: evaluation reapplies each
+            // sub-segment's own ease, and b's easeOut / c's easeIn survive the split unchanged.
+            // Inherit the aim MODE when both ends agree (and the target with it): a keyframe inserted between
+            // two shots of the same actor should keep watching that actor, not freeze into a free framing.
+            if (b.aimMode == c.aimMode) {
+                kf.aimMode = b.aimMode;
+                if (b.aimMode == CINE_AIM_ACTOR && b.aimActorId == c.aimActorId) {
+                    kf.aimActorId = b.aimActorId;
+                    kf.aimActorPtr = b.aimActorPtr;
+                    std::memcpy(kf.aimActorPos, b.aimActorPos, sizeof(kf.aimActorPos));
+                } else if (b.aimMode == CINE_AIM_ACTOR) {
+                    kf.aimMode = CINE_AIM_FREE; // different actors: no single target to inherit
+                }
+            }
+            bool aimSegOk = !linearSeg && sAimOverride != 4 && !AimLockedBetween(b, c) &&
+                            !(b.aimMode == CINE_AIM_RAIL && c.aimMode == CINE_AIM_RAIL);
+            float yB2, yC2, pB2, pC2, moY, miY, moP, miP, lB2, lC2;
+            if (aimSegOk && AimSegmentCurve(i1, &yB2, &yC2, &pB2, &pC2, &moY, &miY, &moP, &miP, &lB2, &lC2)) {
+                const float kR2D = 180.0f / 3.14159265f;
+                float pt = (t - b.time) / D; // raw time fraction; p above is the EASED param the aim curve uses
+                float pe = pt, dfac = 1.0f;
+                if (b.easeOut > 0.0f || c.easeIn > 0.0f) {
+                    float m0e = 1.0f - std::min(std::max(b.easeOut, 0.0f), 1.0f);
+                    float m1e = 1.0f - std::min(std::max(c.easeIn, 0.0f), 1.0f);
+                    pe = std::min(std::max(Hermite1(0.0f, 1.0f, m0e, m1e, pt), 0.0f), 1.0f);
+                    dfac = std::max(Hermite1Deriv(0.0f, 1.0f, m0e, m1e, pt), 0.0f);
+                }
+                aimBake = true;
+                aimB[1] = kR2D * moY / D; // b's leaving side
+                aimB[3] = kR2D * moP / D;
+                aimC[0] = kR2D * miY / D; // c's arriving side
+                aimC[2] = kR2D * miP / D;
+                // The new key: the curve's true time-rate at the split (its sub-segments carry no ease of
+                // their own on this side, so the rate is stored WITH the ease factor).
+                aimK[0] = aimK[1] = kR2D * Hermite1Deriv(yB2, yC2, moY, miY, pe) * dfac / D;
+                aimK[2] = aimK[3] = kR2D * Hermite1Deriv(pB2, pC2, moP, miP, pe) * dfac / D;
+                // b's arriving side and c's leaving side belong to the NEIGHBOUR segments, whose auto slopes
+                // also re-derive against the new key - freeze them at their current values too.
+                aimB[0] = aimB[1]; // fallbacks when there is no usable neighbour segment
+                aimB[2] = aimB[3];
+                aimC[1] = aimC[0];
+                aimC[3] = aimC[2];
+                float q0, q1, q2, q3, nmoY, nmiY, nmoP, nmiP, ql0, ql1;
+                if (hasPrev) {
+                    int p1 = (i1 > 0) ? i1 - 1 : n - 1;
+                    if (!AimLockedBetween(sKeyframes[p1], b) &&
+                        AimSegmentCurve(p1, &q0, &q1, &q2, &q3, &nmoY, &nmiY, &nmoP, &nmiP, &ql0, &ql1)) {
+                        float Dp = SegDurAt(p1);
+                        aimB[0] = kR2D * nmiY / Dp;
+                        aimB[2] = kR2D * nmiP / Dp;
+                    }
+                }
+                if (hasNext) {
+                    if (!AimLockedBetween(c, sKeyframes[(i2 < n - 1) ? i2 + 1 : 0]) &&
+                        AimSegmentCurve(i2, &q0, &q1, &q2, &q3, &nmoY, &nmiY, &nmoP, &nmiP, &ql0, &ql1)) {
+                        float Dn = SegDurAt(i2);
+                        aimC[1] = kR2D * nmoY / Dn;
+                        aimC[3] = kR2D * nmoP / Dn;
+                    }
+                }
+            }
+        }
+    }
+
+    // The insert itself (sorts and selects the new key).
+    AddKeyframeAtPlayhead(kf, false); // undo was already pushed above
+    if (!splitOk) {
+        return;
+    }
+
+    // Phase 2: apply the wants as direction pins + RELATIVE weights measured against the new arrangement.
+    int newIdx = SelectedIndex();
+    int bIdx = -1, cIdx = -1;
+    for (int i = 0; i < (int)sIds.size(); i++) {
+        if (sIds[i] == bId) {
+            bIdx = i;
+        } else if (sIds[i] == cId) {
+            cIdx = i;
+        }
+    }
+    if (newIdx < 0 || bIdx < 0 || cIdx < 0) {
+        return; // should not happen; leave the plain insert rather than pin the wrong keys
+    }
+    int n2 = (int)sKeyframes.size();
+    CineKeyframe& B = sKeyframes[bIdx];
+    CineKeyframe& C = sKeyframes[cIdx];
+    CineKeyframe& K = sKeyframes[newIdx];
+    // Directions first, weights cleared, so the auto magnitudes measured below are exactly what the eval will
+    // scale by the weights.
+    auto pinDir = [](int& has, float* dst, const SideWant& w) {
+        if (w.len > 0.0f) {
+            dst[0] = w.dir[0];
+            dst[1] = w.dir[1];
+            dst[2] = w.dir[2];
+            has = 1;
+        }
+    };
+    pinDir(B.hasTangentIn, B.tangentIn, wBIn);
+    pinDir(B.hasTangent, B.tangent, wBOut);
+    pinDir(K.hasTangentIn, K.tangentIn, wKIn);
+    pinDir(K.hasTangent, K.tangent, wKOut);
+    pinDir(C.hasTangentIn, C.tangentIn, wCIn);
+    pinDir(C.hasTangent, C.tangent, wCOut);
+    if (wBIn.len > 0.0f) {
+        B.tanWIn = 0.0f;
+    }
+    if (wBOut.len > 0.0f) {
+        B.tanWOut = 0.0f;
+    }
+    if (wCIn.len > 0.0f) {
+        C.tanWIn = 0.0f;
+    }
+    if (wCOut.len > 0.0f) {
+        C.tanWOut = 0.0f;
+    }
+    float aTd[3], aTs[3];
+    auto weigh = [](float want, float autoLen) {
+        if (want <= 1e-5f || autoLen <= 1e-5f) {
+            return 0.0f;
+        }
+        // Clamped: where the overshoot guard capped the auto magnitude, an uncapped compensating weight could
+        // be huge - exact today, but explosive the moment a later edit relaxes the guard. Slight inexactness
+        // in already-degenerate spots beats a latent loop.
+        return std::min(std::max(want / autoLen, 0.1f), 4.0f);
+    };
+    if (wBIn.len > 0.0f && bIdx - 1 >= 0) {
+        EyeSegmentTangents(bIdx - 1, bIdx, aTd, aTs);
+        B.tanWIn = weigh(wBIn.len, v3len(aTs));
+    } else if (wBIn.len > 0.0f && LoopCyclic()) {
+        EyeSegmentTangents(n2 - 1, 0, aTd, aTs); // bIdx == 0 while looping: the arriving segment is the return leg
+        B.tanWIn = weigh(wBIn.len, v3len(aTs));
+    }
+    if (wBOut.len > 0.0f || wKIn.len > 0.0f) {
+        EyeSegmentTangents(bIdx, newIdx, aTd, aTs);
+        if (wBOut.len > 0.0f) {
+            B.tanWOut = weigh(wBOut.len, v3len(aTd));
+        }
+        if (wKIn.len > 0.0f) {
+            K.tanWIn = weigh(wKIn.len, v3len(aTs));
+        }
+    }
+    if (wKOut.len > 0.0f || wCIn.len > 0.0f) {
+        EyeSegmentTangents(newIdx, cIdx, aTd, aTs);
+        if (wKOut.len > 0.0f) {
+            K.tanWOut = weigh(wKOut.len, v3len(aTd));
+        }
+        if (wCIn.len > 0.0f) {
+            C.tanWIn = weigh(wCIn.len, v3len(aTs));
+        }
+    }
+    if (wCOut.len > 0.0f) {
+        int nn = (cIdx < n2 - 1) ? cIdx + 1 : 0; // wraps only when looping (hasNext guaranteed a next segment)
+        EyeSegmentTangents(cIdx, nn, aTd, aTs);
+        C.tanWOut = weigh(wCOut.len, v3len(aTd));
+    }
+    // Speed bake: freeze the pacing at the three keyframes so the new knot can't re-derive the profile. Only
+    // the sides that touch the split are pinned - b's arriving side and c's leaving side belong to segments
+    // the insert didn't touch, and their automatic values are still correct.
+    if (speedBake) {
+        B.speedRateOut = spB;
+        C.speedRateIn = spC;
+        K.speedRateIn = spK;
+        K.speedRateOut = spK;
+    }
+    // Aim bake: write the captured rates as explicit values on all three keyframes.
+    if (aimBake) {
+        B.hasAimTan = 1;
+        B.aimTanYawIn = aimB[0];
+        B.aimTanYawOut = aimB[1];
+        B.aimTanPitchIn = aimB[2];
+        B.aimTanPitchOut = aimB[3];
+        K.hasAimTan = 1;
+        K.aimTanYawIn = aimK[0];
+        K.aimTanYawOut = aimK[1];
+        K.aimTanPitchIn = aimK[2];
+        K.aimTanPitchOut = aimK[3];
+        C.hasAimTan = 1;
+        C.aimTanYawIn = aimC[0];
+        C.aimTanYawOut = aimC[1];
+        C.aimTanPitchIn = aimC[2];
+        C.aimTanPitchOut = aimC[3];
+    }
 }
 
 // Serialize / restore a parameter track to the path file. Generic so future tracks reuse it.
 static nlohmann::json TrackToJson(const CineParamTrack& t) {
     nlohmann::json keys = nlohmann::json::array();
     for (const CineParamKey& k : t.keys) {
-        keys.push_back({ { "time", k.time }, { "value", k.value }, { "interp", k.interp } });
+        nlohmann::json kj = { { "time", k.time }, { "value", k.value }, { "interp", k.interp } };
+        if (k.hasHandles) { // only persist explicit Bezier handles
+            kj["h"] = { k.hOutT, k.hOutV, k.hInT, k.hInV };
+            kj["hb"] = k.brokenHandles;
+        }
+        keys.push_back(kj);
     }
     return { { "enabled", t.enabled }, { "keys", keys } };
 }
