@@ -306,6 +306,10 @@ static bool sShowFields = false; // show numeric position/rotation fields for th
 // Transform gizmo state for the selected keyframe.
 enum GizmoMode { GIZMO_MOVE = 0, GIZMO_ROTATE = 1, GIZMO_BEND = 2 };
 static int sGizmoMode = GIZMO_MOVE;
+// Which side of the keyframe the Bend gizmo edits: 0 = both (mirrored / rigid), 1 = out only (the curve
+// leaving toward the next keyframe), 2 = in only (the curve arriving from the previous one). Editing a single
+// side "breaks" the handle so the path can turn a shaped corner through the keyframe.
+static int sBendSide = 0;
 static int sDragKfId = -1; // keyframe id currently being manipulated by the gizmo, or -1
 static int sDragKind = 0;  // 0 = translate, 1 = rotate (snapshot of mode at grab time)
 static int sDragAxis = -1; // which axis/ring: 0=X/yaw, 1=Y/pitch, 2=Z/roll
@@ -1985,21 +1989,182 @@ static void v3rot(const float* v, const float* k, float ang, float* o) {
 
 // --- Path tools: smoothing + speed normalization -------------------------------------------------
 
-// Smooth the path WITHOUT moving any keyframe: reset every keyframe to clean spline defaults so the chosen
-// parameterization (centripetal by default) can produce loop-free, even motion. Removes linear (sharp)
-// segments, manual Bend tangents, and any Tension/Continuity/Bias that was sharpening corners. Positions,
-// aim, roll and FOV are untouched.
+// The keyframe-index range the path tools operate on: the span of the current multi-selection when 2+
+// keyframes are selected, the whole path otherwise. Returns false if the path is too short.
+static bool ToolRange(int& lo, int& hi) {
+    int n = (int)sKeyframes.size();
+    if (n < 2) {
+        return false;
+    }
+    lo = 0;
+    hi = n - 1;
+    if (SelectionCount() >= 2) {
+        int mn = n, mx = -1;
+        for (int i = 0; i < n; i++) {
+            if (IsSelected(sIds[i])) {
+                mn = std::min(mn, i);
+                mx = std::max(mx, i);
+            }
+        }
+        if (mx > mn) {
+            lo = mn;
+            hi = mx;
+        }
+    }
+    return hi > lo;
+}
+
+// Smooth WITHOUT moving any keyframe: reset the range (selection span, else whole path) to clean spline
+// defaults so the centripetal parameterization can produce loop-free, even motion. Removes linear (sharp)
+// Smooth path: make the range's motion CONTINUOUS - solve for the tangents of a C2 cubic (direction AND
+// curvature smooth, the physical-dolly look; also what makes rail aim glide, since rail IS the tangent) and
+// BAKE the result into the per-keyframe tangent storage. Keyframes never move; their tangents rotate and
+// rescale. This is also the "release locality" moment: inside the range every keyframe shapes the whole
+// stretch (that's what the solve does), while the range's end tangents are frozen at their current values so
+// nothing outside it reshapes.
 static void SmoothPath() {
-    if ((int)sKeyframes.size() < 2) {
+    int lo, hi;
+    if (!ToolRange(lo, hi)) {
         return;
     }
+    int n = (int)sKeyframes.size();
+    int m = hi - lo; // segments in range
+    // Whole looping path: solve the PERIODIC spline - the loop-return segment is a segment like any other and
+    // the seam becomes just another smooth knot. (A clamped solve left the seam with the old corner.)
+    bool cyc = LoopCyclic() && lo == 0 && hi == n - 1 && n >= 3;
+    int nk = cyc ? n : m + 1; // knots being solved
+    int ns = cyc ? n : m;     // intervals (cyclic includes loop-return: last -> first)
+    if ((!cyc && m < 2) || nk > 64) {
+        return; // nothing to bend, or beyond the solver's buffer
+    }
     PushUndo();
-    for (auto& k : sKeyframes) {
-        k.interp = CINE_INTERP_SMOOTH;
-        k.hasTangent = 0;
-        k.tension = 0.0f;
-        k.continuity = 0.0f;
-        k.bias = 0.0f;
+    for (int i = lo; i < (cyc ? n : hi); i++) {
+        sKeyframes[i].interp = CINE_INTERP_SMOOTH; // a linear segment can't be part of a continuous curve
+    }
+    // Knot intervals: the same centripetal (chord^0.5) parameterization the evaluator uses.
+    std::vector<float> h((size_t)ns);
+    for (int i = 0; i < ns; i++) {
+        const float* p = sKeyframes[lo + i].eye;
+        const float* q = sKeyframes[(lo + i + 1) % n].eye;
+        float e0 = q[0] - p[0], e1 = q[1] - p[1], e2 = q[2] - p[2];
+        h[i] = std::max(std::sqrt(std::sqrt(e0 * e0 + e1 * e1 + e2 * e2)), 1e-3f);
+    }
+    float M[3][64]; // solved knot velocities (dEye/dt in the global centripetal parameter), per axis
+    if (cyc) {
+        // Periodic C2 system: every knot is interior, indices wrap. Solved as a small dense system (n <= 64,
+        // runs once per button press - no need for a specialised cyclic solver).
+        for (int ax = 0; ax < 3; ax++) {
+            static float A[64][65];
+            std::memset(A, 0, sizeof(A));
+            for (int i = 0; i < nk; i++) {
+                int ip = (i - 1 + nk) % nk, in2 = (i + 1) % nk;
+                float hp = h[ip], hn = h[i];
+                float Pm = sKeyframes[ip].eye[ax], P0 = sKeyframes[i].eye[ax], Pp = sKeyframes[in2].eye[ax];
+                A[i][ip] += 1.0f / hp;
+                A[i][i] += 2.0f * (1.0f / hp + 1.0f / hn);
+                A[i][in2] += 1.0f / hn;
+                A[i][nk] = 3.0f * ((P0 - Pm) / (hp * hp) + (Pp - P0) / (hn * hn));
+            }
+            for (int col = 0; col < nk; col++) { // Gaussian elimination with partial pivoting
+                int piv = col;
+                for (int r = col + 1; r < nk; r++) {
+                    if (std::fabs(A[r][col]) > std::fabs(A[piv][col])) {
+                        piv = r;
+                    }
+                }
+                for (int cc = 0; cc <= nk; cc++) {
+                    std::swap(A[col][cc], A[piv][cc]);
+                }
+                if (std::fabs(A[col][col]) < 1e-9f) {
+                    continue;
+                }
+                for (int r = 0; r < nk; r++) {
+                    if (r == col) {
+                        continue;
+                    }
+                    float w = A[r][col] / A[col][col];
+                    for (int cc = col; cc <= nk; cc++) {
+                        A[r][cc] -= w * A[col][cc];
+                    }
+                }
+            }
+            for (int i = 0; i < nk; i++) {
+                M[ax][i] = (std::fabs(A[i][i]) > 1e-9f) ? A[i][nk] / A[i][i] : 0.0f;
+            }
+        }
+    } else {
+        // Open range: clamped solve (Thomas algorithm) - the range's CURRENT end tangents are the boundary
+        // conditions, so nothing outside the range reshapes.
+        float tdLo[3], tsLo[3], tdHi[3], tsHi[3];
+        EyeSegmentTangents(lo, lo + 1, tdLo, tsLo);
+        EyeSegmentTangents(hi - 1, hi, tdHi, tsHi);
+        std::vector<float> diagA((size_t)nk), diagB((size_t)nk), diagC((size_t)nk), rhs((size_t)nk);
+        for (int ax = 0; ax < 3; ax++) {
+            diagB[0] = 1.0f;
+            diagC[0] = 0.0f;
+            rhs[0] = tdLo[ax] / h[0];
+            for (int i = 1; i < nk - 1; i++) {
+                float hp = h[i - 1], hn = h[i];
+                float Pm = sKeyframes[lo + i - 1].eye[ax], P0 = sKeyframes[lo + i].eye[ax],
+                      Pp = sKeyframes[lo + i + 1].eye[ax];
+                diagA[i] = 1.0f / hp;
+                diagB[i] = 2.0f * (1.0f / hp + 1.0f / hn);
+                diagC[i] = 1.0f / hn;
+                rhs[i] = 3.0f * ((P0 - Pm) / (hp * hp) + (Pp - P0) / (hn * hn));
+            }
+            diagA[nk - 1] = 0.0f;
+            diagB[nk - 1] = 1.0f;
+            rhs[nk - 1] = tsHi[ax] / h[ns - 1];
+            for (int i = 1; i < nk; i++) { // forward elimination (diagA[nk-1] is 0: last row untouched)
+                float w = diagA[i] / diagB[i - 1];
+                diagB[i] -= w * diagC[i - 1];
+                rhs[i] -= w * rhs[i - 1];
+            }
+            M[ax][nk - 1] = rhs[nk - 1] / diagB[nk - 1];
+            for (int i = nk - 2; i >= 0; i--) {
+                M[ax][i] = (rhs[i] - diagC[i] * M[ax][i + 1]) / diagB[i];
+            }
+        }
+    }
+    // Bake phase 1: write the solved DIRECTIONS (weights cleared so the magnitude measurement below is
+    // unweighted). Cyclic solves bake every knot; open solves bake the interior only (ends are frozen).
+    int bake0 = cyc ? 0 : 1, bake1 = cyc ? nk - 1 : nk - 2;
+    for (int i = bake0; i <= bake1; i++) {
+        CineKeyframe& k = sKeyframes[lo + i];
+        float dir[3] = { M[0][i], M[1][i], M[2][i] };
+        if (v3len(dir) < 1e-5f) {
+            continue; // stationary knot: leave it as authored
+        }
+        v3norm(dir);
+        k.hasTangent = 1;
+        k.hasTangentIn = 0; // one direction through the knot - that is the continuity
+        std::memcpy(k.tangent, dir, sizeof(k.tangent));
+        k.tanWOut = 0.0f;
+        k.tanWIn = 0.0f;
+    }
+    // Bake phase 2: weights = solved magnitude / automatic magnitude, per side (the storage is relative so
+    // later keyframe moves rescale naturally - same scheme as Insert @ playhead).
+    for (int i = bake0; i <= bake1; i++) {
+        CineKeyframe& k = sKeyframes[lo + i];
+        if (!k.hasTangent) {
+            continue;
+        }
+        int gi = lo + i;
+        int prevSeg = (gi - 1 + n) % n;   // segment arriving at this knot (wraps only when cyclic)
+        float hOut = h[i % ns];           // interval of the segment leaving this knot
+        float hIn = h[(i - 1 + ns) % ns]; // interval of the segment arriving
+        float td[3], ts[3];
+        EyeSegmentTangents(gi, (gi + 1) % n, td, ts);
+        float autoOut = v3len(td);
+        EyeSegmentTangents(prevSeg, gi, td, ts);
+        float autoIn = v3len(ts);
+        float mag = std::sqrt(M[0][i] * M[0][i] + M[1][i] * M[1][i] + M[2][i] * M[2][i]);
+        if (autoOut > 1e-5f) {
+            k.tanWOut = std::min(std::max(mag * hOut / autoOut, 0.1f), 4.0f);
+        }
+        if (autoIn > 1e-5f) {
+            k.tanWIn = std::min(std::max(mag * hIn / autoIn, 0.1f), 4.0f);
+        }
     }
 }
 
@@ -2026,50 +2191,104 @@ static float SegmentArcLength(int i) {
 }
 
 // Re-time keyframes so each segment's duration is ~proportional to its physical path length: the camera then
-// covers the whole path at a near-constant speed. Total duration and the first keyframe's time are preserved.
+// covers the range at a near-constant speed. Operates on the selection span when 2+ keyframes are selected,
+// else the whole path; the range's first/last times (and everything outside it) are preserved. One pass is
+// exact now - the geometry no longer depends on the times, so re-timing cannot change the arc lengths.
 //
-// Two refinements over a naive single pass:
-//   - Iterate. With the time-based curve, changing the times changes the geometry (and thus the arc lengths),
-//     so one pass doesn't converge - re-measure and re-time a few times.
-//   - Floor each segment. Two physically close keyframes have a tiny arc length, so pure proportionality gives
-//     them a near-zero duration -> a velocity spike as the camera jumps between them. Each segment is given at
-//     least a small share of the average, which keeps the motion smooth right where it used to struggle.
+// Floor each segment: two physically close keyframes have a tiny arc length, so pure proportionality gives
+// them a near-zero duration -> a velocity spike as the camera jumps between them. Each segment gets at least
+// a small share of the average, which keeps the motion smooth right where it used to struggle.
 static void NormalizeSpeed() {
-    int n = (int)sKeyframes.size();
-    if (n < 3) {
-        return;
+    int lo, hi;
+    if (!ToolRange(lo, hi) || hi - lo < 2) {
+        return; // need at least 3 keyframes in the range (2 segments) for re-timing to mean anything
     }
-    float base = sKeyframes[0].time;
-    float totalTime = sKeyframes[n - 1].time - base;
+    float base = sKeyframes[lo].time;
+    float totalTime = sKeyframes[hi].time - base;
     if (totalTime <= 1e-4f) {
         return;
     }
-    PushUndo();
-    const float kFloor = 0.15f; // each segment gets at least ~15% of the average segment's time
-    for (int iter = 0; iter < 5; iter++) {
-        std::vector<float> seg(n - 1);
-        float totalLen = 0.0f;
-        for (int i = 0; i < n - 1; i++) {
-            seg[i] = SegmentArcLength(i);
-            totalLen += seg[i];
-        }
-        if (totalLen <= 1e-4f) {
-            break;
-        }
-        float avgLen = totalLen / (float)(n - 1);
-        std::vector<float> w(n - 1);
-        float wsum = 0.0f;
-        for (int i = 0; i < n - 1; i++) {
-            w[i] = seg[i] + kFloor * avgLen;
-            wsum += w[i];
-        }
-        float t = base;
-        for (int i = 1; i < n; i++) {
-            t += totalTime * (w[i - 1] / wsum);
-            sKeyframes[i].time = t;
-        }
-        sKeyframes[n - 1].time = base + totalTime; // pin the end exactly
+    int segs = hi - lo;
+    std::vector<float> seg(segs);
+    std::vector<float> origT(segs + 1); // times BEFORE re-timing (hold durations are read from these while
+    for (int i = 0; i <= segs; i++) {   // the loop below is already rewriting earlier keyframes)
+        origT[i] = sKeyframes[lo + i].time;
     }
+    float totalLen = 0.0f, holdTime = 0.0f;
+    for (int i = 0; i < segs; i++) {
+        seg[i] = SegmentArcLength(lo + i);
+        totalLen += seg[i];
+        if (seg[i] <= 1e-3f) { // a deliberate hold (coincident keyframes): its authored pause is kept as-is
+            holdTime += origT[i + 1] - origT[i];
+        }
+    }
+    float moveTime = totalTime - holdTime;
+    if (totalLen <= 1e-4f || moveTime <= 1e-3f) {
+        return;
+    }
+    PushUndo();
+    // Near-pure proportionality over the MOVING segments. This used to carry a 15% per-segment floor -
+    // compensation for the old time-knot spline's velocity spikes - but under the arc-length engine any extra
+    // time handed to a short segment IS a speed difference, which made "normalized" paths still feel uneven.
+    // The tiny floor that remains only guards against degenerate weights.
+    const float kFloor = 0.02f;
+    float avgLen = totalLen / (float)segs;
+    std::vector<float> w(segs);
+    float wsum = 0.0f;
+    for (int i = 0; i < segs; i++) {
+        w[i] = (seg[i] <= 1e-3f) ? 0.0f : seg[i] + kFloor * avgLen;
+        wsum += w[i];
+    }
+    if (wsum <= 1e-6f) {
+        return;
+    }
+    float t = base;
+    for (int i = 1; i <= segs; i++) {
+        float dur = (seg[i - 1] <= 1e-3f) ? (origT[i] - origT[i - 1]) : moveTime * (w[i - 1] / wsum);
+        t += dur;
+        if (i < segs) {
+            sKeyframes[lo + i].time = t;
+        }
+    }
+    // Even speed is exactly what an explicit speed handle contradicts - clear them across the range, or the
+    // schedule would keep forcing the old per-keyframe rates and the path would still play unevenly.
+    for (int i = lo; i <= hi; i++) {
+        sKeyframes[i].speedRateIn = -1.0f;
+        sKeyframes[i].speedRateOut = -1.0f;
+    }
+    // A cyclic path's return leg is a real segment carrying real distance: give it the same speed as the rest,
+    // otherwise the seam plays at whatever the old return time happened to be (fast or crawling).
+    if (LoopCyclic() && lo == 0 && hi == (int)sKeyframes.size() - 1) {
+        ArcEnsure(); // geometry is time-independent, so the cached lengths survive the re-timing above
+        float speed = totalLen / moveTime;
+        if (sArc.segs >= 1 && speed > 1e-4f) {
+            float retLen = sArc.S[sArc.segs] - sArc.S[sArc.segs - 1]; // the return leg is the last arc segment
+            if (retLen > 1e-3f) {
+                sLoopReturnTime = retLen / speed;
+            }
+        }
+    }
+}
+
+// Compress/expand the keyframes [lo..hi] to a new span, anchored at lo: every interval scales by the same
+// factor, so the group's internal rhythm is intact while its total duration changes. Keyframes outside the
+// range keep their absolute times (expanding far enough to overlap later keys re-sorts; the timeline shows it).
+static void ScaleSelection(int lo, int hi, float newDur) {
+    int n = (int)sKeyframes.size();
+    if (lo < 0 || hi <= lo || hi >= n || newDur <= 1e-3f) {
+        return;
+    }
+    float old = sKeyframes[hi].time - sKeyframes[lo].time;
+    if (old <= 1e-4f) {
+        return;
+    }
+    PushUndo();
+    float s = newDur / old;
+    float base = sKeyframes[lo].time;
+    for (int i = lo + 1; i <= hi; i++) {
+        sKeyframes[i].time = base + (sKeyframes[i].time - base) * s;
+    }
+    SortByTime();
 }
 
 // Rescale all keyframe times so the path lasts `newTotal` seconds (keeps the first keyframe's time and the
@@ -2133,6 +2352,11 @@ static void GenerateOrbit(const float* center, float radius, float height, int c
         sLoop = true;
         sLoopMode = 0;
         sLoopReturnTime = duration / (float)count; // even spacing across the wrap-around segment
+    }
+    // A generated orbit should BE a smooth ring from the start - run the continuity solve immediately (the
+    // full-circle case gets the periodic solve, so the wrap-around seam is as smooth as any other knot).
+    if (count >= 3) {
+        SmoothPath();
     }
 }
 
@@ -2270,7 +2494,7 @@ static void AutoTangentDir(int idx, float out[3]) {
     v3norm(out);
 }
 
-// The tangent direction in use at keyframe idx (custom if set, otherwise the automatic one).
+// The OUT-side tangent direction in use at keyframe idx (custom if set, otherwise the automatic one).
 static void BendTangentDir(int idx, float out[3]) {
     if (sKeyframes[idx].hasTangent) {
         out[0] = sKeyframes[idx].tangent[0];
@@ -2279,6 +2503,19 @@ static void BendTangentDir(int idx, float out[3]) {
         v3norm(out);
     } else {
         AutoTangentDir(idx, out);
+    }
+}
+
+// The IN-side (arriving) tangent direction in use at keyframe idx: the broken in-direction if set, otherwise
+// it mirrors the out side.
+static void BendTangentDirIn(int idx, float out[3]) {
+    if (sKeyframes[idx].hasTangentIn) {
+        out[0] = sKeyframes[idx].tangentIn[0];
+        out[1] = sKeyframes[idx].tangentIn[1];
+        out[2] = sKeyframes[idx].tangentIn[2];
+        v3norm(out);
+    } else {
+        BendTangentDir(idx, out);
     }
 }
 
@@ -2399,19 +2636,37 @@ static void DrawGizmo(ImDrawList* dl, int idx) {
         if (R <= 0.0f || L <= 0.0f) {
             return;
         }
-        float tdir[3];
-        BendTangentDir(idx, tdir);
-        // Tangent handle line through the keyframe (both directions), like a Bezier handle.
+        float tdir[3], idir[3];
+        BendTangentDir(idx, tdir);   // out side: drawn forward (toward the next keyframe)
+        BendTangentDirIn(idx, idir); // in side: drawn backward; diverges from the out line when broken
+        // Handle length shows the side's WEIGHT (how far the curve bulges on that side); the dots are
+        // directly draggable to steer each side.
+        float fwOut = (k.tanWOut > 0.0f) ? std::min(std::max(k.tanWOut, 0.25f), 3.0f) : 1.0f;
+        float fwIn = (k.tanWIn > 0.0f) ? std::min(std::max(k.tanWIn, 0.25f), 3.0f) : 1.0f;
+        ImVec2 origin2, sp, sn;
         float hp[3], hn[3];
-        v3mad(k.eye, tdir, L, hp);
-        v3mad(k.eye, tdir, -L, hn);
-        ImVec2 sp, sn;
-        if (WorldToScreen(hp, sp) && WorldToScreen(hn, sn)) {
-            dl->AddLine(sn, sp, IM_COL32(230, 130, 255, 220), 2.0f);
-            dl->AddCircleFilled(sp, 4.0f, IM_COL32(230, 130, 255, 255));
+        v3mad(k.eye, tdir, L * fwOut, hp);
+        v3mad(k.eye, idir, -L * fwIn, hn);
+        bool editOut = (sBendSide != 2), editIn = (sBendSide != 1);
+        bool hotO = (sDragKfId == sIds[idx] && sDragKind == 3 && sDragAxis == 0);
+        bool hotI = (sDragKfId == sIds[idx] && sDragKind == 3 && sDragAxis == 1);
+        if (WorldToScreen(k.eye, origin2)) {
+            if (WorldToScreen(hp, sp)) { // out handle: magenta, dimmed when not being edited
+                ImU32 c = hotO ? IM_COL32(255, 255, 120, 255)
+                               : (editOut ? IM_COL32(230, 130, 255, 220) : IM_COL32(230, 130, 255, 90));
+                dl->AddLine(origin2, sp, c, 2.0f);
+                dl->AddCircleFilled(sp, hotO ? 6.0f : 4.5f, c);
+            }
+            if (WorldToScreen(hn, sn)) { // in handle: teal so a broken corner reads at a glance
+                ImU32 c = hotI ? IM_COL32(255, 255, 120, 255)
+                               : (editIn ? IM_COL32(120, 230, 210, 220) : IM_COL32(120, 230, 210, 90));
+                dl->AddLine(origin2, sn, c, 2.0f);
+                dl->AddCircleFilled(sn, hotI ? 6.0f : 4.5f, c);
+            }
         }
+        // Rings orient on the side being edited (the out side when editing both).
         float yawAxis[3], pitchAxis[3];
-        BendAxes(tdir, yawAxis, pitchAxis);
+        BendAxes(sBendSide == 2 ? idir : tdir, yawAxis, pitchAxis);
         bool hot0 = (sDragKfId == sIds[idx] && sDragKind == 2 && sDragAxis == 0);
         bool hot1 = (sDragKfId == sIds[idx] && sDragKind == 2 && sDragAxis == 1);
         DrawRing(dl, k.eye, yawAxis, R, hot0 ? IM_COL32(255, 255, 120, 255) : kBendCol[0], hot0 ? 3.0f : 2.0f);
@@ -2487,13 +2742,58 @@ static bool GizmoTryStart(int idx, ImVec2 m) {
         }
     } else { // GIZMO_BEND
         float R = GizmoScale(k.eye, 60.0f);
-        if (R <= 0.0f) {
+        float L = GizmoScale(k.eye, 70.0f);
+        if (R <= 0.0f || L <= 0.0f) {
             return false;
         }
-        float tdir[3];
+        float tdir[3], idir[3];
         BendTangentDir(idx, tdir);
+        BendTangentDirIn(idx, idir);
+        // The handle DOTS grab with priority over the rings: dragging one steers that side directly.
+        {
+            float fwOut = (k.tanWOut > 0.0f) ? std::min(std::max(k.tanWOut, 0.25f), 3.0f) : 1.0f;
+            float fwIn = (k.tanWIn > 0.0f) ? std::min(std::max(k.tanWIn, 0.25f), 3.0f) : 1.0f;
+            float hp[3], hn[3];
+            v3mad(k.eye, tdir, L * fwOut, hp);
+            v3mad(k.eye, idir, -L * fwIn, hn);
+            ImVec2 sp, sn;
+            int dot = -1;
+            if (WorldToScreen(hp, sp) && std::sqrt((sp.x - m.x) * (sp.x - m.x) + (sp.y - m.y) * (sp.y - m.y)) < 9.0f) {
+                dot = 0;
+            } else if (WorldToScreen(hn, sn) &&
+                       std::sqrt((sn.x - m.x) * (sn.x - m.x) + (sn.y - m.y) * (sn.y - m.y)) < 9.0f) {
+                dot = 1;
+            }
+            if (dot >= 0) {
+                PushUndo();
+                CineKeyframe& kf = sKeyframes[idx];
+                // Grabbing one side breaks the handle: both sides get pinned at their current directions so
+                // only the grabbed one moves.
+                if (!kf.hasTangent) {
+                    kf.tangent[0] = tdir[0];
+                    kf.tangent[1] = tdir[1];
+                    kf.tangent[2] = tdir[2];
+                    kf.hasTangent = 1;
+                }
+                if (!kf.hasTangentIn) {
+                    kf.tangentIn[0] = idir[0];
+                    kf.tangentIn[1] = idir[1];
+                    kf.tangentIn[2] = idir[2];
+                    kf.hasTangentIn = 1;
+                }
+                sDragKfId = sIds[idx];
+                sDragKind = 3;
+                sDragAxis = dot; // 0 = out dot, 1 = in dot
+                float pa[3], ya[3];
+                BendAxes(dot == 0 ? tdir : idir, ya, pa);
+                sDragPitchAxis[0] = pa[0]; // stable pitch axis, captured at grab (recomputing degenerates
+                sDragPitchAxis[1] = pa[1]; // near vertical)
+                sDragPitchAxis[2] = pa[2];
+                return true;
+            }
+        }
         float yawAxis[3], pitchAxis[3];
-        BendAxes(tdir, yawAxis, pitchAxis);
+        BendAxes(sBendSide == 2 ? idir : tdir, yawAxis, pitchAxis);
         int best = -1;
         float bestd = 8.0f;
         float d0 = RingHitDist(k.eye, yawAxis, R, m);
@@ -2509,11 +2809,34 @@ static bool GizmoTryStart(int idx, ImVec2 m) {
         if (best >= 0) {
             PushUndo();
             CineKeyframe& kf = sKeyframes[idx];
-            if (!kf.hasTangent) { // lock in the current (auto) tangent so rotation starts from it
+            // Lock in the current effective directions so rotation starts from what is on screen. Editing a
+            // single side also freezes the OTHER side at its current direction - otherwise a mirrored/auto
+            // opposite side would silently follow the drag.
+            if (sBendSide != 2 && !kf.hasTangent) {
                 kf.tangent[0] = tdir[0];
                 kf.tangent[1] = tdir[1];
                 kf.tangent[2] = tdir[2];
                 kf.hasTangent = 1;
+            }
+            if (sBendSide == 1 && !kf.hasTangentIn) { // freeze the in side while bending out only
+                kf.tangentIn[0] = idir[0];
+                kf.tangentIn[1] = idir[1];
+                kf.tangentIn[2] = idir[2];
+                kf.hasTangentIn = 1;
+            }
+            if (sBendSide == 2) {     // bending the in side: it becomes broken, out side keeps its own state
+                if (!kf.hasTangent) { // freeze the out side (currently auto) so it doesn't drift
+                    kf.tangent[0] = tdir[0];
+                    kf.tangent[1] = tdir[1];
+                    kf.tangent[2] = tdir[2];
+                    kf.hasTangent = 1;
+                }
+                if (!kf.hasTangentIn) {
+                    kf.tangentIn[0] = idir[0];
+                    kf.tangentIn[1] = idir[1];
+                    kf.tangentIn[2] = idir[2];
+                    kf.hasTangentIn = 1;
+                }
             }
             sDragKfId = sIds[idx];
             sDragKind = 2;
@@ -2572,6 +2895,46 @@ static void GizmoContinue() {
         if (k.aimMode == CINE_AIM_FREE) {
             k.at[sDragAxis] += worldDelta; // free aim: carry the look-at rigidly with the eye
         }
+    } else if (sDragKind == 3) {
+        // Bend handle dot: steer that side's direction so the dot follows the mouse. The screen response of a
+        // yaw/pitch nudge depends on the view, so measure it numerically (probe both axes) and solve the 2x2
+        // system for the rotation that closes the gap.
+        float* dir = (sDragAxis == 0) ? k.tangent : k.tangentIn;
+        float sign = (sDragAxis == 0) ? 1.0f : -1.0f;
+        float L = GizmoScale(k.eye, 70.0f);
+        if (L <= 0.0f) {
+            return;
+        }
+        float w = (sDragAxis == 0) ? k.tanWOut : k.tanWIn;
+        float fw = (w > 0.0f) ? std::min(std::max(w, 0.25f), 3.0f) : 1.0f;
+        float reach = L * fw * sign;
+        float up[3] = { 0.0f, 1.0f, 0.0f };
+        const float eps = 0.02f;
+        float hp[3], d1[3], d2[3], p1w[3], p2w[3];
+        ImVec2 base, s1, s2;
+        v3mad(k.eye, dir, reach, hp);
+        v3rot(dir, up, eps, d1);
+        v3rot(dir, sDragPitchAxis, eps, d2);
+        v3mad(k.eye, d1, reach, p1w);
+        v3mad(k.eye, d2, reach, p2w);
+        if (!WorldToScreen(hp, base) || !WorldToScreen(p1w, s1) || !WorldToScreen(p2w, s2)) {
+            return;
+        }
+        float j1x = (s1.x - base.x) / eps, j1y = (s1.y - base.y) / eps;
+        float j2x = (s2.x - base.x) / eps, j2y = (s2.y - base.y) / eps;
+        float ex = io.MousePos.x - base.x, ey = io.MousePos.y - base.y;
+        float det = j1x * j2y - j1y * j2x;
+        if (std::fabs(det) > 1e-3f) {
+            float ya = std::min(std::max((ex * j2y - ey * j2x) / det, -0.2f), 0.2f); // clamp: stable convergence
+            float pa = std::min(std::max((j1x * ey - j1y * ex) / det, -0.2f), 0.2f);
+            float r1[3], r2[3];
+            v3rot(dir, up, ya, r1);
+            v3rot(r1, sDragPitchAxis, pa, r2);
+            v3norm(r2);
+            dir[0] = r2[0];
+            dir[1] = r2[1];
+            dir[2] = r2[2];
+        }
     } else {
         ImVec2 origin;
         if (!WorldToScreen(k.eye, origin)) {
@@ -2601,13 +2964,23 @@ static void GizmoContinue() {
         }
 
         if (sDragKind == 2) {
-            // Bend: rotate the spatial tangent (reshapes the curve; no effect on aim).
+            // Bend: rotate the spatial tangent(s) (reshapes the curve; no effect on aim). "Both" rotates the
+            // pair rigidly (a broken corner keeps its angle); a single side leaves the other frozen.
             float rot[3];
-            v3rot(k.tangent, axis, d, rot);
-            v3norm(rot);
-            k.tangent[0] = rot[0];
-            k.tangent[1] = rot[1];
-            k.tangent[2] = rot[2];
+            if (sBendSide != 2) {
+                v3rot(k.tangent, axis, d, rot);
+                v3norm(rot);
+                k.tangent[0] = rot[0];
+                k.tangent[1] = rot[1];
+                k.tangent[2] = rot[2];
+            }
+            if (sBendSide != 1 && k.hasTangentIn) {
+                v3rot(k.tangentIn, axis, d, rot);
+                v3norm(rot);
+                k.tangentIn[0] = rot[0];
+                k.tangentIn[1] = rot[1];
+                k.tangentIn[2] = rot[2];
+            }
         } else if (sDragAxis == 2) {
             k.roll += d * (180.0f / kPi); // aim roll in degrees
         } else {
@@ -4721,21 +5094,39 @@ void CinematicCamPathWindow::DrawElement() {
         }
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Re-time the keyframes so the camera moves at a constant speed: keyframes spread out "
-                              "over long path stretches and pack together over short ones. Keeps total duration.");
+            CineTooltip("Re-time the keyframes so the camera moves at a constant speed: keyframes spread out "
+                        "over long path stretches and pack together over short ones. Keeps total duration. "
+                        "With 3+ keyframes selected (Ctrl+click), only that range is re-timed (its ends stay "
+                        "put).");
         }
         ImGui::SameLine();
         ImGui::BeginDisabled((int)sKeyframes.size() < 2);
-        float dur = TotalTime();
+        // With 2+ keyframes selected this field scales the SELECTION: type a new duration for that span and
+        // its keyframes compress/expand proportionally about the first one (later keyframes stay put).
+        // Otherwise it rescales the whole path.
+        bool selScale = SelectionCount() >= 2;
+        int scLo = 0, scHi = 0;
+        if (selScale) {
+            selScale = ToolRange(scLo, scHi) && !(scLo == 0 && scHi == (int)sKeyframes.size() - 1);
+        }
+        float dur = selScale ? (sKeyframes[scHi].time - sKeyframes[scLo].time) : TotalTime();
         ImGui::SetNextItemWidth(120.0f);
-        ImGui::InputFloat("Total (s)", &dur, 0.0f, 0.0f, "%.2f");
+        ImGui::InputFloat(selScale ? "Selection (s)" : "Total (s)", &dur, 0.0f, 0.0f, "%.2f");
         if (ImGui::IsItemDeactivatedAfterEdit()) { // commit on Enter / focus loss, not on every keystroke
-            SetTotalDuration(dur);
+            if (selScale) {
+                ScaleSelection(scLo, scHi, dur);
+            } else {
+                SetTotalDuration(dur);
+            }
+        }
+        if (ImGui::IsItemHovered()) {
+            CineTooltip(selScale ? "New duration for the SELECTED span: its keyframes compress or expand "
+                                   "proportionally about the first selected one. Keyframes after the span keep "
+                                   "their times."
+                                 : "Rescale the whole path to last this many seconds (keeps relative spacing). "
+                                   "Select 2+ keyframes to compress/expand just that group instead.");
         }
         ImGui::EndDisabled();
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Set the whole path's duration; all keyframe times rescale to fit. Press Enter.");
-        }
 
         // Auto-orbit: its own collapsible (collapsed by default) so it isn't always taking up space.
         if (ImGui::CollapsingHeader("Auto-orbit")) {
@@ -4879,18 +5270,68 @@ void CinematicCamPathWindow::DrawElement() {
             ImGui::SameLine();
             ImGui::RadioButton("Bend (path)", &sGizmoMode, GIZMO_BEND);
             if (sGizmoMode == GIZMO_MOVE) {
-                ImGui::TextDisabled("Drag the red/green/blue axes in the world to move this keyframe.");
+                CineHint("Drag the red/green/blue axes in the world to move this keyframe.");
             } else if (sGizmoMode == GIZMO_ROTATE) {
-                ImGui::TextDisabled("Drag the rings to aim the camera: green=yaw, red=pitch, blue=roll.");
+                CineHint("Drag the rings to aim the camera: green=yaw, red=pitch, blue=roll.");
             } else {
-                ImGui::TextDisabled("Drag the rings to bend the path's curve through this point (no effect on aim).");
-                if (sKeyframes[sel].hasTangent && ImGui::SmallButton("Reset tangent")) {
+                CineHint("Drag the rings to bend the path's curve through this point (no effect on aim).");
+                ImGui::TextUnformatted("Side:");
+                ImGui::SameLine();
+                ImGui::RadioButton("Both", &sBendSide, 0);
+                bool sideHov = ImGui::IsItemHovered();
+                ImGui::SameLine();
+                ImGui::RadioButton("Out##bendside", &sBendSide, 1);
+                sideHov = sideHov || ImGui::IsItemHovered();
+                ImGui::SameLine();
+                ImGui::RadioButton("In##bendside", &sBendSide, 2);
+                sideHov = sideHov || ImGui::IsItemHovered();
+                if (sideHov || sBendSide != 0) {
+                    CineHint("Out = the curve leaving toward the next keyframe (magenta handle); In = the "
+                             "curve arriving from the previous one (teal). Editing one side breaks the "
+                             "handle so the path can turn a corner here; Both keeps/rotates them rigidly.");
+                }
+                // Side weights: how far the curve bulges on each side of this keyframe (a scalable Bezier
+                // handle, the "tension per side" control). 1.0 = the automatic length; relative, so it stays
+                // sensible when the keyframe moves. Drag the handle DOTS in the world to steer direction.
+                {
+                    CineKeyframe& kfb = sKeyframes[sel];
+                    float wo = (kfb.tanWOut > 0.0f) ? kfb.tanWOut : 1.0f;
+                    float wi = (kfb.tanWIn > 0.0f) ? kfb.tanWIn : 1.0f;
+                    // Neutral (1.0) stores as 0 = automatic, so merely touching a slider doesn't pin the key.
+                    ImGui::SetNextItemWidth(110.0f);
+                    ImGui::SliderFloat("Out weight", &wo, 0.2f, 3.0f, "%.2f");
+                    if (ImGui::IsItemActivated()) {
+                        PushUndo();
+                    }
+                    if (ImGui::IsItemActive() || ImGui::IsItemDeactivatedAfterEdit()) {
+                        kfb.tanWOut = (std::fabs(wo - 1.0f) < 0.01f) ? 0.0f : wo;
+                    }
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(110.0f);
+                    ImGui::SliderFloat("In weight", &wi, 0.2f, 3.0f, "%.2f");
+                    if (ImGui::IsItemActivated()) {
+                        PushUndo();
+                    }
+                    if (ImGui::IsItemActive() || ImGui::IsItemDeactivatedAfterEdit()) {
+                        kfb.tanWIn = (std::fabs(wi - 1.0f) < 0.01f) ? 0.0f : wi;
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        CineTooltip("How strongly each side of this keyframe shapes the curve (handle length). "
+                                    "Works with or without a custom direction.");
+                    }
+                }
+                bool pinned = sKeyframes[sel].hasTangent || sKeyframes[sel].hasTangentIn ||
+                              sKeyframes[sel].tanWOut > 0.0f || sKeyframes[sel].tanWIn > 0.0f;
+                if (pinned && ImGui::SmallButton("Reset tangent")) {
                     PushUndo();
                     sKeyframes[sel].hasTangent = 0;
+                    sKeyframes[sel].hasTangentIn = 0;
+                    sKeyframes[sel].tanWOut = 0.0f;
+                    sKeyframes[sel].tanWIn = 0.0f;
                 }
             }
         } else {
-            ImGui::TextDisabled("Enable 'Show path in world' to use the move/rotate/bend gizmo.");
+            CineHint("Enable 'Show path in world' to use the move/rotate/bend gizmo.");
         }
 
         float t = sKeyframes[sel].time;
