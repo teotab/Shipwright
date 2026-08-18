@@ -11,6 +11,9 @@
 #include <fstream>
 #include <filesystem>
 #include <chrono>
+#include <cstdint>
+#include <ctime>
+#include <cstdarg>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
@@ -24,6 +27,32 @@ void CinematicCam_GetPose(float* eye, float* at, float* roll, float* fov);
 void CinematicCam_SetPlayback(int active, float* eye, float* at, float roll, float fov);
 int CinematicCam_WorldToNdc(float* world, float* outNdcX, float* outNdcY);
 int CinematicCam_GetPlayerPos(float* out);
+}
+
+// In-window hint text that WRAPS at the window edge (TextDisabled draws one long unwrapped line, so the longer
+// help texts ran off screen). Every disabled-color hint/label in this editor goes through here.
+static void CineHint(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+    ImGui::TextV(fmt, args);
+    ImGui::PopStyleColor();
+    ImGui::PopTextWrapPos();
+    va_end(args);
+}
+
+// Tooltip that WRAPS. ImGui::SetTooltip never wraps, so the longer help texts ran off screen; every tooltip in
+// this editor goes through here instead.
+static void CineTooltip(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    ImGui::BeginTooltip();
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 28.0f);
+    ImGui::TextV(fmt, args);
+    ImGui::PopTextWrapPos();
+    ImGui::EndTooltip();
+    va_end(args);
 }
 
 // ---------------------------------------------------------------------------
@@ -425,7 +454,12 @@ static void SortByTime() {
     sIds = std::move(ids);
 }
 
-static float v3len(const float* a); // defined with the gizmo vector helpers below
+// Defined with the gizmo vector helpers below.
+static float v3len(const float* a);
+static void v3sub(const float* a, const float* b, float* o);
+static void v3norm(float* a);
+static float v3dot(const float* a, const float* b);
+static void AutoTangentDir(int idx, float out[3]); // path travel direction at a keyframe (rail aim)
 
 // Kochanek-Bartels (TCB) Hermite interpolation for one scalar component over a segment p1 -> p2.
 // tcB = TCB params at p1 (segment source), tcC = TCB params at p2 (segment destination).
@@ -437,17 +471,12 @@ static float Hermite1(float p1, float p2, float m0, float m1, float s) {
            (s3 - s2) * m1;
 }
 
-// Spline parameterization for the eye path:
-//   0 = even velocity (knots = segment durations) - velocity-continuous: the camera (and therefore the view
-//       direction) moves at a smooth, time-coherent rate with no speed dip/jolt at the keyframes, while
-//       keyframe spacing on the timeline still controls pacing. The cinematic default.
-//   1 = uniform Catmull-Rom (equal knot spacing) - the classic, snappier look; can overshoot on unevenly
-//       spaced points (tame it with per-keyframe Tension or the Smooth tool).
-// NOTE: centripetal/chordal (chord^alpha knots) were removed. They give the smoothest spatial SHAPE, but
-// because the tangent magnitudes scale with chord length (not time) the eye speeds up and slows down within
-// each segment in a way that's decoupled from the timeline - so the view appears to hang toward the next
-// keyframe and then snap. "Even velocity" gives smooth motion; Tension/Smooth cover overshoot.
-static int sSplineParam = 0;
+// Derivative of Hermite1 with respect to its parameter s (used to read the curve's tangent at a split point).
+static float Hermite1Deriv(float p1, float p2, float m0, float m1, float s) {
+    float s2 = s * s;
+    return (6.0f * s2 - 6.0f * s) * p1 + (3.0f * s2 - 4.0f * s + 1.0f) * m0 + (-6.0f * s2 + 6.0f * s) * p2 +
+           (3.0f * s2 - 2.0f * s) * m1;
+}
 
 // Non-uniform Kochanek-Bartels tangents for the segment p1->p2 (mOut at p1, mIn at p2), given the three knot
 // intervals t01,t12,t23 (the "parameter distances" between the four control points; chord^alpha for
@@ -455,9 +484,11 @@ static int sSplineParam = 0;
 // Tension/Continuity/Bias at p1 (out-tangent), tC/cC/bC at p2 (in-tangent). With all TCB params 0 this is
 // exactly non-uniform Catmull-Rom, so dialing TCB away from 0 changes the curve continuously in any
 // parameterization (no jump to a different uniform formula). Tangents are scaled to the [0,1] Hermite param.
+// noPrev / noNext: p0 / p3 is a duplicated clamp point (no real neighbor on that side), so its zero-length
+// secant must not participate in the overshoot guard - otherwise every path would be forced to start/end at rest.
 static void NuKbTangents(const float* p0, const float* p1, const float* p2, const float* p3, float t01, float t12,
-                         float t23, float tB, float cB, float bB, float tC, float cC, float bC, float* mOut,
-                         float* mIn) {
+                         float t23, float tB, float cB, float bB, float tC, float cC, float bC, float* mOut, float* mIn,
+                         bool noPrev, bool noNext) {
     if (t01 < 1e-5f) {
         t01 = 1e-5f;
     }
@@ -469,6 +500,7 @@ static void NuKbTangents(const float* p0, const float* p1, const float* p2, cons
     }
     float wInO = t12 / (t01 + t12), wOutO = t01 / (t01 + t12);  // interval weights, out-tangent at p1
     float wMidI = t23 / (t12 + t23), wFarI = t12 / (t12 + t23); // interval weights, in-tangent at p2
+    float lIn = 0.0f, lOut = 0.0f, lFar = 0.0f;                 // secant SPEEDS (vector norms), for the guard below
     for (int k = 0; k < 3; k++) {
         float sIn = (p1[k] - p0[k]) / t01; // one-sided secant velocities
         float sOut = (p2[k] - p1[k]) / t12;
@@ -477,13 +509,42 @@ static void NuKbTangents(const float* p0, const float* p1, const float* p2, cons
         float vIn = (1.0f - tC) * (wMidI * (1.0f - cC) * (1.0f + bC) * sOut + wFarI * (1.0f + cC) * (1.0f - bC) * sFar);
         mOut[k] = vOut * t12;
         mIn[k] = vIn * t12;
+        lIn += sIn * sIn;
+        lOut += sOut * sOut;
+        lFar += sFar * sFar;
+    }
+    lIn = std::sqrt(lIn);
+    lOut = std::sqrt(lOut);
+    lFar = std::sqrt(lFar);
+    // Overshoot guard (a vector Fritsch-Carlson): cap each tangent's LENGTH at 3x the smaller of its two
+    // adjacent secant speeds, keeping its direction. A velocity-continuous spline otherwise sails THROUGH a
+    // keyframe at whatever speed the neighbors imply - with two coincident keyframes that literally draws a
+    // full loop out and back (tangents nonzero, chord zero). The cap makes a zero-length segment an exact
+    // hold, eases motion to rest INTO a hold and out of it, and tames the swing into very short segments,
+    // while leaving well-proportioned paths untouched (their tangents sit far below 3x the local secants).
+    float capOut = 3.0f * (noPrev ? lOut : std::min(lIn, lOut)) * t12;
+    float capIn = 3.0f * (noNext ? lOut : std::min(lOut, lFar)) * t12;
+    float nOut = std::sqrt(mOut[0] * mOut[0] + mOut[1] * mOut[1] + mOut[2] * mOut[2]);
+    float nIn = std::sqrt(mIn[0] * mIn[0] + mIn[1] * mIn[1] + mIn[2] * mIn[2]);
+    if (nOut > capOut) {
+        float f = (nOut > 1e-6f) ? capOut / nOut : 0.0f;
+        mOut[0] *= f;
+        mOut[1] *= f;
+        mOut[2] *= f;
+    }
+    if (nIn > capIn) {
+        float f = (nIn > 1e-6f) ? capIn / nIn : 0.0f;
+        mIn[0] *= f;
+        mIn[1] *= f;
+        mIn[2] *= f;
     }
 }
 
-// Scalar form of the non-uniform Kochanek-Bartels evaluation (for the aim point components, roll and FOV), so
-// they interpolate as smoothly as the eye path - no stiff/quick swing when a turn and an aim change coincide.
-static float NuKbScalar(float p0, float p1, float p2, float p3, float t01, float t12, float t23, float tB, float cB,
-                        float bB, float tC, float cC, float bC, float s, bool monotone, bool zeroOut, bool zeroIn) {
+// The two Hermite endpoint slopes for a scalar segment p1->p2 (non-uniform Kochanek-Bartels), already scaled
+// to the [0,1] segment parameter. Split out from NuKbScalar so callers that need to OVERRIDE a slope (the aim
+// channels, which expose per-keyframe tangent modes) can start from the automatic value.
+static void NuKbScalarSlopes(float p0, float p1, float p2, float p3, float t01, float t12, float t23, float tB,
+                             float cB, float bB, float tC, float cC, float bC, bool monotone, float* mOut, float* mIn) {
     if (t01 < 1e-5f) {
         t01 = 1e-5f;
     }
@@ -499,11 +560,10 @@ static float NuKbScalar(float p0, float p1, float p2, float p3, float t01, float
     float vOut = (1.0f - tB) * (wInO * (1.0f + cB) * (1.0f + bB) * sIn + wOutO * (1.0f - cB) * (1.0f - bB) * sOut);
     float vIn = (1.0f - tC) * (wMidI * (1.0f - cC) * (1.0f + bC) * sOut + wFarI * (1.0f + cC) * (1.0f - bC) * sFar);
 
-    // Monotone limiting (Fritsch-Carlson): clamp each endpoint slope to the local secants so a 1D channel (roll,
-    // FOV) never overshoots or bleeds past its adjacent keyframes - a big roll spike on one keyframe stays in its
-    // two neighboring segments instead of rippling two keyframes out on each side. Only for scalar channels: doing
-    // this per-axis on the 3D aim point puts kinks in its trajectory (each axis zeros its slope at a different
-    // moment), which reads as the aim twitching left/right at keyframes - so the aim passes monotone = false.
+    // Monotone limiting (Fritsch-Carlson): clamp each endpoint slope to the local secants so a 1D channel never
+    // overshoots or bleeds past its adjacent keyframes - a big roll spike on one keyframe stays in its two
+    // neighboring segments instead of rippling two keyframes out on each side. At a local extreme (the secants
+    // disagree) the slope goes to zero, which is what keeps the curve from bulging past the keyframe's value.
     if (monotone) {
         if (sIn * sOut <= 0.0f) {
             vOut = 0.0f;
@@ -518,16 +578,61 @@ static float NuKbScalar(float p0, float p1, float p2, float p3, float t01, float
             vIn = std::min(std::max(vIn, -lim), lim);
         }
     }
-    // Boundary easing: force an endpoint slope to zero so this channel meets a "held" (constant) neighbor with
-    // matching velocity. Used by the aim where a free segment borders a locked-on-target segment - otherwise the
-    // free side arrives moving while the locked side sits still, which reads as a small jerk at the keyframe.
-    if (zeroOut) {
-        vOut = 0.0f;
+    *mOut = vOut * t12;
+    *mIn = vIn * t12;
+}
+
+// Scalar form of the non-uniform Kochanek-Bartels evaluation (for the 1D channels: roll and FOV), so they
+// interpolate as smoothly as the eye path - no stiff/quick swing when a turn and an aim change coincide.
+static float NuKbScalar(float p0, float p1, float p2, float p3, float t01, float t12, float t23, float tB, float cB,
+                        float bB, float tC, float cC, float bC, float s, bool monotone) {
+    float mOut, mIn;
+    NuKbScalarSlopes(p0, p1, p2, p3, t01, t12, t23, tB, cB, bB, tC, cC, bC, monotone, &mOut, &mIn);
+    return Hermite1(p1, p2, mOut, mIn, s);
+}
+
+// Endpoint slopes for one aim angle (yaw or pitch) over segment b->c, in [0,1]-parameter space. Authority
+// order: automatic from the neighbours -> the keyframes' baked explicit rates (exOut/exIn, from Insert) ->
+// the envelope clamp -> Hold framing.
+//
+// The limiting here is deliberately gentler than the roll/FOV rule above, and that difference IS the fix for
+// the aim stalling at keyframes: `noPrev` / `noNext` mean there is no meaningful neighbour on that side (a
+// clamped path end, a locked tracked aim), so this segment continues at its OWN rate instead of pretending
+// the view was standing still there. The clamp keeps both slopes pointing the way this segment actually
+// turns, no steeper than 3x its own rate: monotone, so the view can never swing past either keyframe's
+// framing. (For exact bakes the clamp is a no-op - a monotone cubic's slopes already satisfy it.)
+static void AimAngleSlopes(float p0, float p1, float p2, float p3, float t01, float t12, float t23,
+                           const CineKeyframe& b, const CineKeyframe& c, bool noPrev, bool noNext, float exOut,
+                           float exIn, float* mOut, float* mIn) {
+    if (noPrev) {
+        p0 = p1 - (p2 - p1) * (t01 / std::max(t12, 1e-5f)); // one-sided: continue this segment's own rate
     }
-    if (zeroIn) {
-        vIn = 0.0f;
+    if (noNext) {
+        p3 = p2 + (p2 - p1) * (t23 / std::max(t12, 1e-5f));
     }
-    return Hermite1(p1, p2, vOut * t12, vIn * t12, s);
+    NuKbScalarSlopes(p0, p1, p2, p3, t01, t12, t23, b.tension, b.continuity, b.bias, c.tension, c.continuity, c.bias,
+                     false, mOut, mIn);
+    if (b.hasAimTan) {
+        *mOut = exOut;
+    }
+    if (c.hasAimTan) {
+        *mIn = exIn;
+    }
+    float secant = p2 - p1; // this segment's straight-line slope, in [0,1] parameter space
+    float lim = 3.0f * std::fabs(secant);
+    if (secant >= 0.0f) {
+        *mOut = std::min(std::max(*mOut, 0.0f), lim);
+        *mIn = std::min(std::max(*mIn, 0.0f), lim);
+    } else {
+        *mOut = std::min(std::max(*mOut, -lim), 0.0f);
+        *mIn = std::min(std::max(*mIn, -lim), 0.0f);
+    }
+    if (b.aimHold) { // "hold framing" on either end parks the view's turn there
+        *mOut = 0.0f;
+    }
+    if (c.aimHold) {
+        *mIn = 0.0f;
+    }
 }
 
 // Interpolate one component over a segment with the given knot intervals, honoring the source keyframe's mode.
@@ -537,7 +642,7 @@ static float InterpComp(float p0, float p1, float p2, float p3, const CineKeyfra
         return p1 + (p2 - p1) * s;
     }
     return NuKbScalar(p0, p1, p2, p3, t01, t12, t23, kSrc.tension, kSrc.continuity, kSrc.bias, kDst.tension,
-                      kDst.continuity, kDst.bias, s, true, false, false);
+                      kDst.continuity, kDst.bias, s, true);
 }
 
 // Duration (seconds) of the path segment that starts at keyframe index j and runs to the next one cyclically.
@@ -557,9 +662,78 @@ static float SegDurAt(int j) {
     return d < 1e-4f ? 1e-4f : d;
 }
 
+// The eye-path Hermite tangents (in [0,1] segment-parameter units) for the segment i1 -> i2, exactly as
+// SampleAt evaluates it: parameterization knots, TCB, the overshoot guard, and the per-keyframe direction and
+// speed overrides. Shared by SampleAt and the shape-preserving insert, which needs the tangents of a segment
+// and its neighbors to pin the curve before a knot is added.
+static void EyeSegmentTangents(int i1, int i2, float td[3], float ts[3]) {
+    int n = (int)sKeyframes.size();
+    int i0, i3;
+    if (LoopCyclic()) {
+        i0 = ((i1 - 1) % n + n) % n;
+        i3 = (i2 + 1) % n;
+    } else {
+        i0 = std::max(0, i1 - 1);
+        i3 = std::min(n - 1, i2 + 1);
+    }
+    const CineKeyframe& a = sKeyframes[i0];
+    const CineKeyframe& b = sKeyframes[i1];
+    const CineKeyframe& c = sKeyframes[i2];
+    const CineKeyframe& d = sKeyframes[i3];
+    // Centripetal parameterization: knots from the square root of the chord lengths - GEOMETRY ONLY. This is
+    // the classic loop/cusp-free choice, and because time plays no part here, retiming keyframes can never
+    // reshape the path. Timing is applied separately as an arc-length speed schedule (see SampleAt).
+    auto chordKnot = [](const float* p, const float* q) {
+        float e0 = q[0] - p[0], e1 = q[1] - p[1], e2 = q[2] - p[2];
+        return std::sqrt(std::sqrt(e0 * e0 + e1 * e1 + e2 * e2)); // chord^0.5
+    };
+    float t12 = chordKnot(b.eye, c.eye);
+    float t01 = (i0 != i1) ? chordKnot(a.eye, b.eye) : t12;
+    float t23 = (i2 != i3) ? chordKnot(c.eye, d.eye) : t12;
+    NuKbTangents(a.eye, b.eye, c.eye, d.eye, t01, t12, t23, b.tension, b.continuity, b.bias, c.tension, c.continuity,
+                 c.bias, td, ts, i0 == i1, i2 == i3);
+    if (b.hasTangent) {
+        float m = v3len(td);
+        td[0] = b.tangent[0] * m;
+        td[1] = b.tangent[1] * m;
+        td[2] = b.tangent[2] * m;
+    }
+    // The in side of c uses its broken in-direction when set, else the shared/mirrored tangent.
+    if (c.hasTangentIn || c.hasTangent) {
+        const float* dir = c.hasTangentIn ? c.tangentIn : c.tangent;
+        float m = v3len(ts);
+        ts[0] = dir[0] * m;
+        ts[1] = dir[1] * m;
+        ts[2] = dir[2] * m;
+    }
+    // Per-side tangent WEIGHTS scale the (guarded) automatic magnitude. Relative on purpose: when a keyframe
+    // moves, the auto magnitude follows the new chords and the weighted tangent scales with it - no stale
+    // absolute length bulging the curve.
+    if (b.tanWOut > 0.0f) {
+        td[0] *= b.tanWOut;
+        td[1] *= b.tanWOut;
+        td[2] *= b.tanWOut;
+    }
+    if (c.tanWIn > 0.0f) {
+        ts[0] *= c.tanWIn;
+        ts[1] *= c.tanWIn;
+        ts[2] *= c.tanWIn;
+    }
+}
+
 // A keyframe's effective look-at point this frame: the stored point for free/point aim, or Link's live
 // position for player aim.
 static void EffectiveAt(int idx, float out[3]) {
+    // Path-level rail override: every keyframe faces along the path's travel direction.
+    if (sAimOverride == 4) {
+        const CineKeyframe& kk = sKeyframes[idx];
+        float td[3];
+        AutoTangentDir(idx, td);
+        out[0] = kk.eye[0] + td[0] * 100.0f;
+        out[1] = kk.eye[1] + td[1] * 100.0f;
+        out[2] = kk.eye[2] + td[2] * 100.0f;
+        return;
+    }
     // Path-level override aims every keyframe at one target (great for fixing up recorded paths at once).
     if (sAimOverride == 1) {
         float p[3];
@@ -609,6 +783,13 @@ static void EffectiveAt(int idx, float out[3]) {
         out[1] = sAimOverridePoint[1];
         out[2] = sAimOverridePoint[2];
         return;
+    } else if (k.aimMode == CINE_AIM_RAIL) {
+        float td[3]; // face along the rail at this keyframe (blends with neighboring free/rail aims)
+        AutoTangentDir(idx, td);
+        out[0] = k.eye[0] + td[0] * 100.0f;
+        out[1] = k.eye[1] + td[1] * 100.0f;
+        out[2] = k.eye[2] + td[2] * 100.0f;
+        return;
     }
     out[0] = k.at[0];
     out[1] = k.at[1];
@@ -622,6 +803,9 @@ static void EffectiveAt(int idx, float out[3]) {
 // look-at spline only touches the target AT each keyframe and bows away from it in between (pulled by the
 // neighboring keyframes' tangents). Free/point keyframes are authored static look-at points, so they still blend.
 static bool AimLockedBetween(const CineKeyframe& b, const CineKeyframe& c) {
+    if (sAimOverride == 4) {
+        return false; // rail override: the aim follows the travel direction, it doesn't hold a target
+    }
     if (sAimOverride != 0) {
         return true;
     }
@@ -636,6 +820,330 @@ static bool AimLockedBetween(const CineKeyframe& b, const CineKeyframe& c) {
             return b.aimActorId == c.aimActorId;
         default:
             return false;
+    }
+}
+
+// --- WHERE vs WHEN: the arc-length speed schedule ---------------------------------------------------------
+// The spatial path is pure geometry (centripetal knots in EyeSegmentTangents) - the timeline cannot reshape
+// it. Timing is layered on top: each segment's arc length is measured, and a monotone C1 cubic through the
+// keyframe (time, cumulative distance) knots maps time -> distance traveled (Fritsch-Carlson slopes: speed
+// glides smoothly THROUGH keyframes with no hang/snap, never runs backwards, and every keyframe is reached
+// at exactly its timeline time). The eye then rides the path to that distance. Retiming a keyframe therefore
+// only redistributes speed. Cached; rebuilt when PathShapeHash changes.
+static uint32_t PathShapeHash(); // defined below (also used by the overlay/curve-editor caches)
+
+static const int kArcSteps = 24; // per-segment tessellation for the length tables
+struct CineArcCache {
+    uint32_t hash = 0;
+    int segs = 0;             // spatial segments, including the loop-return one when cyclic
+    std::vector<float> cum;   // per segment: kArcSteps+1 cumulative lengths (local, 0 .. segment length)
+    std::vector<float> S;     // cumulative arc length at each knot (segs+1 entries)
+    std::vector<float> slope; // ds/dt at each knot, monotone-limited (world units/sec)
+    // Per-SEGMENT endpoint speeds (units/sec): the knot slopes above, with each keyframe's explicit rate
+    // substituted where it has one, clamped to 3x this segment's own average (the bound that keeps distance
+    // monotone in time - i.e. that keeps the camera arriving exactly on its keyframes).
+    std::vector<float> mOut, mIn;
+};
+static CineArcCache sArc;
+
+// Monotone (Fritsch-Carlson) knot slopes for a cumulative-quantity-over-time schedule (arc length for the
+// eye, view angle for the aim). All secants are >= 0, so limiting each knot's slope to 3x the smaller
+// adjacent secant guarantees the quantity never runs backwards; a zero-length segment (a hold) forces slope 0
+// on both of its ends, so motion eases to rest into it and out of it. When cyclic, knot 0 and the last knot
+// are the SAME keyframe: give them the same wrapped slope so the rate glides through the loop seam instead of
+// popping to a new pace each lap.
+static void BuildMonotoneSlopes(const std::vector<float>& S, int segs, std::vector<float>& slope) {
+    bool cyc = LoopCyclic() && segs >= 2;
+    for (int i = 0; i <= segs; i++) {
+        float sigPrev, sigNext;
+        if (i > 0) {
+            sigPrev = (S[i] - S[i - 1]) / SegDurAt(i - 1);
+        } else {
+            sigPrev = cyc ? (S[segs] - S[segs - 1]) / SegDurAt(segs - 1) : -1.0f;
+        }
+        if (i < segs) {
+            sigNext = (S[i + 1] - S[i]) / SegDurAt(i);
+        } else {
+            sigNext = cyc ? (S[1] - S[0]) / SegDurAt(0) : -1.0f;
+        }
+        float m;
+        if (sigPrev < 0.0f) {
+            m = sigNext; // first knot, non-loop: one-sided
+        } else if (sigNext < 0.0f) {
+            m = sigPrev; // last knot, non-loop: one-sided
+        } else if (sigPrev < 1e-6f || sigNext < 1e-6f) {
+            m = 0.0f; // bordering a hold: come to rest
+        } else {
+            m = 0.5f * (sigPrev + sigNext);
+            float lim = 3.0f * std::min(sigPrev, sigNext);
+            m = std::min(m, lim);
+        }
+        slope[i] = std::max(m, 0.0f);
+    }
+}
+
+static void ArcRebuild() {
+    int n = (int)sKeyframes.size();
+    sArc.segs = (n >= 2) ? (LoopCyclic() ? n : n - 1) : 0;
+    sArc.cum.assign((size_t)std::max(sArc.segs, 0) * (kArcSteps + 1), 0.0f);
+    sArc.S.assign((size_t)std::max(sArc.segs, 0) + 1, 0.0f);
+    sArc.slope.assign((size_t)std::max(sArc.segs, 0) + 1, 0.0f);
+    for (int i = 0; i < sArc.segs; i++) {
+        int i2 = (i + 1) % n;
+        const CineKeyframe& b = sKeyframes[i];
+        const CineKeyframe& c = sKeyframes[i2];
+        float* cum = &sArc.cum[(size_t)i * (kArcSteps + 1)];
+        float len = 0.0f;
+        if (b.interp == CINE_INTERP_LINEAR) {
+            float e0 = c.eye[0] - b.eye[0], e1 = c.eye[1] - b.eye[1], e2 = c.eye[2] - b.eye[2];
+            float chord = std::sqrt(e0 * e0 + e1 * e1 + e2 * e2);
+            for (int s = 0; s <= kArcSteps; s++) {
+                cum[s] = chord * (float)s / (float)kArcSteps;
+            }
+            len = chord;
+        } else {
+            float td[3], ts[3];
+            EyeSegmentTangents(i, i2, td, ts);
+            float prev[3] = { b.eye[0], b.eye[1], b.eye[2] };
+            cum[0] = 0.0f;
+            for (int s = 1; s <= kArcSteps; s++) {
+                float u = (float)s / (float)kArcSteps;
+                float p[3];
+                for (int k = 0; k < 3; k++) {
+                    p[k] = Hermite1(b.eye[k], c.eye[k], td[k], ts[k], u);
+                }
+                float e0 = p[0] - prev[0], e1 = p[1] - prev[1], e2 = p[2] - prev[2];
+                len += std::sqrt(e0 * e0 + e1 * e1 + e2 * e2);
+                cum[s] = len;
+                prev[0] = p[0];
+                prev[1] = p[1];
+                prev[2] = p[2];
+            }
+        }
+        sArc.S[i + 1] = sArc.S[i] + len;
+    }
+    BuildMonotoneSlopes(sArc.S, sArc.segs, sArc.slope);
+    // Per-segment endpoint speeds: start from the automatic knot slopes, substitute each keyframe's explicit
+    // rate for the side it governs, then clamp to 3x THIS segment's own average speed. The clamp is what keeps
+    // the camera arriving exactly on the next keyframe; automatic values already satisfy it, so only dragged
+    // handles are ever limited (and the handle draws at the limited value, so the graph shows the bound).
+    sArc.mOut.assign((size_t)std::max(sArc.segs, 0), 0.0f);
+    sArc.mIn.assign((size_t)std::max(sArc.segs, 0), 0.0f);
+    for (int i = 0; i < sArc.segs; i++) {
+        float sig = (sArc.S[i + 1] - sArc.S[i]) / SegDurAt(i);
+        float cap = 3.0f * sig;
+        float exOut = (n > 0) ? sKeyframes[i % n].speedRateOut : -1.0f;
+        float exIn = (n > 0) ? sKeyframes[(i + 1) % n].speedRateIn : -1.0f;
+        float mo = (exOut >= 0.0f) ? exOut : sArc.slope[i];
+        float mi = (exIn >= 0.0f) ? exIn : sArc.slope[i + 1];
+        sArc.mOut[i] = std::min(std::max(mo, 0.0f), cap);
+        sArc.mIn[i] = std::min(std::max(mi, 0.0f), cap);
+    }
+}
+
+static void ArcEnsure() {
+    uint32_t h = PathShapeHash();
+    int wantSegs =
+        ((int)sKeyframes.size() >= 2) ? (LoopCyclic() ? (int)sKeyframes.size() : (int)sKeyframes.size() - 1) : 0;
+    if (h != sArc.hash || wantSegs != sArc.segs) {
+        ArcRebuild();
+        sArc.hash = h;
+    }
+}
+
+// Map the (eased) local time progress p in arc segment i1 to the geometric curve parameter u in [0,1].
+static float ArcParamAtTime(int i1, float p) {
+    if (i1 < 0 || i1 >= sArc.segs) {
+        return p; // no schedule (degenerate path): fall back to raw progress
+    }
+    float dur = SegDurAt(i1);
+    float d = Hermite1(sArc.S[i1], sArc.S[i1 + 1], sArc.mOut[i1] * dur, sArc.mIn[i1] * dur, p) - sArc.S[i1];
+    const float* cum = &sArc.cum[(size_t)i1 * (kArcSteps + 1)];
+    float len = cum[kArcSteps];
+    if (len < 1e-5f) {
+        return 0.0f; // zero-length segment: hold on the keyframe
+    }
+    d = std::min(std::max(d, 0.0f), len);
+    int lo = 0, hi = kArcSteps; // invariant: cum[lo] <= d <= cum[hi]
+    while (hi - lo > 1) {
+        int mid = (lo + hi) / 2;
+        if (cum[mid] <= d) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    float span = cum[hi] - cum[lo];
+    float frac = (span > 1e-6f) ? (d - cum[lo]) / span : 0.0f;
+    return ((float)lo + frac) / (float)kArcSteps;
+}
+
+// Eye position on arc segment i1 -> i2 at geometric curve parameter u (pure geometry, no schedule).
+static void EyePosAt(int i1, int i2, float u, float* out) {
+    const CineKeyframe& b = sKeyframes[i1];
+    const CineKeyframe& c = sKeyframes[i2];
+    if (b.interp == CINE_INTERP_LINEAR) {
+        for (int k = 0; k < 3; k++) {
+            out[k] = b.eye[k] + (c.eye[k] - b.eye[k]) * u;
+        }
+    } else {
+        float td[3], ts[3];
+        EyeSegmentTangents(i1, i2, td, ts);
+        for (int k = 0; k < 3; k++) {
+            out[k] = Hermite1(b.eye[k], c.eye[k], td[k], ts[k], u);
+        }
+    }
+}
+
+// The aim's value curves for segment i1: endpoint yaw/pitch (radians, yaw unwrapped the short way round),
+// look-at distances, and the four Hermite slopes with explicit bakes, the envelope clamp and holds applied.
+// Returns false when the segment has no direction to interpolate (degenerate look-at on an endpoint).
+// Shared by evaluation (AimPointAt) and by Insert @ playhead's bake, so what gets baked is exactly what
+// renders.
+static bool AimSegmentCurve(int i1, float* oyB, float* oyC, float* opB, float* opC, float* moY, float* miY, float* moP,
+                            float* miP, float* olenB, float* olenC) {
+    int n = (int)sKeyframes.size();
+    int i2 = (i1 + 1) % n;
+    int i0, i3;
+    if (LoopCyclic()) {
+        i0 = ((i1 - 1) % n + n) % n;
+        i3 = (i2 + 1) % n;
+    } else {
+        i0 = std::max(0, i1 - 1);
+        i3 = std::min(n - 1, i2 + 1);
+    }
+    const CineKeyframe& a = sKeyframes[i0];
+    const CineKeyframe& b = sKeyframes[i1];
+    const CineKeyframe& c = sKeyframes[i2];
+    const CineKeyframe& d = sKeyframes[i3];
+    float at12 = SegDurAt(i1);
+    float at01 = (i0 != i1) ? SegDurAt(i0) : at12;
+    float at23 = (i2 != i3) ? SegDurAt(i2) : at12;
+    float aA[3], aB[3], aC[3], aD[3];
+    EffectiveAt(i0, aA);
+    EffectiveAt(i1, aB);
+    EffectiveAt(i2, aC);
+    EffectiveAt(i3, aD);
+    float dA[3], dB[3], dC[3], dD[3];
+    v3sub(aB, b.eye, dB);
+    v3sub(aC, c.eye, dC);
+    float lenB = v3len(dB), lenC = v3len(dC);
+    if (lenB < 1e-3f || lenC < 1e-3f) {
+        return false;
+    }
+    for (int k = 0; k < 3; k++) {
+        dB[k] /= lenB;
+        dC[k] /= lenC;
+    }
+    v3sub(aA, a.eye, dA); // neighbours give the turn its tangent context; degenerate ones borrow the
+    v3sub(aD, d.eye, dD); // segment's own endpoint direction
+    if (v3len(dA) > 1e-3f) {
+        v3norm(dA);
+    } else {
+        std::memcpy(dA, dB, sizeof(dA));
+    }
+    if (v3len(dD) > 1e-3f) {
+        v3norm(dD);
+    } else {
+        std::memcpy(dD, dC, sizeof(dD));
+    }
+    // Angle space (yaw + pitch), never Cartesian blending: componentwise blending of unit vectors shortens
+    // the horizontal part and INFLATES pitch mid-segment (two 4.8-deg framings measured 7.7 deg between).
+    const float kPi = 3.14159265358979f;
+    auto yawOf = [](const float* dv) { return std::atan2(dv[0], dv[2]); };
+    auto pitchOf = [](const float* dv) { return std::asin(std::min(std::max(dv[1], -1.0f), 1.0f)); };
+    auto unwrap = [&](float y, float ref) { // shortest way round from the reference
+        while (y - ref > kPi) {
+            y -= 2.0f * kPi;
+        }
+        while (y - ref < -kPi) {
+            y += 2.0f * kPi;
+        }
+        return y;
+    };
+    float yB = yawOf(dB), pB = pitchOf(dB);
+    float yC = unwrap(yawOf(dC), yB), pC = pitchOf(dC);
+    float yA = unwrap(yawOf(dA), yB), pA = pitchOf(dA);
+    float yD = unwrap(yawOf(dD), yC), pD = pitchOf(dD);
+    // A clamped path end or a locked (tracked) neighbour carries no useful rate: one-sided treatment instead
+    // of pretending the view was standing still there (which forced dead stops at exactly those keyframes).
+    bool prevLocked = (i0 != i1) && AimLockedBetween(a, b);
+    bool nextLocked = (i2 != i3) && AimLockedBetween(c, d);
+    bool noPrev = (i0 == i1) || prevLocked;
+    bool noNext = (i2 == i3) || nextLocked;
+    const float kD2R = kPi / 180.0f; // stored explicit rates are deg/s; slopes are per [0,1] segment param
+    AimAngleSlopes(yA, yB, yC, yD, at01, at12, at23, b, c, noPrev, noNext, b.aimTanYawOut * kD2R * at12,
+                   c.aimTanYawIn * kD2R * at12, moY, miY);
+    AimAngleSlopes(pA, pB, pC, pD, at01, at12, at23, b, c, noPrev, noNext, b.aimTanPitchOut * kD2R * at12,
+                   c.aimTanPitchIn * kD2R * at12, moP, miP);
+    *oyB = yB;
+    *oyC = yC;
+    *opB = pB;
+    *opC = pC;
+    *olenB = lenB;
+    *olenC = lenC;
+    return true;
+}
+
+// Look-at point on arc segment i1 at aim-curve parameter pAim. eyePos / ueEye are the eye's position and
+// geometric parameter at the same moment. Three rules total: locked tracking is exact, rail follows the
+// travel direction, and everything else is the yaw/pitch value curves from AimSegmentCurve.
+static void AimPointAt(int i1, float pAim, float ueEye, const float* eyePos, float* out) {
+    int n = (int)sKeyframes.size();
+    int i2 = (i1 + 1) % n;
+    const CineKeyframe& b = sKeyframes[i1];
+    const CineKeyframe& c = sKeyframes[i2];
+    float aB[3], aC[3];
+    EffectiveAt(i1, aB);
+    EffectiveAt(i2, aC);
+    bool aimLocked = AimLockedBetween(b, c);
+    bool railMode = sAimOverride == 4 || (!aimLocked && b.aimMode == CINE_AIM_RAIL && c.aimMode == CINE_AIM_RAIL);
+    if (aimLocked) { // both ends track the same live/shared source: stay dead on it
+        for (int k = 0; k < 3; k++) {
+            out[k] = aB[k];
+        }
+        return;
+    }
+    if (railMode) { // look straight along the actual travel direction, like a dolly
+        float dir[3];
+        if (b.interp == CINE_INTERP_LINEAR) {
+            v3sub(c.eye, b.eye, dir);
+        } else {
+            float td[3], ts[3];
+            EyeSegmentTangents(i1, i2, td, ts);
+            for (int k = 0; k < 3; k++) {
+                dir[k] = Hermite1Deriv(b.eye[k], c.eye[k], td[k], ts[k], ueEye);
+            }
+        }
+        if (v3len(dir) < 1e-4f) { // stationary stretch: hold the keyframe's own rail direction
+            AutoTangentDir(i1, dir);
+        }
+        v3norm(dir);
+        for (int k = 0; k < 3; k++) {
+            out[k] = eyePos[k] + dir[k] * 100.0f;
+        }
+        return;
+    }
+    float yB, yC, pB, pC, moY, miY, moP, miP, lenB, lenC;
+    if (!AimSegmentCurve(i1, &yB, &yC, &pB, &pC, &moY, &miY, &moP, &miP, &lenB, &lenC)) {
+        for (int k = 0; k < 3; k++) { // degenerate framing: nothing to interpolate in angle space
+            out[k] = aB[k] + (aC[k] - aB[k]) * pAim;
+        }
+        return;
+    }
+    float yaw, pitch;
+    if (b.interp == CINE_INTERP_LINEAR) {
+        yaw = yB + (yC - yB) * pAim;
+        pitch = pB + (pC - pB) * pAim;
+    } else {
+        yaw = Hermite1(yB, yC, moY, miY, pAim);
+        pitch = Hermite1(pB, pC, moP, miP, pAim);
+    }
+    float cp = std::cos(pitch);
+    float dir[3] = { std::sin(yaw) * cp, std::sin(pitch), std::cos(yaw) * cp };
+    float dist = lenB + (lenC - lenB) * pAim;
+    for (int k = 0; k < 3; k++) {
+        out[k] = eyePos[k] + dir[k] * dist;
     }
 }
 
@@ -721,80 +1229,79 @@ static CineKeyframe SampleAt(float time) {
         lt = std::min(std::max(lt, 0.0f), 1.0f);
     }
 
-    // Eye (spatial path): one unified non-uniform Kochanek-Bartels evaluation. The chosen parameterization
-    // sets the knot intervals (centripetal/chordal/uniform from chord length, or time-based from the segment
-    // durations); Tension/Continuity/Bias shape on top continuously; a manual Bend tangent overrides direction.
-    if (b.interp == CINE_INTERP_LINEAR) {
-        for (int k = 0; k < 3; k++) {
-            out.eye[k] = b.eye[k] + (c.eye[k] - b.eye[k]) * lt;
-        }
-    } else {
-        float t01, t12, t23;
-        if (sSplineParam == 0) {
-            // Even velocity: knots = the segment durations, so the velocity matches on both sides of every
-            // keyframe (no dip/jolt) while timeline spacing still sets the pacing.
-            t12 = SegDurAt(i1);
-            t01 = (i0 != i1) ? SegDurAt(i0) : t12;
-            t23 = (i2 != i3) ? SegDurAt(i2) : t12;
-        } else {
-            // Uniform Catmull-Rom: equal knot spacing.
-            t01 = t12 = t23 = 1.0f;
-        }
-        float td[3], ts[3];
-        NuKbTangents(a.eye, b.eye, c.eye, d.eye, t01, t12, t23, b.tension, b.continuity, b.bias, c.tension,
-                     c.continuity, c.bias, td, ts);
-        if (b.hasTangent) {
-            float m = v3len(td);
-            td[0] = b.tangent[0] * m;
-            td[1] = b.tangent[1] * m;
-            td[2] = b.tangent[2] * m;
-        }
-        if (c.hasTangent) {
-            float m = v3len(ts);
-            ts[0] = c.tangent[0] * m;
-            ts[1] = c.tangent[1] * m;
-            ts[2] = c.tangent[2] * m;
-        }
-        for (int k = 0; k < 3; k++) {
-            out.eye[k] = Hermite1(b.eye[k], c.eye[k], td[k], ts[k], lt);
-        }
-    }
+    // Eye (spatial path): WHERE comes from the geometric spline (EyeSegmentTangents: centripetal knots, TCB,
+    // overshoot guard, per-side direction/length overrides); WHEN comes from the arc-length speed schedule,
+    // which maps the eased time progress to a distance along the path and then to the curve parameter.
+    ArcEnsure();
+    float ue = ArcParamAtTime(i1, lt);
+    EyePosAt(i1, i2, ue, out.eye);
 
-    // Aim / roll / FOV: always interpolate with TIME-based knots so these change at a smooth, continuous rate
-    // (no stiff angular swing where a turn and an aim change land on the same keyframe). The keyframe times
-    // already encode pacing; spatial overshoot isn't a concern for a look-at point the way it is for the path.
+    // Roll / FOV knot intervals: keyframe times, so these channels change at a smooth, continuous rate.
     float at12 = SegDurAt(i1);
     float at01 = (i0 != i1) ? SegDurAt(i0) : at12;
     float at23 = (i2 != i3) ? SegDurAt(i2) : at12;
 
-    // Aim (at): interpolate each control keyframe's EFFECTIVE target (handles look-at-point / look-at-Link).
-    // When both ends track the same live/shared source, lock straight onto it so it stays centered between
-    // keyframes (the look-at spline would otherwise bow off a tracked actor/target).
-    float aA[3], aB[3], aC[3], aD[3];
-    EffectiveAt(i0, aA);
-    EffectiveAt(i1, aB);
-    EffectiveAt(i2, aC);
-    EffectiveAt(i3, aD);
-    // Where a free (interpolated) aim segment borders a locked one, ease the free side's slope to zero at that
-    // boundary so the aim meets the held target with matching velocity rather than jerking. (i0==i1 / i2==i3 are
-    // clamped path ends, so there is no real neighbor segment to match there.)
-    bool aimLocked = AimLockedBetween(b, c);
-    bool prevLocked = (i0 != i1) && AimLockedBetween(a, b);
-    bool nextLocked = (i2 != i3) && AimLockedBetween(c, d);
-    for (int k = 0; k < 3; k++) {
-        if (aimLocked) {
-            out.at[k] = aB[k];
-        } else if (b.interp == CINE_INTERP_LINEAR) {
-            out.at[k] = aB[k] + (aC[k] - aB[k]) * lt;
-        } else {
-            out.at[k] = NuKbScalar(aA[k], aB[k], aC[k], aD[k], at01, at12, at23, b.tension, b.continuity, b.bias,
-                                   c.tension, c.continuity, c.bias, lt, false, prevLocked, nextLocked);
-        }
-    }
+    // Aim: ordinary value curves over the segment's eased time progress - the way every editing suite treats
+    // orientation. (An earlier build paced the aim by its own ANGULAR arc length, the twin of the eye's
+    // distance schedule. It was a workaround for artifacts that came from blending directions as Cartesian
+    // vectors; interpolating yaw/pitch as angles removed those at the source, and the schedule only added
+    // rate plateaus and jumps at keyframes where segments turn by very different amounts.)
+    AimPointAt(i1, lt, ue, out.eye, out.at);
+
+    // Roll / FOV ride the same clock as the aim (the segment's eased time progress), so every value channel
+    // authored on the same two keyframes stays in step with every other.
     out.roll = InterpComp(a.roll, b.roll, c.roll, d.roll, b, c, at01, at12, at23, lt);
     out.fov = InterpComp(a.fov, b.fov, c.fov, d.fov, b, c, at01, at12, at23, lt);
     out.time = time;
     return out;
+}
+
+// --- Path-shape checksum (spline caching) -----------------------------------------------------------------
+// A cheap FNV-style hash over everything that changes SampleAt's eye/roll/fov output for a given time: the
+// keyframes' shape-relevant fields plus the global spline/loop settings. Consumers (the world-overlay polyline
+// and the curve editor's camera-channel sampling) re-tessellate only when this changes, instead of running
+// hundreds of full spline evaluations every frame. Deliberately EXCLUDES aim/look-at state: neither consumer
+// reads the interpolated aim, and live-tracked targets would otherwise invalidate the cache every frame.
+static uint32_t HashF32(uint32_t h, float v) {
+    uint32_t b;
+    std::memcpy(&b, &v, sizeof(b));
+    h ^= b;
+    h *= 16777619u;
+    return h;
+}
+static uint32_t PathShapeHash() {
+    uint32_t h = 2166136261u;
+    h = HashF32(h, (float)sKeyframes.size());
+    h = HashF32(h, sLoop ? 1.0f : 0.0f);
+    h = HashF32(h, (float)sLoopMode);
+    h = HashF32(h, sLoopReturnTime);
+    for (const CineKeyframe& k : sKeyframes) {
+        h = HashF32(h, k.time);
+        h = HashF32(h, k.eye[0]);
+        h = HashF32(h, k.eye[1]);
+        h = HashF32(h, k.eye[2]);
+        h = HashF32(h, k.roll);
+        h = HashF32(h, k.fov);
+        h = HashF32(h, (float)k.interp);
+        h = HashF32(h, k.tension);
+        h = HashF32(h, k.continuity);
+        h = HashF32(h, k.bias);
+        h = HashF32(h, (float)k.hasTangent);
+        h = HashF32(h, k.tangent[0]);
+        h = HashF32(h, k.tangent[1]);
+        h = HashF32(h, k.tangent[2]);
+        h = HashF32(h, (float)k.hasTangentIn);
+        h = HashF32(h, k.tangentIn[0]);
+        h = HashF32(h, k.tangentIn[1]);
+        h = HashF32(h, k.tangentIn[2]);
+        h = HashF32(h, k.tanWOut);
+        h = HashF32(h, k.tanWIn);
+        h = HashF32(h, k.easeIn);
+        h = HashF32(h, k.easeOut);
+        h = HashF32(h, k.speedRateIn); // these drive the arc schedule, which this hash keys
+        h = HashF32(h, k.speedRateOut);
+    }
+    return h;
 }
 
 // Playback timing easing applied to the 0..1 progress.
@@ -1043,6 +1550,9 @@ static void PlaybackTick() {
     sGreenScreenOverride = -1;
     sShakeIntensity = 1.0f;
     sHudHideOverride = -1;
+    sRollTrackOn = 0;
+    sFovTrackOn = 0;
+    sLetterboxOverride = -1.0f;
     for (const TrackDef& d : AllTrackDefs()) {
         if (active && d.track->enabled) {
             float v;
@@ -1066,6 +1576,14 @@ static void PlaybackTick() {
                 s.at[1] += dy;
                 s.at[2] += dz;
             }
+        }
+        // Roll / FOV automation tracks override the keyframes' interpolated values (applied before shake so
+        // the shake's roll jitter still layers on top).
+        if (sRollTrackOn) {
+            s.roll = sRollTrackVal;
+        }
+        if (sFovTrackOn) {
+            s.fov = std::min(std::max(sFovTrackVal, 1.0f), 170.0f);
         }
         if ((sShakeEnabled && (sPlaying || sShakeOnPreview)) || sShakeTrack.enabled) {
             ApplyShake(sPlayhead, s.eye, s.at, &s.roll); // intensity scales the amps (keyframable)
@@ -1223,7 +1741,15 @@ static void SavePath() {
                         { "bias", k.bias },
                         { "hasTangent", k.hasTangent },
                         { "tangent", { k.tangent[0], k.tangent[1], k.tangent[2] } },
+                        { "hasTangentIn", k.hasTangentIn },
+                        { "tangentIn", { k.tangentIn[0], k.tangentIn[1], k.tangentIn[2] } },
+                        { "tanWOut", k.tanWOut },
+                        { "tanWIn", k.tanWIn },
                         { "aimMode", k.aimMode },
+                        { "aimHold", k.aimHold },
+                        { "hasAimTan", k.hasAimTan },
+                        { "aimTan", { k.aimTanYawIn, k.aimTanYawOut, k.aimTanPitchIn, k.aimTanPitchOut } },
+                        { "speedRate", { k.speedRateIn, k.speedRateOut, (float)k.speedBroken } },
                         { "aimActorId", k.aimActorId },
                         { "aimActorPos", { k.aimActorPos[0], k.aimActorPos[1], k.aimActorPos[2] } },
                         { "easeIn", k.easeIn },
@@ -1303,7 +1829,33 @@ static void LoadPath() {
             k.tangent[1] = 0.0f;
             k.tangent[2] = 1.0f;
         }
+        k.hasTangentIn = e.value("hasTangentIn", 0);
+        if (e.contains("tangentIn")) {
+            k.tangentIn[0] = e["tangentIn"][0];
+            k.tangentIn[1] = e["tangentIn"][1];
+            k.tangentIn[2] = e["tangentIn"][2];
+        } else { // older files: the in side mirrors the out tangent
+            k.tangentIn[0] = k.tangent[0];
+            k.tangentIn[1] = k.tangent[1];
+            k.tangentIn[2] = k.tangent[2];
+        }
+        k.tanWOut = e.value("tanWOut", 0.0f);
+        k.tanWIn = e.value("tanWIn", 0.0f);
         k.aimMode = e.value("aimMode", 0);
+        // "Flat" on either side of the short-lived Aim in/out controls becomes the hold flag.
+        k.aimHold = e.value("aimHold", (e.value("aimTanIn", 0) == 1 || e.value("aimTanOut", 0) == 1) ? 1 : 0);
+        k.hasAimTan = e.value("hasAimTan", 0);
+        if (e.contains("aimTan") && e["aimTan"].size() >= 4) {
+            k.aimTanYawIn = e["aimTan"][0];
+            k.aimTanYawOut = e["aimTan"][1];
+            k.aimTanPitchIn = e["aimTan"][2];
+            k.aimTanPitchOut = e["aimTan"][3];
+        }
+        if (e.contains("speedRate") && e["speedRate"].is_array() && e["speedRate"].size() >= 3) {
+            k.speedRateIn = e["speedRate"][0];
+            k.speedRateOut = e["speedRate"][1];
+            k.speedBroken = (int)(float)e["speedRate"][2];
+        }
         k.aimActorId = e.value("aimActorId", 0);
         k.aimActorPtr = nullptr;
         if (e.contains("aimActorPos") && e["aimActorPos"].size() >= 3) {
@@ -4145,26 +4697,22 @@ void CinematicCamPathWindow::DrawElement() {
 
     // Path tools: smooth out jitter, normalize speed, retime, and generate orbits.
     if (ImGui::CollapsingHeader("Path tools", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::SetNextItemWidth(180.0f);
-        const char* curveModes[] = { "Even velocity (smooth)", "Uniform (classic)" };
-        ImGui::Combo("Curve", &sSplineParam, curveModes, 2);
+        CineHint("Shape is set only by keyframe positions; the timeline only sets speed.");
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("How the camera moves between keyframes.\n"
-                              "Even velocity (smooth): the camera and the view direction move at a smooth, "
-                              "time-coherent rate - no hang/snap at keyframes. Timeline spacing still controls "
-                              "pacing. The cinematic default.\n"
-                              "Uniform (classic): snappier classic Catmull-Rom; can overshoot on unevenly spaced "
-                              "keyframes - tame it with Tension or Smooth path.");
+            CineTooltip("The path's shape depends purely on WHERE the keyframes are - retiming them on the "
+                        "timeline never bends the curve, it only redistributes how fast the camera travels. "
+                        "Speed glides smoothly through keyframes (no slow-down/hang at each one).");
         }
-        ImGui::SameLine();
         ImGui::BeginDisabled((int)sKeyframes.size() < 2);
         if (ImGui::Button("Smooth path")) {
             SmoothPath();
         }
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Reset every keyframe to clean spline defaults (no linear segments, manual bends, or "
-                              "tension) so the curve flows smoothly. Doesn't move any keyframe.");
+            CineTooltip("Bend the keyframes' tangents so the whole path (or the selected range) moves as ONE "
+                        "continuous curve - direction and curvature smooth, no corner at any keyframe. Never "
+                        "moves a keyframe; the range's ends are frozen so nothing outside it changes. This "
+                        "also removes rail-aim flicks, since rail follows the curve's direction.");
         }
 
         ImGui::BeginDisabled((int)sKeyframes.size() < 3);
@@ -4446,12 +4994,39 @@ void CinematicCamPathWindow::DrawElement() {
         }
 
         // Aim mode: how this keyframe's camera is oriented.
-        const char* aimModes[] = { "Free orientation", "Look at point", "Look at Link", "Look at actor",
-                                   "Look at target" };
+        const char* aimModes[] = { "Free orientation", "Look at point",  "Look at Link",
+                                   "Look at actor",    "Look at target", "Follow path (rail)" };
         int am = sKeyframes[sel].aimMode;
-        if (ImGui::Combo("Aim", &am, aimModes, 5)) {
+        if (ImGui::Combo("Aim", &am, aimModes, 6)) {
             PushUndo();
             sKeyframes[sel].aimMode = am;
+        }
+        if (ImGui::IsItemHovered()) {
+            CineTooltip("Follow path (rail): the camera looks straight along its direction of travel, like a "
+                        "dolly on a rail - always parallel to the spline. Roll and FOV still apply.");
+        }
+        {
+            bool hold = sKeyframes[sel].aimHold != 0;
+            if (ImGui::Checkbox("Hold framing here", &hold)) {
+                PushUndo();
+                sKeyframes[sel].aimHold = hold ? 1 : 0;
+            }
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("The view's turn comes to rest ON this keyframe and builds up again leaving it, "
+                            "so the framing parks for a beat while the camera keeps travelling. Off, the view "
+                            "flows straight through without stopping.");
+            }
+            if (sKeyframes[sel].hasAimTan) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Reset aim rates")) {
+                    PushUndo();
+                    sKeyframes[sel].hasAimTan = 0;
+                }
+                if (ImGui::IsItemHovered()) {
+                    CineTooltip("This keyframe carries baked aim rates (from Insert @ playhead), frozen so "
+                                "the insert couldn't reshape the aim. Reset returns them to automatic.");
+                }
+            }
         }
         if (sKeyframes[sel].aimMode == CINE_AIM_POINT) {
             float tgt[3] = { sKeyframes[sel].at[0], sKeyframes[sel].at[1], sKeyframes[sel].at[2] };
@@ -4785,12 +5360,14 @@ void CinematicCamPathWindow::DrawElement() {
     }
 
     // Path-level aim override: aim every keyframe at one target (fixes up recorded paths at once).
-    const char* aimOv[] = { "Per-keyframe (off)", "All look at Link", "All look at target", "All look at actor" };
+    const char* aimOv[] = { "Per-keyframe (off)", "All look at Link", "All look at target", "All look at actor",
+                            "All follow path (rail)" };
     ImGui::SetNextItemWidth(200.0f);
-    ImGui::Combo("Aim override", &sAimOverride, aimOv, 4);
+    ImGui::Combo("Aim override", &sAimOverride, aimOv, 5);
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Ignore each keyframe's own aim and point the whole path at one target. Handy for "
-                          "re-aiming a recorded flight at Link or an actor in one step.");
+        CineTooltip("Ignore each keyframe's own aim and point the whole path at one target - or, with rail, "
+                    "straight along the travel direction like a dolly. Handy for re-aiming a recorded flight "
+                    "in one step.");
     }
     if (sAimOverride == 2) {
         ImGui::SameLine();

@@ -16,6 +16,7 @@ enum CineAim {
     CINE_AIM_PLAYER = 2, // look at Link (tracked live)
     CINE_AIM_ACTOR = 3,  // look at a chosen actor (tracked live by id; pointer cached at runtime)
     CINE_AIM_TARGET = 4, // look at the shared movable aim target (the same point used by the aim override)
+    CINE_AIM_RAIL = 5,   // look along the path's travel direction (dolly/rail style, parallel to the spline)
 };
 
 // A single captured camera pose on the path timeline.
@@ -35,7 +36,39 @@ struct CineKeyframe {
     // Optional custom spline tangent (the direction the spatial curve passes through this point), edited
     // with the Bend gizmo. Like a Bezier handle; bends the curve on both sides. Independent of camera aim.
     int hasTangent;   // 0 = automatic tangent, 1 = use the custom direction below
-    float tangent[3]; // unit direction
+    float tangent[3]; // unit direction (the OUT side - the curve leaving toward the next keyframe)
+
+    // Broken (per-side) tangent: when set, the segment ARRIVING at this keyframe uses tangentIn instead of
+    // tangent, so the curve can enter and leave this point in different directions (a shaped corner).
+    int hasTangentIn;   // 0 = the in side mirrors `tangent` (or auto), 1 = use the direction below
+    float tangentIn[3]; // unit direction of travel arriving at this keyframe
+
+    // Per-side tangent WEIGHTS: multipliers on the automatic tangent magnitude (0 = automatic / 1.0). Set by
+    // the shape-preserving Insert @ playhead (exact at insert time) and editable as "side weights" - how far
+    // the curve bulges on each side, like a scalable Bezier handle. Relative, so moving a keyframe rescales
+    // the tangents naturally instead of leaving a stale absolute length behind.
+    float tanWOut;
+    float tanWIn;
+
+    // "Hold framing here": the view's turn comes to rest ON this keyframe and builds up again leaving it, so
+    // the framing parks for a beat while the camera keeps moving. Off = the view flows through the keyframe.
+    int aimHold;
+
+    // Explicit aim-curve rates at this keyframe (degrees/second of yaw and pitch, per side), baked by
+    // Insert @ playhead so adding a keyframe cannot reshape the aim curve: once baked, the neighbours stop
+    // re-deriving their slopes from the new arrangement. 0 = automatic (derived from the neighbours).
+    int hasAimTan;
+    float aimTanYawIn, aimTanYawOut;
+    float aimTanPitchIn, aimTanPitchOut;
+
+    // The camera's speed at this keyframe (world units/second) on the arc-length schedule, per side: In
+    // governs the segment arriving, Out the segment leaving. Negative = automatic (the monotone schedule's own
+    // value). Set by dragging the Speed curve's handles, and baked by Insert @ playhead so adding a keyframe
+    // cannot change the pacing. Always clamped to what exactness allows (the camera must still arrive on
+    // time), and mirrored across the keyframe unless speedBroken.
+    float speedRateIn = -1.0f;
+    float speedRateOut = -1.0f;
+    int speedBroken; // 0 = the two sides move together (alt-drag a handle to break them apart)
 
     int aimMode;          // CineAim: how the camera is aimed (free / point / Link / actor)
     int aimActorId;       // for CINE_AIM_ACTOR: the actor id to track (saved)
