@@ -3575,12 +3575,29 @@ static void DrawWorldOverlay() {
         if (steps > 2400) {
             steps = 2400;
         }
+        // The world-space polyline only changes when the path shape does, so it's cached behind PathShapeHash():
+        // re-tessellating every frame was hundreds-to-thousands of full spline evaluations per frame (the single
+        // biggest per-frame cost of the editor). Screen projection still runs per frame - the camera moves.
+        static std::vector<float> sSplineCache; // xyz triplets, steps+1 points
+        static uint32_t sSplineHash = 0;
+        static int sSplineSteps = -1;
+        uint32_t hsh = PathShapeHash();
+        if (hsh != sSplineHash || steps != sSplineSteps) {
+            sSplineHash = hsh;
+            sSplineSteps = steps;
+            sSplineCache.resize(((size_t)steps + 1) * 3);
+            for (int i = 0; i <= steps; i++) {
+                CineKeyframe s = SampleAt(total * (float)i / (float)steps);
+                sSplineCache[(size_t)i * 3 + 0] = s.eye[0];
+                sSplineCache[(size_t)i * 3 + 1] = s.eye[1];
+                sSplineCache[(size_t)i * 3 + 2] = s.eye[2];
+            }
+        }
         ImVec2 prev;
         bool prevValid = false;
         for (int i = 0; i <= steps; i++) {
-            CineKeyframe s = SampleAt(total * (float)i / (float)steps);
             ImVec2 sp;
-            if (WorldToScreen(s.eye, sp)) {
+            if (WorldToScreen(&sSplineCache[(size_t)i * 3], sp)) {
                 if (prevValid) {
                     dl->AddLine(prev, sp, IM_COL32(255, 220, 40, 200), 2.0f);
                 }
@@ -4287,11 +4304,6 @@ static bool DrawParamKeyNav(CineParamTrack& t, float value) {
     return true;
 }
 
-// Curve editor: a value-over-time graph overlaying the enabled continuous parameter tracks (time of day, shake,
-// target X/Y/Z) and any camera channels (Eye / Look-at / Roll / FOV) switched on via the "Camera:" chips. Drag a
-// parameter point in 2D to retime + revalue it (right-click to delete; "Add key at playhead" drops one); camera
-// points are locked in time to their keyframe, so dragging only changes the value. The dope sheet handles
-// retiming/overview; this panel is where you shape the value.
 // Combined inline keyframe control for the 3-axis movable aim target (keys X/Y/Z together at the playhead).
 static void DrawTargetKeyNav() {
     ImGui::PushID("targetkey");
@@ -4377,113 +4389,493 @@ static void DrawTargetKeyNav() {
     ImGui::PopID();
 }
 
-// --- Camera channels (curve editor) -----------------------------------------------------------------------
-// The curve editor can graph the SCALAR camera values - Roll and FOV - as value-over-time channels, read from the
-// camera keyframes and LOCKED in time to their keyframe (you retime/add/remove them on the main timeline); only
-// the value is editable here. Eye / Look-at are deliberately NOT channels: positions belong to the world gizmos,
-// and graphing them just clutters the editor. Labeled "Cam:" to stay distinct from the "Target X/Y/Z" tracks.
-enum CamChan { CAM_ROLL = 0, CAM_FOV, CAM_CHAN_COUNT };
-static const char* kCamChanName[CAM_CHAN_COUNT] = { "Cam: Roll", "Cam: FOV" };
-static const char* kCamChanShort[CAM_CHAN_COUNT] = { "Roll", "FOV" };
-static const ImU32 kCamPalette[CAM_CHAN_COUNT] = { IM_COL32(205, 140, 240, 255), IM_COL32(150, 235, 130, 255) };
-static float CamChanGet(const CineKeyframe& k, int c) {
-    return (c == CAM_FOV) ? k.fov : k.roll;
-}
-static void CamChanSet(CineKeyframe& k, int c, float v) {
-    if (c == CAM_FOV) {
-        k.fov = v;
+// Instantaneous eye speed (world units/s) at an absolute timeline time - read straight off the distance
+// schedule (the exact derivative of what playback renders, not a finite difference). Keyframe ease in/out is
+// folded in via the chain rule; the global playback ease is not (the graph shows the authored timeline). The
+// aim's rate is measured from the sampled view direction instead - it has no schedule of its own any more.
+static void ScheduleSpeedsAt(float time, float* outEye) {
+    *outEye = 0.0f;
+    int n = (int)sKeyframes.size();
+    if (n < 2) {
+        return;
+    }
+    float lastT = sKeyframes[n - 1].time;
+    int i1;
+    float p, D;
+    if (!LoopCyclic()) {
+        if (time <= sKeyframes[0].time || time >= lastT) {
+            return; // parked on an endpoint
+        }
+        int i = 0;
+        while (i < n - 1 && time >= sKeyframes[i + 1].time) {
+            i++;
+        }
+        D = sKeyframes[i + 1].time - sKeyframes[i].time;
+        if (D <= 0.0001f) {
+            return;
+        }
+        p = (time - sKeyframes[i].time) / D;
+        i1 = i;
     } else {
-        k.roll = v;
+        float eff = lastT + sLoopReturnTime;
+        if (eff <= 0.0001f) {
+            return;
+        }
+        time = std::fmod(time, eff);
+        if (time < 0.0f) {
+            time += eff;
+        }
+        if (time < lastT) {
+            int i = 0;
+            while (i < n - 1 && time >= sKeyframes[i + 1].time) {
+                i++;
+            }
+            D = sKeyframes[i + 1].time - sKeyframes[i].time;
+            if (D <= 0.0001f) {
+                return;
+            }
+            p = (time - sKeyframes[i].time) / D;
+            i1 = i;
+        } else {
+            if (sLoopReturnTime <= 0.0001f) {
+                return;
+            }
+            D = sLoopReturnTime;
+            p = (time - lastT) / D;
+            i1 = n - 1;
+        }
+    }
+    const CineKeyframe& b = sKeyframes[i1];
+    const CineKeyframe& c = sKeyframes[(i1 + 1) % n];
+    float elt = p, dfac = 1.0f; // keyframe ease reparametrization + its slope (chain rule)
+    if (b.easeOut > 0.0f || c.easeIn > 0.0f) {
+        float m0 = 1.0f - std::min(std::max(b.easeOut, 0.0f), 1.0f);
+        float m1 = 1.0f - std::min(std::max(c.easeIn, 0.0f), 1.0f);
+        elt = std::min(std::max(Hermite1(0.0f, 1.0f, m0, m1, p), 0.0f), 1.0f);
+        dfac = std::max(Hermite1Deriv(0.0f, 1.0f, m0, m1, p), 0.0f);
+    }
+    float dur = SegDurAt(i1);
+    if (i1 < sArc.segs) {
+        *outEye =
+            std::max(Hermite1Deriv(sArc.S[i1], sArc.S[i1 + 1], sArc.mOut[i1] * dur, sArc.mIn[i1] * dur, elt), 0.0f) /
+            D * dfac;
     }
 }
 
+// Diagnostic graph channels. Two of them are RATES read straight off the motion schedules; the rest are the
+// pose VALUES playback actually produces at each moment (sampled through SampleAt, so what you see is exactly
+// what the camera does). Each is toggled separately - overlaying all seven at once tells you nothing.
+struct CineSgChan {
+    const char* name;
+    ImU32 col;
+    int bit;
+    bool rate; // true: plotted 0..peak. false: plotted across its own min..max
+    const char* unit;
+    // Smallest range the plot will stretch over the graph's full height. Without it, a channel that is
+    // essentially CONSTANT gets its last-digit float noise blown up to full scale and reads as violent
+    // jitter that isn't in the camera at all.
+    float minSpan;
+};
+static const CineSgChan kSgChans[] = {
+    { "Speed", IM_COL32(255, 140, 50, 235), 1, true, "u/s", 25.0f },
+    { "Aim", IM_COL32(80, 210, 255, 235), 2, true, "deg/s", 15.0f },
+    { "Pitch", IM_COL32(130, 235, 130, 235), 4, false, "deg", 2.0f },
+    { "Yaw", IM_COL32(235, 140, 235, 235), 8, false, "deg", 2.0f },
+    { "X", IM_COL32(240, 110, 110, 235), 16, false, "", 5.0f },
+    { "Y", IM_COL32(240, 225, 120, 235), 32, false, "", 5.0f },
+    { "Z", IM_COL32(120, 160, 255, 235), 64, false, "", 5.0f },
+};
+static const int kSgCount = (int)(sizeof(kSgChans) / sizeof(kSgChans[0]));
+static int SpeedGraphMask() {
+    return CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.SpeedGraphChans"), 1 | 2);
+}
+
+// Draw the enabled diagnostic channels over the visible time window. Every channel is normalized to its own
+// range (printed in the legend), so shape is comparable across wildly different units. forceSpeedMax > 0
+// pins the Speed channel's scale (used while a handle drag is live, so the graph can't rescale under the
+// cursor); outSpeedMax reports the scale actually used, for the handles.
+static void DrawSpeedGraphInto(ImDrawList* dl, float gx0, float gx1, float gy0, float gy1, float vt0, float vt1,
+                               float forceSpeedMax, float* outSpeedMax) {
+    if (outSpeedMax) {
+        *outSpeedMax = 0.0f;
+    }
+    int mask = SpeedGraphMask();
+    if (sKeyframes.size() < 2 || !(vt1 > vt0) || mask == 0) {
+        return;
+    }
+    ArcEnsure();
+    int N = (int)((gx1 - gx0) / 3.0f);
+    N = std::min(std::max(N, 64), 512);
+    std::vector<std::vector<float>> v((size_t)kSgCount, std::vector<float>((size_t)N + 1, 0.0f));
+    // The aim rate is MEASURED from the sampled view direction (the aim has no schedule to read a derivative
+    // off), so it needs the pose too.
+    bool needPose = (mask & (2 | 4 | 8 | 16 | 32 | 64)) != 0;
+    const float kRad2Deg = 57.2957795f;
+    float prevYaw = 0.0f;
+    bool haveYaw = false;
+    float dt = (vt1 - vt0) / (float)N;
+    std::vector<float> dirs((size_t)(N + 1) * 3, 0.0f);
+    for (int i = 0; i <= N; i++) {
+        float t = vt0 + (vt1 - vt0) * (float)i / (float)N;
+        ScheduleSpeedsAt(t, &v[0][i]);
+        if (!needPose) {
+            continue;
+        }
+        CineKeyframe s = SampleAt(t);
+        float d[3];
+        v3sub(s.at, s.eye, d);
+        if (v3len(d) > 1e-4f) {
+            v3norm(d);
+            float pitch = std::asin(std::min(std::max(d[1], -1.0f), 1.0f)) * kRad2Deg;
+            float yaw = std::atan2(d[0], d[2]) * kRad2Deg;
+            if (haveYaw) { // keep yaw continuous across the +-180 seam so the curve doesn't jump
+                while (yaw - prevYaw > 180.0f) {
+                    yaw -= 360.0f;
+                }
+                while (yaw - prevYaw < -180.0f) {
+                    yaw += 360.0f;
+                }
+            }
+            prevYaw = yaw;
+            haveYaw = true;
+            v[2][i] = pitch;
+            v[3][i] = yaw;
+            std::memcpy(&dirs[(size_t)i * 3], d, sizeof(d));
+        } else if (i > 0) {
+            v[2][i] = v[2][i - 1];
+            v[3][i] = v[3][i - 1];
+            std::memcpy(&dirs[(size_t)i * 3], &dirs[(size_t)(i - 1) * 3], sizeof(float) * 3);
+        }
+        v[4][i] = s.eye[0];
+        v[5][i] = s.eye[1];
+        v[6][i] = s.eye[2];
+    }
+    for (int i = 0; i <= N && needPose; i++) {
+        // Turn rate over a FIXED interval (~1/30 s), not over the sample spacing: zoomed in, neighbouring
+        // samples are microseconds apart and the division blew float noise up into a jittering line.
+        int k = std::max(1, (int)std::ceil(0.033f / std::max(dt, 1e-5f) * 0.5f));
+        int i0s = std::max(i - k, 0), i1s = std::min(i + k, N);
+        float h = (float)(i1s - i0s) * dt;
+        if (h > 1e-6f) {
+            // atan2(|cross|, dot), not acos(dot): acos loses nearly all float precision for small angles
+            // (dot ~ 0.9999999), which drew jitter on near-constant aims that the camera never had.
+            const float* u = &dirs[(size_t)i0s * 3];
+            const float* w = &dirs[(size_t)i1s * 3];
+            float cx = u[1] * w[2] - u[2] * w[1], cy = u[2] * w[0] - u[0] * w[2], cz = u[0] * w[1] - u[1] * w[0];
+            float cross = std::sqrt(cx * cx + cy * cy + cz * cz);
+            v[1][i] = std::atan2(cross, v3dot(u, w)) * kRad2Deg / h;
+        }
+    }
+    float labY = gy0 + 2.0f;
+    for (int c = 0; c < kSgCount; c++) {
+        if (!(mask & kSgChans[c].bit)) {
+            continue;
+        }
+        float lo = 1e30f, hi = -1e30f;
+        for (int i = 0; i <= N; i++) {
+            lo = std::min(lo, v[c][i]);
+            hi = std::max(hi, v[c][i]);
+        }
+        char lab[80];
+        if (c == 0 && forceSpeedMax > 0.0f) { // frozen scale during a handle drag
+            lo = 0.0f;
+            hi = forceSpeedMax;
+        }
+        bool flat = (hi - lo) < kSgChans[c].minSpan;
+        if (kSgChans[c].rate) {
+            lo = 0.0f;
+            snprintf(lab, sizeof(lab), "%-5s peak %.1f %s", kSgChans[c].name, hi, kSgChans[c].unit);
+        } else {
+            snprintf(lab, sizeof(lab), "%-5s %.2f .. %.2f %s%s", kSgChans[c].name, lo, hi, kSgChans[c].unit,
+                     flat ? "  (flat)" : "");
+        }
+        dl->AddText(ImVec2(gx0 + 4.0f, labY), kSgChans[c].col, lab);
+        labY += 13.0f;
+        // Never stretch a range smaller than the channel's minSpan across the graph - see minSpan above.
+        if (flat) {
+            float mid = 0.5f * (lo + hi);
+            lo = mid - kSgChans[c].minSpan * 0.5f;
+            hi = mid + kSgChans[c].minSpan * 0.5f;
+            if (kSgChans[c].rate) {
+                lo = 0.0f;
+                hi = kSgChans[c].minSpan;
+            }
+        }
+        float span = hi - lo;
+        if (span < 1e-6f) {
+            continue;
+        }
+        if (c == 0 && outSpeedMax) {
+            *outSpeedMax = hi; // the scale the Speed handles must share
+        }
+        // Normalized value clamped to [0,1]: a sample must never draw outside the graph rect (the standalone
+        // rect has no clip, and an escaping line painted over the timeline).
+        auto yOf = [&](float val) {
+            float u = std::min(std::max((val - lo) / span, 0.0f), 1.0f);
+            return gy1 - u * (gy1 - gy0) * 0.92f;
+        };
+        ImVec2 prev(gx0, yOf(v[c][0]));
+        for (int i = 1; i <= N; i++) {
+            ImVec2 cur(gx0 + (gx1 - gx0) * (float)i / (float)N, yOf(v[c][i]));
+            dl->AddLine(prev, cur, kSgChans[c].col, 1.5f);
+            prev = cur;
+        }
+    }
+}
+
+// Draggable handles on the Speed curve: a pair per keyframe (arriving on the left, leaving on the right),
+// each sitting at the speed the schedule actually crosses that side with. Drag one vertically to set the
+// camera's speed there - the schedule reshapes around it and keyframe TIMES never move. The two sides move
+// together unless you Alt-drag, which breaks them apart (same convention as the Bezier handles); right-click
+// returns the keyframe to automatic, and a white ring marks one you have set. Handles draw at the EFFECTIVE
+// rate, so when the exactness bound limits a drag you can see it stop.
+static int sSpDragKnot = -1;    // keyframe index being dragged (-1 = none)
+static int sSpDragSide = 0;     // 0 = arriving (in) handle, 1 = leaving (out) handle
+static float sSpDragMax = 0.0f; // frozen Speed scale for the duration of the drag
+static bool sSpHot = false;     // a handle is hovered or dragged: the editor's own click handlers must yield
+static void SpeedHandlesUI(ImDrawList* dl, float gx0, float gx1, float gy0, float gy1, float vt0, float vt1,
+                           float speedMax, bool hovered) {
+    sSpHot = sSpDragKnot >= 0;
+    int n = (int)sKeyframes.size();
+    if (!(SpeedGraphMask() & 1) || n < 2 || speedMax <= 0.0f || !(vt1 > vt0)) {
+        return;
+    }
+    ArcEnsure();
+    ImGuiIO& io = ImGui::GetIO();
+    const float kArm = 22.0f; // handle arm length in pixels, matching the curve editor's Bezier handles
+    auto yOf = [&](float rate) { return gy1 - std::min(std::max(rate / speedMax, 0.0f), 1.0f) * (gy1 - gy0) * 0.92f; };
+    auto xOf = [&](float t) { return gx0 + ((t - vt0) / (vt1 - vt0)) * (gx1 - gx0); };
+    // The EFFECTIVE speeds either side of keyframe i, as the schedule ended up using them.
+    auto ratesAt = [&](int i, float* rIn, float* rOut) {
+        int segIn = (i > 0) ? i - 1 : (LoopCyclic() ? sArc.segs - 1 : -1);
+        int segOut = (i < sArc.segs) ? i : -1;
+        *rIn = (segIn >= 0 && segIn < (int)sArc.mIn.size()) ? sArc.mIn[segIn] : -1.0f;
+        *rOut = (segOut >= 0 && segOut < (int)sArc.mOut.size()) ? sArc.mOut[segOut] : -1.0f;
+        if (*rIn < 0.0f) {
+            *rIn = *rOut; // path ends have only one real side; mirror it so the pair still reads
+        }
+        if (*rOut < 0.0f) {
+            *rOut = *rIn;
+        }
+    };
+    int hover = -1, hoverSide = 0;
+    for (int i = 0; i < n; i++) {
+        float t = sKeyframes[i].time;
+        if (t < vt0 - 1e-4f || t > vt1 + 1e-4f) {
+            continue;
+        }
+        float rIn, rOut;
+        ratesAt(i, &rIn, &rOut);
+        if (rIn < 0.0f || rOut < 0.0f) {
+            continue;
+        }
+        float x = xOf(t);
+        bool ex = sKeyframes[i].speedRateIn >= 0.0f || sKeyframes[i].speedRateOut >= 0.0f;
+        ImVec2 pIn(x - kArm, yOf(rIn)), pOut(x + kArm, yOf(rOut));
+        ImVec2 knot(x, yOf(0.5f * (rIn + rOut)));
+        dl->AddLine(pIn, knot, IM_COL32(255, 140, 50, 160), 1.2f);
+        dl->AddLine(knot, pOut, IM_COL32(255, 140, 50, 160), 1.2f);
+        for (int sd = 0; sd < 2; sd++) {
+            ImVec2 hp = sd ? pOut : pIn;
+            bool hot = (sSpDragKnot == i && sSpDragSide == sd);
+            if (hovered && sSpDragKnot < 0 && std::fabs(io.MousePos.x - hp.x) < 7.0f &&
+                std::fabs(io.MousePos.y - hp.y) < 8.0f) {
+                hover = i;
+                hoverSide = sd;
+                hot = true;
+            }
+            dl->AddCircleFilled(hp, hot ? 5.0f : 3.5f, IM_COL32(255, 140, 50, 255));
+            if (ex) {
+                dl->AddCircle(hp, 6.5f, IM_COL32(255, 255, 255, 200));
+            }
+        }
+        dl->AddCircleFilled(knot, 2.5f, IM_COL32(255, 190, 120, 220));
+    }
+    if (hover >= 0) {
+        sSpHot = true;
+        float rIn, rOut;
+        ratesAt(hover, &rIn, &rOut);
+        ImGui::SetTooltip("%.0f u/s %s this keyframe - drag to set, Alt-drag to break the two sides apart, "
+                          "right-click for automatic",
+                          hoverSide ? rOut : rIn, hoverSide ? "leaving" : "arriving");
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            PushUndo();
+            sSpDragKnot = hover;
+            sSpDragSide = hoverSide;
+            sSpDragMax = speedMax;
+            if (io.KeyAlt) {
+                sKeyframes[hover].speedBroken = 1;
+            }
+        } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            PushUndo();
+            sKeyframes[hover].speedRateIn = -1.0f;
+            sKeyframes[hover].speedRateOut = -1.0f;
+            sKeyframes[hover].speedBroken = 0;
+        }
+    }
+    if (sSpDragKnot >= 0) {
+        if (sSpDragKnot < n && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            CineKeyframe& k = sKeyframes[sSpDragKnot];
+            float u = (gy1 - io.MousePos.y) / ((gy1 - gy0) * 0.92f);
+            float rate = std::max(u, 0.0f) * sSpDragMax;
+            if (sSpDragSide) {
+                k.speedRateOut = rate;
+            } else {
+                k.speedRateIn = rate;
+            }
+            if (!k.speedBroken) { // both sides together unless broken
+                k.speedRateIn = rate;
+                k.speedRateOut = rate;
+            }
+        } else {
+            sSpDragKnot = -1;
+        }
+    }
+}
+
+// Curve editor: a value-over-time graph overlaying the enabled continuous parameter tracks - including the
+// camera channels (Cam roll / Cam FOV), which are ordinary tracks with their own keys. Drag a point in 2D to
+// retime + revalue it; right-click deletes; double-click empty space drops a key; per-key interpolation (Step /
+// Linear / Smooth / Bezier with handles). Mouse wheel zooms the time axis, middle-drag pans, Fit resets.
 static void DrawCurveEditor() {
-    // A channel is either a parameter automation track (free keys on its own sub-timeline) or a CAMERA channel
-    // (Eye / Look-at / Roll / FOV) read straight from the camera keyframes. Camera points are locked in time to
-    // their keyframe - you retime/add/remove them on the main timeline; here only their VALUE is editable, letting
-    // you fine-tune a position or FOV against the curve. Both kinds overlay together, each scaled to its own range.
     struct CurveChannel {
         const char* name;
         ImU32 col;
-        bool isCam;
-        CineParamTrack* track; // parameter channel (null for camera channels)
-        int camChan;           // CamChan index (camera channels; -1 otherwise)
-        float vmin, vmax;      // fixed range (vmax > vmin) or 0,0 = auto-fit to the keys
+        CineParamTrack* track;
+        float vmin, vmax; // fixed range (vmax > vmin) or 0,0 = auto-fit to the keys
     };
     static const ImU32 kChanCol[6] = { IM_COL32(120, 200, 255, 255), IM_COL32(255, 180, 90, 255),
                                        IM_COL32(150, 230, 120, 255), IM_COL32(230, 130, 230, 255),
                                        IM_COL32(240, 220, 90, 255),  IM_COL32(120, 230, 230, 255) };
-    static bool sCamShow[CAM_CHAN_COUNT] = { false, false };
 
-    // Camera-channel visibility chips - always offered (even with no parameter track enabled) so you can pull a
-    // camera curve up on its own. A lit chip is overlaid; click its legend entry below to make it editable.
-    ImGui::TextDisabled("Camera:");
-    ImGui::SameLine();
-    for (int c = 0; c < CAM_CHAN_COUNT; c++) {
-        ImGui::PushID(2000 + c);
-        bool on = sCamShow[c];
-        ImGui::PushStyleColor(ImGuiCol_Text,
-                              on ? ImGui::ColorConvertU32ToFloat4(kCamPalette[c]) : ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
-        if (ImGui::SmallButton(kCamChanShort[c])) {
-            sCamShow[c] = !sCamShow[c];
+    // Quick keyframe toggles for the camera channels - always offered so you can start animating roll / FOV
+    // (they seed a key at the playhead holding the current interpolated value).
+    {
+        CineKeyframe cur{};
+        if (sKeyframes.size() >= 2) {
+            cur = SampleAt(sPlayhead);
+        } else if (!sKeyframes.empty()) {
+            cur = sKeyframes[0];
+        } else {
+            CinematicCam_GetPose(cur.eye, cur.at, &cur.roll, &cur.fov);
         }
-        ImGui::PopStyleColor();
-        ImGui::PopID();
-        if (c != CAM_CHAN_COUNT - 1) {
-            ImGui::SameLine();
+        // Seed new keys from whatever is actually DRIVING right now: the track itself when it's on (adding a
+        // key mid-curve must not step it), else the keyframes' interpolated value.
+        float rollSeed = cur.roll, fovSeed = cur.fov, tv;
+        if (sRollTrack.enabled && EvalParamTrack(sRollTrack, sPlayhead, tv)) {
+            rollSeed = tv;
+        }
+        if (sFovTrack.enabled && EvalParamTrack(sFovTrack, sPlayhead, tv)) {
+            fovSeed = tv;
+        }
+        CineHint("Camera:");
+        ImGui::SameLine();
+        ImGui::TextUnformatted("Roll");
+        ImGui::SameLine();
+        DrawParamKeyNav(sRollTrack, rollSeed);
+        ImGui::SameLine();
+        ImGui::TextUnformatted("  FOV");
+        ImGui::SameLine();
+        DrawParamKeyNav(sFovTrack, fovSeed);
+        ImGui::SameLine();
+        ImGui::TextUnformatted(" ");
+        ImGui::SameLine();
+        bool spd = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.SpeedGraph"), 0) != 0;
+        if (ImGui::Checkbox("Speed graph", &spd)) {
+            CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.SpeedGraph"), spd ? 1 : 0);
+            CVarSave();
+        }
+        if (ImGui::IsItemHovered()) {
+            CineTooltip("Debugging overlay: what the camera actually does over the timeline. Speed and Aim "
+                        "are rates read off the motion schedules; Pitch / Yaw / X / Y / Z are the values "
+                        "playback produces. Toggle channels below - each is scaled to its own range, printed "
+                        "in the legend.");
+        }
+        if (spd) { // per-channel toggles, so the graph shows only what you're diagnosing
+            int mask = SpeedGraphMask();
+            for (int c = 0; c < kSgCount; c++) {
+                bool on = (mask & kSgChans[c].bit) != 0;
+                ImGui::PushID(c);
+                ImU32 col = on ? kSgChans[c].col : ((kSgChans[c].col & 0x00FFFFFF) | 0x66000000);
+                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(col));
+                char lbl[32];
+                snprintf(lbl, sizeof(lbl), "%s%s", on ? "* " : "", kSgChans[c].name);
+                if (ImGui::SmallButton(lbl)) {
+                    CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.SpeedGraphChans"), mask ^ kSgChans[c].bit);
+                    CVarSave();
+                }
+                ImGui::PopStyleColor();
+                ImGui::PopID();
+                if (c < kSgCount - 1) {
+                    ImGui::SameLine();
+                }
+            }
         }
     }
+    bool showSpeed = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.SpeedGraph"), 0) != 0;
 
     std::vector<CurveChannel> curves;
     int pc = 0;
     for (const TrackDef& d : AllTrackDefs()) {
         if (d.continuous && d.track->enabled) {
-            curves.push_back({ d.name, kChanCol[pc % 6], false, d.track, -1, d.vmin, d.vmax });
+            curves.push_back({ d.name, kChanCol[pc % 6], d.track, d.vmin, d.vmax });
             pc++;
         }
     }
-    for (int c = 0; c < CAM_CHAN_COUNT; c++) {
-        if (sCamShow[c] && !sKeyframes.empty()) {
-            // FOV is genuinely bounded, so a fixed range gives the graph height a sensible, precise scale. Roll is
-            // left AUTO-fit (range floored to +-180 in rangeOf) so the dial reads naturally but barrel rolls past a
-            // half-turn still expand the view instead of clamping.
-            float cvmin = 0.0f, cvmax = 0.0f;
-            if (c == CAM_FOV) {
-                cvmin = 1.0f;
-                cvmax = 120.0f;
-            }
-            curves.push_back({ kCamChanName[c], kCamPalette[c], true, nullptr, c, cvmin, cvmax });
-        }
-    }
     if (curves.empty()) {
-        ImGui::TextDisabled("Enable a continuous parameter (Time of day, Shake, Target X/Y/Z) or switch on a camera "
-                            "channel above to shape its curve.");
+        ImGui::PushTextWrapPos(0.0f);
+        CineHint("Keyframe a camera channel above (Roll / FOV) or enable a parameter track (Time of day, "
+                 "Shake, Letterbox, Target X/Y/Z) to shape its curve here.");
+        ImGui::PopTextWrapPos();
+        if (showSpeed && sKeyframes.size() >= 2) { // the speed graph stands on its own - no tracks needed
+            // Fixed slice (matched by the layout budget in DrawElement) so it never pushes the timeline
+            // off-screen - taking all remaining height made the bottom region scroll.
+            float sgH = std::min(std::max(ImGui::GetContentRegionAvail().y - 6.0f, 80.0f), 126.0f);
+            ImVec2 sz(std::max(ImGui::GetContentRegionAvail().x, 80.0f), sgH);
+            ImVec2 q0 = ImGui::GetCursorScreenPos();
+            ImGui::InvisibleButton("##speedgraph", sz);
+            ImVec2 q1(q0.x + sz.x, q0.y + sz.y);
+            ImDrawList* sdl = ImGui::GetWindowDrawList();
+            sdl->AddRectFilled(q0, q1, IM_COL32(24, 24, 27, 255), 4.0f);
+            sdl->AddRect(q0, q1, IM_COL32(90, 90, 95, 255), 4.0f);
+            float tEnd = EffectiveTotal();
+            if (tEnd < 0.001f) {
+                tEnd = 1.0f;
+            }
+            float sgx0 = q0.x + 6.0f, sgx1 = q1.x - 6.0f;
+            sdl->PushClipRect(q0, q1, true); // belt and braces: nothing painted past the graph frame
+            float spMax = 0.0f;
+            DrawSpeedGraphInto(sdl, sgx0, sgx1, q0.y + 8.0f, q1.y - 8.0f, 0.0f, tEnd,
+                               (sSpDragKnot >= 0) ? sSpDragMax : 0.0f, &spMax);
+            SpeedHandlesUI(sdl, sgx0, sgx1, q0.y + 8.0f, q1.y - 8.0f, 0.0f, tEnd, spMax, ImGui::IsItemHovered());
+            float sphx = sgx0 + (std::min(sPlayhead, tEnd) / tEnd) * (sgx1 - sgx0);
+            sdl->AddLine(ImVec2(sphx, q0.y + 4.0f), ImVec2(sphx, q1.y - 4.0f), IM_COL32(60, 255, 90, 150), 1.5f);
+            sdl->PopClipRect();
+        }
         return;
     }
 
     // The active (editable) channel is tracked by identity, so toggling another channel's visibility doesn't shift
     // which curve you're editing.
-    static bool sActIsCam = false;
     static CineParamTrack* sActTrack = nullptr;
-    static int sActCam = -1;
-    static int keySel = -1;
     static int drag = -1;
     static float sDragLo = 0.0f, sDragHi = 1.0f; // active channel's value range, frozen for the duration of a drag
     static bool sDragRange = false;
+    static float sCvT0 = 0.0f, sCvT1 = -1.0f; // visible time window (sCvT1 <= sCvT0 = the whole timeline)
     int active = -1;
     for (int i = 0; i < (int)curves.size(); i++) {
-        if (curves[i].isCam == sActIsCam && (sActIsCam ? curves[i].camChan == sActCam : curves[i].track == sActTrack)) {
+        if (curves[i].track == sActTrack) {
             active = i;
             break;
         }
     }
-    if (active < 0) { // the previously active channel is gone (disabled/hidden) - fall back and reset selection
+    if (active < 0) { // the previously active channel is gone (disabled/hidden) - fall back
         active = 0;
-        keySel = -1;
         drag = -1;
     }
 
     // Legend: every visible channel; click one to make it the editable (bright) curve, the rest stay faded.
+    // (Selection is shared per (track,id), so it persists across channels.)
     for (int i = 0; i < (int)curves.size(); i++) {
         ImGui::PushID(i);
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(curves[i].col));
@@ -4491,36 +4883,35 @@ static void DrawCurveEditor() {
         snprintf(lbl, sizeof(lbl), "%s%s", (i == active) ? "* " : "", curves[i].name);
         if (ImGui::SmallButton(lbl)) {
             active = i;
-            keySel = -1;
         }
         ImGui::PopStyleColor();
         ImGui::PopID();
         ImGui::SameLine();
     }
     ImGui::NewLine();
-    { // remember the active channel's identity for next frame
-        const CurveChannel& A = curves[active];
-        sActIsCam = A.isCam;
-        sActTrack = A.track;
-        sActCam = A.camChan;
-    }
+    sActTrack = curves[active].track; // remember the active channel's identity for next frame
     const CurveChannel& AL = curves[active];
 
     float total = EffectiveTotal();
     if (total < 0.001f) {
         total = 1.0f;
     }
+    // Visible time window (zoom/pan state, clamped to the timeline).
+    float vt0 = 0.0f, vt1 = total;
+    if (sCvT1 > sCvT0) {
+        vt0 = std::min(std::max(sCvT0, 0.0f), total);
+        vt1 = std::min(std::max(sCvT1, vt0 + total * 0.01f), total);
+        if (vt1 - vt0 < 1e-4f) { // the timeline shrank underneath the zoom window (deletes / shorter path
+            sCvT0 = 0.0f;        // loaded): a zero-width window would divide time-to-pixel by zero
+            sCvT1 = -1.0f;
+            vt0 = 0.0f;
+            vt1 = total;
+        }
+    }
 
-    // Generic key accessors spanning both channel kinds.
-    auto keyCount = [&](const CurveChannel& C) -> int {
-        return C.isCam ? (int)sKeyframes.size() : (int)C.track->keys.size();
-    };
-    auto keyTime = [&](const CurveChannel& C, int i) -> float {
-        return C.isCam ? sKeyframes[i].time : C.track->keys[i].time;
-    };
-    auto keyValue = [&](const CurveChannel& C, int i) -> float {
-        return C.isCam ? CamChanGet(sKeyframes[i], C.camChan) : C.track->keys[i].value;
-    };
+    auto keyCount = [&](const CurveChannel& C) -> int { return (int)C.track->keys.size(); };
+    auto keyTime = [&](const CurveChannel& C, int i) -> float { return C.track->keys[i].time; };
+    auto keyValue = [&](const CurveChannel& C, int i) -> float { return C.track->keys[i].value; };
     // Display range for a channel: its fixed range if it has one (vmax > vmin), otherwise auto-fit to the keys
     // (with padding) - needed for unbounded values like positions.
     auto rangeOf = [&](const CurveChannel& C) -> std::pair<float, float> {
@@ -4534,8 +4925,8 @@ static void DrawCurveEditor() {
             lo = std::min(lo, v);
             hi = std::max(hi, v);
         }
-        if (C.isCam && C.camChan == CAM_ROLL) { // floor the roll view to a full half-turn each way (barrel rolls
-            lo = std::min(lo, -180.0f);         // past +-180 still expand it; they're never clamped)
+        if (C.track == &sRollTrack) {   // floor the roll view to a full half-turn each way (barrel rolls past
+            lo = std::min(lo, -180.0f); // +-180 still expand it; they're never clamped)
             hi = std::max(hi, 180.0f);
         }
         if (lo > hi) {
@@ -4604,42 +4995,21 @@ static void DrawCurveEditor() {
     snprintf(lab, sizeof(lab), "%g", vmin);
     dl->AddText(ImVec2(gx0 + 2.0f, gy1 - 13.0f), IM_COL32(150, 150, 155, 255), lab);
 
+    if (showSpeed) { // behind the value curves so it reads as context, not another editable channel
+        float spMax = 0.0f;
+        DrawSpeedGraphInto(dl, gx0, gx1, gy0, gy1, vt0, vt1, (sSpDragKnot >= 0) ? sSpDragMax : 0.0f, &spMax);
+        SpeedHandlesUI(dl, gx0, gx1, gy0, gy1, vt0, vt1, spMax, ImGui::IsItemHovered());
+    } else {
+        sSpHot = false;
+    }
+
     float phx = timeToX(std::min(sPlayhead, total));
     dl->AddLine(ImVec2(phx, gy0), ImVec2(phx, gy1), IM_COL32(60, 255, 90, 150), 1.5f);
 
-    // Camera channels share one pose sampling across the visible range (so the drawn curve matches what actually
-    // plays back - ease and spline shaping included); computed once here and reused by every visible camera channel.
-    bool anyCam = false;
-    for (const CurveChannel& C : curves) {
-        if (C.isCam) {
-            anyCam = true;
-            break;
-        }
-    }
-    std::vector<float> camT;
-    std::vector<CineKeyframe> camP;
-    if (anyCam) {
-        int ns = (int)((gx1 - gx0) / 3.0f);
-        if (ns < 24) {
-            ns = 24;
-        }
-        if (ns > 400) {
-            ns = 400;
-        }
-        camT.reserve(ns + 1);
-        camP.reserve(ns + 1);
-        for (int s = 0; s <= ns; s++) {
-            float tt = total * (float)s / (float)ns;
-            camT.push_back(tt);
-            camP.push_back(SampleAt(tt));
-        }
-    }
-
-    // Draw every channel. Camera channels are a polyline sampled straight from the camera evaluation. Parameter
-    // channels render PER SEGMENT so each interpolation type is exact: step = hold + vertical drop, linear = a
-    // straight line, smooth = a polyline sub-sampled by the segment's on-screen width (so curves between close
-    // keyframes stay smooth instead of collapsing to a line). Each channel is scaled to its own range; the active
-    // one is bright, the rest are faded overlays.
+    // Draw every channel PER SEGMENT so each interpolation type is exact: step = hold + vertical drop, linear =
+    // a straight line, smooth/bezier = a polyline sub-sampled by the segment's on-screen width (so curves
+    // between close keyframes stay smooth instead of collapsing to a line). Each channel is scaled to its own
+    // range; the active one is bright, the rest are faded overlays.
     for (int ci = 0; ci < (int)curves.size(); ci++) {
         const CurveChannel& C = curves[ci];
         bool isAct = (ci == active);
@@ -4653,15 +5023,6 @@ static void DrawCurveEditor() {
         }
         int nk = keyCount(C);
         if (nk == 0) {
-            continue;
-        }
-        if (C.isCam) {
-            ImVec2 prev(timeToX(camT[0]), valToY(CamChanGet(camP[0], C.camChan), lo, hi));
-            for (size_t s = 1; s < camT.size(); s++) {
-                ImVec2 cur(timeToX(camT[s]), valToY(CamChanGet(camP[s], C.camChan), lo, hi));
-                dl->AddLine(prev, cur, col, w);
-                prev = cur;
-            }
             continue;
         }
         CineParamTrack* ct = C.track;
@@ -4701,12 +5062,62 @@ static void DrawCurveEditor() {
             }
         }
     }
-    // Active channel's key points (draggable). Camera points are locked in time (vertical drag only).
+    // Selection accessors for the active channel (the shared (track,id) selection).
+    auto keyIdAt = [&](int i) -> int { return AL.track->keys[i].id; };
+    auto isSelIdx = [&](int i) -> bool { return IsParamKeySel(AL.track, AL.track->keys[i].id); };
+    // Primary (last-selected) key index in the active channel - drives the toolbar fields.
+    int primIdx = -1;
+    for (int s = (int)sParamSel.size() - 1; s >= 0; s--) {
+        if (sParamSel[s].track == AL.track) {
+            primIdx = ParamKeyIndexById(AL.track, sParamSel[s].id);
+            break;
+        }
+    }
+
+    // Active channel's key points. Selected = filled gold; the primary gets a brighter ring.
     for (int i = 0; i < activeN; i++) {
         ImVec2 c(timeToX(keyTime(AL, i)), valToY(keyValue(AL, i), vmin, vmax));
-        bool s = (i == keySel);
-        dl->AddCircleFilled(c, s ? 5.5f : 4.0f, s ? IM_COL32(255, 220, 80, 255) : AL.col);
-        dl->AddCircle(c, s ? 7.0f : 5.0f, IM_COL32(255, 255, 255, s ? 220 : 120));
+        bool sel = isSelIdx(i);
+        bool prim = (i == primIdx);
+        dl->AddCircleFilled(c, sel ? 5.5f : 4.0f, sel ? IM_COL32(255, 220, 80, 255) : AL.col);
+        dl->AddCircle(c, prim ? 7.5f : (sel ? 6.5f : 5.0f), IM_COL32(255, 255, 255, sel ? 230 : 120));
+    }
+
+    // Bezier handles: for selected parameter keys that touch a Bezier segment, draw the in/out tangent handles
+    // (a line from the key to a draggable endpoint). Collected so the click handler can grab them with priority.
+    struct HandleHit {
+        int keyId;
+        int which; // 0 = out (segment leaving this key), 1 = in (segment arriving at this key)
+        ImVec2 pos;
+    };
+    std::vector<HandleHit> handles;
+    {
+        CineParamTrack* tr = AL.track;
+        for (int i = 0; i < activeN; i++) {
+            if (!isSelIdx(i)) {
+                continue;
+            }
+            bool showOut = (i < activeN - 1) && KeyInterp(*tr, i) == CINE_TRACK_BEZIER;
+            bool showIn = (i > 0) && KeyInterp(*tr, i - 1) == CINE_TRACK_BEZIER;
+            if (!showOut && !showIn) {
+                continue;
+            }
+            float oT, oV, iT, iV;
+            GetBezierHandles(*tr, i, oT, oV, iT, iV);
+            ImVec2 kp(timeToX(tr->keys[i].time), valToY(tr->keys[i].value, vmin, vmax));
+            if (showOut) {
+                ImVec2 hp(timeToX(tr->keys[i].time + oT), valToY(tr->keys[i].value + oV, vmin, vmax));
+                dl->AddLine(kp, hp, IM_COL32(170, 180, 200, 200), 1.0f);
+                dl->AddCircleFilled(hp, 3.5f, IM_COL32(120, 220, 255, 255));
+                handles.push_back({ tr->keys[i].id, 0, hp });
+            }
+            if (showIn) {
+                ImVec2 hp(timeToX(tr->keys[i].time + iT), valToY(tr->keys[i].value + iV, vmin, vmax));
+                dl->AddLine(kp, hp, IM_COL32(170, 180, 200, 200), 1.0f);
+                dl->AddCircleFilled(hp, 3.5f, IM_COL32(120, 220, 255, 255));
+                handles.push_back({ tr->keys[i].id, 1, hp });
+            }
+        }
     }
 
     ImGuiIO& io = ImGui::GetIO();
