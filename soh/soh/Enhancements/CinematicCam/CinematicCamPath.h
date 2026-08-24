@@ -61,7 +61,10 @@ struct CineKeyframe {
     // Units are DEGREES PER UNIT OF SEGMENT PROGRESS, not degrees per second. A rate in deg/s is a claim about
     // wall-clock time, so retiming the path left it fighting the new duration and the aim jerked; relative to
     // progress it describes the shape of the turn, and retiming just plays that shape faster or slower.
-    int hasAimTan;
+    // Flagged per SIDE. A keyframe's two sides belong to two different segments, and a bake that only
+    // measured one of them must not pin the other - the far side's value would be a guess, and it would
+    // reshape a segment the insert never touched. (Same reason as hasAccelIn/Out on the speed fields.)
+    int hasAimTanIn, hasAimTanOut;
     float aimTanYawIn, aimTanYawOut;
     float aimTanPitchIn, aimTanPitchOut;
 
@@ -69,7 +72,8 @@ struct CineKeyframe {
     // keyframe, per side, in the same progress-relative units. Automatic is a value shared by both sides (so
     // the turn has no acceleration step at a keyframe); these are baked by Insert @ playhead for the same
     // reason the rates are, since a derived curvature would re-derive itself around a new keyframe.
-    int hasAimAcc;
+    // Degrees per progress squared, per side, same units and same per-side rule as the rates above.
+    int hasAimAccIn, hasAimAccOut;
     float aimAccYawIn, aimAccYawOut;
     float aimAccPitchIn, aimAccPitchOut;
 

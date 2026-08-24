@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <chrono>
 #include <cstdint>
+#include <array>
 #include <ctime>
 #include <cstdarg>
 #include <nlohmann/json.hpp>
@@ -933,10 +934,10 @@ static void AimAngleSlopes(float p0, float p1, float p2, float p3, float t01, fl
     }
     NuKbScalarSlopes(p0, p1, p2, p3, t01, t12, t23, b.tension, b.continuity, b.bias, c.tension, c.continuity, c.bias,
                      false, mOut, mIn);
-    if (b.hasAimTan) {
+    if (b.hasAimTanOut) {
         *mOut = exOut;
     }
-    if (c.hasAimTan) {
+    if (c.hasAimTanIn) {
         *mIn = exIn;
     }
     // No clamp here. The envelope is enforced once, on the finished curve, by AimEnvelopeScale below - see
@@ -1740,13 +1741,18 @@ static void AimSegmentAccels(int i1, float yB, float yC, float pB, float pC, flo
     float y0 = kY0 * dd, y1 = kY1 * dd, p0 = kP0 * dd, p1v = kP1 * dd; // back to per-progress
     const CineKeyframe& b = sKeyframes[i1];
     const CineKeyframe& c = sKeyframes[i2];
-    if (b.hasAimAcc) { // baked values are already progress-relative, so they are used as they stand
-        y0 = b.aimAccYawOut;
-        p0 = b.aimAccPitchOut;
+    // Baked values are progress-relative already, but they are stored in DEGREES like the rates, and every
+    // angle in here is radians. Reading them raw made every baked curvature 57x too strong, which the
+    // envelope then had to scale back hard - and since a keyframe's curvature is shared with the segment on
+    // its other side, the wreckage showed up further from the inserted keyframe than the insert had touched.
+    const float kD2Ra = 3.14159265f / 180.0f;
+    if (b.hasAimAccOut) {
+        y0 = b.aimAccYawOut * kD2Ra;
+        p0 = b.aimAccPitchOut * kD2Ra;
     }
-    if (c.hasAimAcc) {
-        y1 = c.aimAccYawIn;
-        p1v = c.aimAccPitchIn;
+    if (c.hasAimAccIn) {
+        y1 = c.aimAccYawIn * kD2Ra;
+        p1v = c.aimAccPitchIn * kD2Ra;
     }
     // Curvature this strong would carry the view past one of the two keyframes it sits between - the one
     // thing the aim may never do. Scale it back just far enough. Level curvature (0) is always within the
@@ -1983,7 +1989,7 @@ static uint32_t PathShapeHash() {
         h = HashF32(h, k.tangentIn[2]);
         h = HashF32(h, k.tanWOut);
         h = HashF32(h, k.tanWIn);
-        h = HashF32(h, (float)k.hasAimAcc);
+        h = HashF32(h, (float)(k.hasAimAccIn * 8 + k.hasAimAccOut * 4 + k.hasAimTanIn * 2 + k.hasAimTanOut));
         h = HashF32(h, k.speedRate); // these drive the arc schedule, which this hash keys
         h = HashF32(h, (float)(k.hasAccelIn * 2 + k.hasAccelOut));
         h = HashF32(h, k.speedAccelIn);
@@ -2451,6 +2457,10 @@ static void InsertAtPlayhead() {
     // written as explicit values, nobody re-derives slopes from the new arrangement - so the insert cannot
     // reshape the aim curve.
     bool aimBake = false;
+    // Whether the OUTER sides were actually measured off their own segment. Without this the fallback value
+    // (a copy of the near side) would be pinned as if it had been measured, reshaping a segment the insert
+    // never touched.
+    bool haveBIn = false, haveCOut = false;
     float aimB[4] = {}, aimK[4] = {}, aimC[4] = {};
     float accB[4] = {}, accK[4] = {}, accC[4] = {}; // matching curvatures, same {YawIn,YawOut,PitchIn,PitchOut}
     // Speed bake: same idea for the pacing. The schedule derives its knot speeds from the (time, distance)
@@ -2610,6 +2620,7 @@ static void InsertAtPlayhead() {
                         AimSegmentAccels(p1, q0, q1, q2, q3, nmoY, nmiY, nmoP, nmiP, &ry, &riy, &rp, &rip);
                         accB[0] = kR2D * riy;
                         accB[2] = kR2D * rip;
+                        haveBIn = true;
                     }
                 }
                 if (hasNext) {
@@ -2621,6 +2632,7 @@ static void InsertAtPlayhead() {
                         AimSegmentAccels(i2, q0, q1, q2, q3, nmoY, nmiY, nmoP, nmiP, &ry, &riy, &rp, &rip);
                         accC[1] = kR2D * ry;
                         accC[3] = kR2D * rp;
+                        haveCOut = true;
                     }
                 }
             }
@@ -2737,7 +2749,14 @@ static void InsertAtPlayhead() {
     }
     // Aim bake: write the captured rates as explicit values on all three keyframes.
     if (aimBake) {
-        B.hasAimAcc = C.hasAimAcc = K.hasAimAcc = 1;
+        // Pin only the sides that were measured. B's leaving side and C's arriving side face the split and
+        // are always known; their outer sides belong to segments the insert did not touch, and are pinned
+        // only when their own segment could be read.
+        B.hasAimAccOut = B.hasAimTanOut = 1;
+        C.hasAimAccIn = C.hasAimTanIn = 1;
+        K.hasAimAccIn = K.hasAimAccOut = K.hasAimTanIn = K.hasAimTanOut = 1;
+        B.hasAimAccIn = B.hasAimTanIn = haveBIn ? 1 : 0;
+        C.hasAimAccOut = C.hasAimTanOut = haveCOut ? 1 : 0;
         B.aimAccYawIn = accB[0];
         B.aimAccYawOut = accB[1];
         B.aimAccPitchIn = accB[2];
@@ -2750,17 +2769,14 @@ static void InsertAtPlayhead() {
         K.aimAccYawOut = accK[1];
         K.aimAccPitchIn = accK[2];
         K.aimAccPitchOut = accK[3];
-        B.hasAimTan = 1;
         B.aimTanYawIn = aimB[0];
         B.aimTanYawOut = aimB[1];
         B.aimTanPitchIn = aimB[2];
         B.aimTanPitchOut = aimB[3];
-        K.hasAimTan = 1;
         K.aimTanYawIn = aimK[0];
         K.aimTanYawOut = aimK[1];
         K.aimTanPitchIn = aimK[2];
         K.aimTanPitchOut = aimK[3];
-        C.hasAimTan = 1;
         C.aimTanYawIn = aimC[0];
         C.aimTanYawOut = aimC[1];
         C.aimTanPitchIn = aimC[2];
@@ -2839,9 +2855,9 @@ static void SavePathTo(const char* base, bool bindEntrance) {
                         { "tanWIn", k.tanWIn },
                         { "aimMode", k.aimMode },
                         { "aimHold", k.aimHold },
-                        { "hasAimTanP", k.hasAimTan },
+                        { "hasAimTanP", { k.hasAimTanIn, k.hasAimTanOut } },
                         { "aimTanP", { k.aimTanYawIn, k.aimTanYawOut, k.aimTanPitchIn, k.aimTanPitchOut } },
-                        { "hasAimAcc", k.hasAimAcc },
+                        { "hasAimAcc", { k.hasAimAccIn, k.hasAimAccOut } },
                         { "aimAcc", { k.aimAccYawIn, k.aimAccYawOut, k.aimAccPitchIn, k.aimAccPitchOut } },
                         { "speed",
                           { k.speedRate, k.speedAccelIn, k.speedAccelOut, (float)k.hasAccelIn, (float)k.hasAccelOut,
@@ -2987,14 +3003,20 @@ static void LoadPath() {
         // Only the progress-relative form is read. Files written while these were deg/s carry the old
         // "aimTan" key, which is deliberately ignored: the numbers mean something different now, and falling
         // back to automatic rates gives those paths a correct curve rather than a plausible wrong one.
-        k.hasAimTan = e.value("hasAimTanP", 0);
+        if (e.contains("hasAimTanP") && e["hasAimTanP"].is_array() && e["hasAimTanP"].size() >= 2) {
+            k.hasAimTanIn = e["hasAimTanP"][0];
+            k.hasAimTanOut = e["hasAimTanP"][1];
+        }
         if (e.contains("aimTanP") && e["aimTanP"].size() >= 4) {
             k.aimTanYawIn = e["aimTanP"][0];
             k.aimTanYawOut = e["aimTanP"][1];
             k.aimTanPitchIn = e["aimTanP"][2];
             k.aimTanPitchOut = e["aimTanP"][3];
         }
-        k.hasAimAcc = e.value("hasAimAcc", 0);
+        if (e.contains("hasAimAcc") && e["hasAimAcc"].is_array() && e["hasAimAcc"].size() >= 2) {
+            k.hasAimAccIn = e["hasAimAcc"][0];
+            k.hasAimAccOut = e["hasAimAcc"][1];
+        }
         if (e.contains("aimAcc") && e["aimAcc"].size() >= 4) {
             k.aimAccYawIn = e["aimAcc"][0];
             k.aimAccYawOut = e["aimAcc"][1];
@@ -3206,8 +3228,8 @@ static void SmoothPath() {
     bool cyc = LoopCyclic() && lo == 0 && hi == n - 1 && n >= 3;
     int nk = cyc ? n : m + 1; // knots being solved
     int ns = cyc ? n : m;     // intervals (cyclic includes loop-return: last -> first)
-    if ((!cyc && m < 2) || nk > 64) {
-        return; // nothing to bend, or beyond the solver's buffer
+    if (!cyc && m < 2) {
+        return; // nothing to bend
     }
     PushUndo();
     for (int i = lo; i < (cyc ? n : hi); i++) {
@@ -3221,47 +3243,51 @@ static void SmoothPath() {
         float e0 = q[0] - p[0], e1 = q[1] - p[1], e2 = q[2] - p[2];
         h[i] = std::max(std::sqrt(std::sqrt(e0 * e0 + e1 * e1 + e2 * e2)), 1e-3f);
     }
-    float M[3][64]; // solved knot velocities (dEye/dt in the global centripetal parameter), per axis
+    // Solved knot velocities (dEye/dt in the global centripetal parameter), per axis. Sized to the path
+    // rather than to a fixed buffer: these used to be 64-entry arrays with an early return above them, so on
+    // any path longer than 64 keyframes Smooth path did nothing at all and said nothing about it.
+    std::vector<std::array<float, 3>> M((size_t)nk);
     if (cyc) {
-        // Periodic C2 system: every knot is interior, indices wrap. Solved as a small dense system (n <= 64,
-        // runs once per button press - no need for a specialised cyclic solver).
+        // Periodic C2 system: every knot is interior, indices wrap. Solved as a dense system - it runs once
+        // per button press, so an O(n^3) elimination is fine well past any realistic path length.
+        std::vector<float> A((size_t)nk * (size_t)(nk + 1));
+        auto at = [&](int r, int c) -> float& { return A[(size_t)r * (size_t)(nk + 1) + (size_t)c]; };
         for (int ax = 0; ax < 3; ax++) {
-            static float A[64][65];
-            std::memset(A, 0, sizeof(A));
+            std::fill(A.begin(), A.end(), 0.0f);
             for (int i = 0; i < nk; i++) {
                 int ip = (i - 1 + nk) % nk, in2 = (i + 1) % nk;
                 float hp = h[ip], hn = h[i];
                 float Pm = sKeyframes[ip].eye[ax], P0 = sKeyframes[i].eye[ax], Pp = sKeyframes[in2].eye[ax];
-                A[i][ip] += 1.0f / hp;
-                A[i][i] += 2.0f * (1.0f / hp + 1.0f / hn);
-                A[i][in2] += 1.0f / hn;
-                A[i][nk] = 3.0f * ((P0 - Pm) / (hp * hp) + (Pp - P0) / (hn * hn));
+                at(i, ip) += 1.0f / hp;
+                at(i, i) += 2.0f * (1.0f / hp + 1.0f / hn);
+                at(i, in2) += 1.0f / hn;
+                at(i, nk) = 3.0f * ((P0 - Pm) / (hp * hp) + (Pp - P0) / (hn * hn));
             }
             for (int col = 0; col < nk; col++) { // Gaussian elimination with partial pivoting
                 int piv = col;
                 for (int r = col + 1; r < nk; r++) {
-                    if (std::fabs(A[r][col]) > std::fabs(A[piv][col])) {
+                    if (std::fabs(at(r, col)) > std::fabs(at(piv, col))) {
                         piv = r;
                     }
                 }
                 for (int cc = 0; cc <= nk; cc++) {
-                    std::swap(A[col][cc], A[piv][cc]);
+                    std::swap(at(col, cc), at(piv, cc));
                 }
-                if (std::fabs(A[col][col]) < 1e-9f) {
+                if (std::fabs(at(col, col)) < 1e-9f) {
                     continue;
                 }
                 for (int r = 0; r < nk; r++) {
                     if (r == col) {
                         continue;
                     }
-                    float w = A[r][col] / A[col][col];
+                    float w = at(r, col) / at(col, col);
                     for (int cc = col; cc <= nk; cc++) {
-                        A[r][cc] -= w * A[col][cc];
+                        at(r, cc) -= w * at(col, cc);
                     }
                 }
             }
             for (int i = 0; i < nk; i++) {
-                M[ax][i] = (std::fabs(A[i][i]) > 1e-9f) ? A[i][nk] / A[i][i] : 0.0f;
+                M[i][ax] = (std::fabs(at(i, i)) > 1e-9f) ? at(i, nk) / at(i, i) : 0.0f;
             }
         }
     } else {
@@ -3292,9 +3318,9 @@ static void SmoothPath() {
                 diagB[i] -= w * diagC[i - 1];
                 rhs[i] -= w * rhs[i - 1];
             }
-            M[ax][nk - 1] = rhs[nk - 1] / diagB[nk - 1];
+            M[nk - 1][ax] = rhs[nk - 1] / diagB[nk - 1];
             for (int i = nk - 2; i >= 0; i--) {
-                M[ax][i] = (rhs[i] - diagC[i] * M[ax][i + 1]) / diagB[i];
+                M[i][ax] = (rhs[i] - diagC[i] * M[i + 1][ax]) / diagB[i];
             }
         }
     }
@@ -3303,7 +3329,7 @@ static void SmoothPath() {
     int bake0 = cyc ? 0 : 1, bake1 = cyc ? nk - 1 : nk - 2;
     for (int i = bake0; i <= bake1; i++) {
         CineKeyframe& k = sKeyframes[lo + i];
-        float dir[3] = { M[0][i], M[1][i], M[2][i] };
+        float dir[3] = { M[i][0], M[i][1], M[i][2] };
         if (v3len(dir) < 1e-5f) {
             continue; // stationary knot: leave it as authored
         }
@@ -3330,7 +3356,7 @@ static void SmoothPath() {
         float autoOut = v3len(td);
         EyeSegmentTangents(prevSeg, gi, td, ts);
         float autoIn = v3len(ts);
-        float mag = std::sqrt(M[0][i] * M[0][i] + M[1][i] * M[1][i] + M[2][i] * M[2][i]);
+        float mag = std::sqrt(M[i][0] * M[i][0] + M[i][1] * M[i][1] + M[i][2] * M[i][2]);
         if (autoOut > 1e-5f) {
             k.tanWOut = std::min(std::max(mag * hOut / autoOut, 0.1f), 4.0f);
         }
@@ -7826,11 +7852,12 @@ void CinematicCamPathWindow::DrawElement() {
                             "so the framing parks for a beat while the camera keeps travelling. Off, the view "
                             "flows straight through without stopping.");
             }
-            if (sKeyframes[sel].hasAimTan) {
+            if (sKeyframes[sel].hasAimTanIn || sKeyframes[sel].hasAimTanOut) {
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Reset aim rates")) {
                     PushUndo();
-                    sKeyframes[sel].hasAimTan = 0;
+                    sKeyframes[sel].hasAimTanIn = sKeyframes[sel].hasAimTanOut = 0;
+                    sKeyframes[sel].hasAimAccIn = sKeyframes[sel].hasAimAccOut = 0;
                 }
                 if (ImGui::IsItemHovered()) {
                     CineTooltip("This keyframe carries baked aim rates (from Insert @ playhead), frozen so "
