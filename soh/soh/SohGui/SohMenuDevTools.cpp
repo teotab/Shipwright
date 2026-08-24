@@ -367,11 +367,14 @@ void SohMenu::AddMenuDevTools() {
                               "Back button."));
     AddWidget(path, "Boost (faster):", WIDGET_CVAR_BTN_SELECTOR)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.BoostBtn"))
-        .Options(BtnSelectorOptions().DefaultValue(BTN_CUSTOM_MODIFIER2).Tooltip(
-            "Hold to fly faster. Defaults to Modifier 2, which is a bumper rather than a face button because you "
-            "hold it while working both sticks.\n\n"
-            "Modifier 2 needs mapping once before it does anything: Settings > Controller Configuration > your "
-            "port > Modifier Buttons > M2, and set it to your right bumper (RB / R1)."));
+        .Options(
+            BtnSelectorOptions()
+                .DefaultValue(BTN_CUSTOM_MODIFIER2)
+                .Tooltip(
+                    "Hold to fly faster. Defaults to Modifier 2: a bumper, not a face button, because you hold it "
+                    "while both sticks are busy.\n\n"
+                    "Modifier 2 needs mapping once before it does anything: Settings > Controller Configuration > your "
+                    "port > Modifier Buttons > M2, and set it to your right bumper (RB / R1)."));
     AddWidget(path, "Precision (slower):", WIDGET_CVAR_BTN_SELECTOR)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.PrecisionBtn"))
         .Options(BtnSelectorOptions().DefaultValue(BTN_L));
