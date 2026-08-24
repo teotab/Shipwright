@@ -1,8 +1,11 @@
 # 🎥 Cinematic Camera for Ship of Harkinian
 
-A **cinematic camera toolkit** for [Ship of Harkinian](https://github.com/HarbourMasters/Shipwright): a detached
-free-fly camera, a keyframe path editor, and a curve editor — everything you need to plan, shoot and re-shoot a
-camera move through *The Legend of Zelda: Ocarina of Time*.
+A **cinematic camera toolkit** for [Ship of Harkinian](https://github.com/HarbourMasters/Shipwright) with everything you could need to make cool cinematics in the one and only OOT. At your disposal, you've got :
+
+- An easy to use, proper freecam mode
+- A full-fledged keyframe and path system, editable in 3D or via the UI
+- A timeline, a curve editor and a god damn speed graph
+
 
 Fly anywhere, frame the shot, drop keyframes, and play back a move that actually looks like it was shot on a
 crane rather than snapped between poses.
@@ -22,11 +25,11 @@ crane rather than snapped between poses.
 
 A fully detached, controller-driven camera that flies anywhere in the scene, independent of Link.
 
-- **Ignore culling** — actors keep drawing and the far clip plane pushes out while you fly, so nothing pops in
+- **Ignore culling** : actors keep drawing and the far clip plane pushes out while you fly, so nothing pops in
   and out of a shot.
-- **Inertia** — one slider takes you from crisp 1:1 to floaty handheld glide.
-- **Freeze the world**, or leave the action running and shoot it live.
-- **Boost** and **precision** modifiers for covering ground and for the last few units.
+- **Inertia** : full control over how precise/cinematic you want the camera to be.
+- **Time control**, Slider for the day/night cycle, time freeze.
+- **Boost** and **precision** modifiers to glyde through hyrule at light speed.
 - Fully rebindable; sticks remap in SoH's normal Controller Configuration.
 
 > **📷 Image slot — `docs/media/freecam.gif`**
@@ -37,22 +40,22 @@ A fully detached, controller-driven camera that flies anywhere in the scene, ind
 Fly to a pose, press **Add Keyframe**, repeat. The camera plays a smooth spline through them.
 
 - Each keyframe stores **eye, look-at, roll and FOV**.
-- **In-world overlay** — the spline itself, numbered markers, facing indicators and a live playhead, drawn over
+- **In-world overlay** : the spline itself, numbered markers, facing indicators and a live playhead, drawn over
   the game at any resolution.
 - **Transform gizmos** on the selected keyframe:
-  - **Move** — drag the X/Y/Z axes to reposition it.
-  - **Rotate (aim)** — drag rings for yaw / pitch / roll.
-  - **Bend (path)** — rotate the spline's tangent to bend the curve through the point, without touching the aim.
-- **Per-keyframe shape** — Tension / Continuity / Bias, or plain Linear.
-- **Numeric fields** for exact position, yaw, pitch, roll and FOV.
+  - **Move** : drag the X/Y/Z axes to reposition it.
+  - **Rotate (aim)** : drag rings for yaw / pitch / roll.
+  - **Bend (path)** : rotate the spline's tangent to bend the curve through the point, without touching the aim.
+- **Per-keyframe shape** : Tension / Continuity / Bias, or plain Linear.
+- **Numeric fields** for exact position, yaw, pitch, roll and FOV. (they're useful, you'll need 'em)
 - **Six aim modes per keyframe**: free orientation, look at a point, look at **Link**, look at **any actor**
   (searchable, distance-sorted picker), look at the **shared movable target**, or **follow the path** like a
   dolly on a rail.
-- **Path-level aim override** — re-point an entire recorded flight at one target in a single click.
-- **Record from freecam** — fly the move live and have keyframes laid down at an interval.
-- **Smooth path** and **Normalize speed** clean up a hand-built or recorded path in one press.
-- **Auto-orbit** — generate a circle or arc of keyframes around Link, an actor, the target or the camera, each
-  one already aimed at the centre. A full 360° arc turns looping on for you.
+- **Path-level aim override** : re-point an entire recorded flight at one target in a single click.
+- **Record from freecam** : not quite like an FPV drone but close enough, you record the path as you move.
+- **Smooth path** and **Normalize speed** clean up a hand-built or recorded path in one press. (or just a selection, important)
+- **Auto-orbit** : generate a circle or arc of keyframes around Link, an actor, the target or the camera, each
+  one already aimed at the centre. And if you wanna record a looped animation, you can even sync link's idle animation to the start of your timeline, to get a perfect loop every 8 seconds
 
 > **📷 Image slot — `docs/media/world-overlay.png`**
 > A screenshot of the in-world overlay: the spline curve, numbered markers, and the move gizmo on a selected
@@ -63,21 +66,22 @@ Fly to a pose, press **Add Keyframe**, repeat. The camera plays a smooth spline 
 
 ### The timeline
 
-Where the shot is *timed*. The path's shape comes only from where the keyframes are in the world; the timeline
-decides how fast the camera travels between them, and never bends the curve.
+The physical path's shape comes only from where the keyframes are in the world; the timeline
+decides how fast the camera travels between them, and never bends the movement curve. 
+Again, all the usual amenities :
 
 - Draggable **keyframe markers** and a draggable **playhead**, with frame and keyframe step buttons.
 - **Multi-select** (Ctrl+click), **range select** (Ctrl+Shift+click), **ripple** (Shift+drag), and
   **compress / expand a group** by Alt-dragging either end of a selection.
 - **Automation lanes** underneath for every keyframed parameter.
-- Type a new **total duration** — or select a span and retime just that span.
+- Type a new **total duration**, or select a span and retime just that span.
 
 > **📷 Image slot — `docs/media/timeline.png`**
 > The timeline with several keyframes, a multi-selection, and at least one automation lane populated.
 
 ### The curve editor
 
-A value-over-time graph for every animatable channel — camera roll and FOV, the aim target's X/Y/Z, letterbox,
+A value-over-time graph for every currently animatable channel : camera roll and FOV, the aim target's X/Y/Z, letterbox,
 time of day, shake intensity, green screen.
 
 - **Step / Linear / Smooth / Bezier** per key, with draggable tangent handles on Bezier keys.

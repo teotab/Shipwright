@@ -1428,6 +1428,9 @@ static float KnotSpeedCap(const std::vector<float>& S, int segs, const std::vect
     std::vector<float> trial(slope); // hoisted: the bisection below calls ok() twenty times
     auto ok = [&](float v) {
         trial[i] = v;
+        if (cyc && (i == 0 || i == segs)) {
+            trial[0] = trial[segs] = v; // one keyframe, two ends of the array - both must agree
+        }
         auto segFine = [&](int seg) {
             float d = SegDurAt(seg);
             float a0 = KnotAutoAccel(S, segs, trial, seg) * d * d;
@@ -1441,9 +1444,12 @@ static float KnotSpeedCap(const std::vector<float>& S, int segs, const std::vect
     };
     // Start from a bound that is certainly too fast, then close in. The mean speed of the shorter side is the
     // natural unit; 8x it has never been reachable.
+    // Index by the SEGMENT, never by the knot: on a cyclic path knot 0's previous segment is the WRAPPED one
+    // (segs - 1), so `S[i - 1]` reads S[-1] and takes the process down. A 360-degree auto-orbit turns looping
+    // on for you, which is exactly how this got found.
     float sig = 0.0f;
     if (segPrev >= 0) {
-        sig = (S[i] - S[i - 1]) / SegDurAt(segPrev);
+        sig = (S[segPrev + 1] - S[segPrev]) / SegDurAt(segPrev);
     }
     if (segNext >= 0) {
         float sn = (S[segNext + 1] - S[segNext]) / SegDurAt(segNext);
