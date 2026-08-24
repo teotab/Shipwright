@@ -623,14 +623,94 @@ static float NiceStep(float span, int want) {
     return m * mag;
 }
 
+// How many notches off the automatic step the user has asked for (- = finer, + = coarser). Persisted.
+static int SnapLevel() {
+    return std::min(std::max(CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.SnapLevel"), 0), -6), 6);
+}
+
+// Move a step `notches` rungs along the 1-2-5 ladder (1, 2, 5, 10, 20, 50, ...). The grid stays on round
+// numbers at every setting, which is the whole reason to have a grid: a step of span/17 would put the lines
+// at values nobody would ever choose to type.
+static float LadderStep(float base, int notches) {
+    if (!(base > 0.0f)) {
+        return base;
+    }
+    static const float kMult[3] = { 1.0f, 2.0f, 5.0f };
+    float k = std::floor(std::log10(base));
+    float m = base / std::pow(10.0f, k);
+    int mi = (m < 1.5f) ? 0 : (m < 3.5f) ? 1 : 2;
+    int idx = (int)k * 3 + mi + notches;
+    int kk = (int)std::floor(idx / 3.0f); // floor division: idx can be negative
+    return kMult[idx - kk * 3] * std::pow(10.0f, (float)kk);
+}
+
 // The time grid never goes finer than one tick: a tick is the smallest time the rest of the tool moves in
 // (the , / . step buttons, playback), so a grid below it would snap to times nothing else can reach.
 static float SnapTimeStep(float visibleSpan) {
-    return std::max(NiceStep(visibleSpan, 10), kTickSeconds);
+    return std::max(LadderStep(NiceStep(visibleSpan, 10), SnapLevel()), kTickSeconds);
+}
+
+// The value grid has no equivalent floor - a value channel's units are whatever the channel means.
+static float SnapValueStep(float visibleSpan) {
+    return LadderStep(NiceStep(visibleSpan, 8), SnapLevel());
 }
 
 static float SnapTo(float v, float step) {
     return (step > 1e-9f) ? std::round(v / step) * step : v;
+}
+
+// The Snap cluster, drawn by BOTH graphs from this one function so they cannot drift apart: the toggle, the
+// two ladder buttons, and the step they currently land on. `vStep <= 0` means this graph snaps time only.
+// `id` disambiguates the ImGui ids - two SmallButtons with the same label in one window collide, which is
+// exactly the "conflicting ID" assert.
+static void SnapToolbarUI(const char* id, float tStep, float vStep) {
+    const bool on = SnapEnabled();
+    char lbl[40];
+    snprintf(lbl, sizeof(lbl), "Snap: %s##%ssnap", on ? "on" : "off", id);
+    if (ImGui::SmallButton(lbl)) {
+        CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.SnapGrid"), on ? 0 : 1);
+        CVarSave();
+    }
+    if (ImGui::IsItemHovered()) {
+        if (vStep > 0.0f) {
+            CineTooltip("Magnet: a key you DRAG lands on the grid. Selecting one never moves it.\n\n"
+                        "The grid is drawn while this is on and refines as you zoom in; the - and + buttons "
+                        "step it finer or coarser, always on round numbers.\n\n"
+                        "Separately: hold Q while dragging to lock the drag to one axis - time or value, "
+                        "whichever you were already moving along.");
+        } else {
+            CineTooltip("Magnet: a keyframe you DRAG lands on the time grid. Selecting one never moves it.\n\n"
+                        "The grid refines as you zoom in and never goes finer than one tick; the - and + "
+                        "buttons step it finer or coarser. Same setting as the curve editor's Snap, which also "
+                        "snaps values.");
+        }
+    }
+    if (!on) {
+        return;
+    }
+    const int lvl = SnapLevel();
+    auto ladder = [&](const char* txt, int delta, bool disabled, const char* tip) {
+        char b[40];
+        snprintf(b, sizeof(b), "%s##%ssnap%d", txt, id, delta);
+        ImGui::SameLine(0.0f, 3.0f);
+        ImGui::BeginDisabled(disabled);
+        if (ImGui::SmallButton(b)) {
+            CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.SnapLevel"), lvl + delta);
+            CVarSave();
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) {
+            CineTooltip("%s", tip);
+        }
+    };
+    ladder("-", -1, lvl <= -6, "Finer grid (one step down the 1-2-5 ladder)");
+    ladder("+", 1, lvl >= 6, "Coarser grid (one step up the 1-2-5 ladder)");
+    ImGui::SameLine(0.0f, 5.0f);
+    if (vStep > 0.0f) {
+        CineHint("%g s x %g", tStep, vStep);
+    } else {
+        CineHint("%g s", tStep);
+    }
 }
 
 static float TotalTime() {
@@ -4795,6 +4875,8 @@ static void DrawTimeline() {
     static int sTlKeyDrag = -1;          // key index within that track
     static float sTlKeyGrabT0 = 0.0f;    // that key's time when the drag began, and the cursor's - this lane
     static float sTlKeyGrabCur = 0.0f;   // moves by the cursor's DELTA like everything else (grabbing != editing)
+    static bool sTlBand = false;         // Ctrl+drag on empty space: select every keyframe in the time range
+    static float sTlBandX = 0.0f;        // its anchor, in pixels
     bool interacting = (sTlDragMode != 0) || sTlScrub || (sTlTrackDrag >= 0);
 
     float content = EffectiveTotal(); // actual path length (for labels + playhead clamp)
@@ -5076,8 +5158,15 @@ static void DrawTimeline() {
                     }
                     beginDrag(1);
                 }
+            } else if (io.KeyCtrl) {
+                // Ctrl+drag on empty space rubber-bands a time range. A plain drag here has to stay the
+                // playhead scrub - that is the timeline's primary gesture and far too useful to spend - which
+                // is why this graph needs the modifier and the curve editor, where empty space does nothing,
+                // does not.
+                sTlBand = true;
+                sTlBandX = mx;
             } else {
-                if (!io.KeyCtrl && !io.KeyShift) { // a CLICK on empty space clears; a scrub drag must not
+                if (!io.KeyShift) { // a CLICK on empty space clears; a scrub drag must not
                     sTlClickClear = true;
                     sTlPressX = mx;
                 }
@@ -5124,6 +5213,21 @@ static void DrawTimeline() {
     // Same magnet as the curve editor, same step rule, read off THIS graph's visible span.
     float gridT = SnapTimeStep(view);
     bool snapOn = SnapEnabled();
+    if (ImGui::IsItemActive() && sTlBand) {
+        float a = std::min(sTlBandX, mx), b = std::max(sTlBandX, mx);
+        if (b - a >= 2.5f) {
+            dl->AddRectFilled(ImVec2(a, laneTop(0)), ImVec2(b, laneTop(1)), IM_COL32(255, 220, 80, 34));
+            dl->AddRect(ImVec2(a, laneTop(0)), ImVec2(b, laneTop(1)), IM_COL32(255, 220, 80, 170));
+            int inband = 0;
+            for (int i = 0; i < n; i++) {
+                float x = timeToX(sKeyframes[i].time);
+                if (x >= a && x <= b) {
+                    inband++;
+                }
+            }
+            CineTooltip("%d keyframe%s", inband, inband == 1 ? "" : "s");
+        }
+    }
     if (ImGui::IsItemActive()) {
         if (sTlDragMode == 3) {
             // Scale the selection about its fixed end: the grabbed end follows the cursor, every selected
@@ -5203,6 +5307,21 @@ static void DrawTimeline() {
         }
     }
     if (ImGui::IsItemDeactivated()) {
+        if (sTlBand) { // Ctrl+drag on empty space: add every keyframe in the swept time range
+            float a = std::min(sTlBandX, mx), b = std::max(sTlBandX, mx);
+            if (b - a >= 2.5f) {
+                for (int i = 0; i < n; i++) {
+                    float x = timeToX(sKeyframes[i].time);
+                    if (x >= a && x <= b && !IsSelected(sIds[i])) {
+                        sSelection.push_back(sIds[i]);
+                        if (sSelectedId < 0) {
+                            sSelectedId = sIds[i];
+                        }
+                    }
+                }
+            }
+            sTlBand = false;
+        }
         // Empty-space press: only a real CLICK clears the selection - scrubbing the playhead must keep it.
         if (sTlClickClear && std::fabs(mx - sTlPressX) < 4.0f) {
             sSelection.clear();
@@ -5214,6 +5333,7 @@ static void DrawTimeline() {
         sTlNoDrag = false;
         sTlTrackDrag = -1;
         sTlKeyDrag = -1;
+        sTlBand = false;
     }
 
     float total = content;
@@ -5242,18 +5362,10 @@ static void DrawTimeline() {
         CineTooltip("Auto-fit the ruler to the path length");
     }
     ImGui::SameLine();
-    // The same magnet the curve editor toggles - one setting, reachable from either graph, because the
-    // editor's other half may well be collapsed when you want it.
-    if (ImGui::SmallButton(snapOn ? "Snap: on" : "Snap: off")) {
-        CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.SnapGrid"), snapOn ? 0 : 1);
-        CVarSave();
-    }
-    if (ImGui::IsItemHovered()) {
-        CineTooltip("Magnet: dragged keyframes land on the time grid (now every %.2fs) instead of anywhere "
-                    "between it. The grid refines as you zoom in, and never goes finer than one tick. Same "
-                    "setting as the curve editor's Snap, which also snaps values.",
-                    gridT);
-    }
+    // The same magnet cluster the curve editor draws, from the same function so the two cannot
+    // drift apart - one setting, reachable from either graph, because the editor's other half is
+    // often collapsed when you want it.
+    SnapToolbarUI("tl", gridT, -1.0f);
     ImGui::SameLine();
     CineHint("|");
     ImGui::SameLine();
@@ -5318,7 +5430,8 @@ static void DrawTimeline() {
     } else {
         CineHint("Camera: drag = move, Ctrl+click = multi-select, Ctrl+Shift+click = select range, "
                  "Shift+drag = ripple. Track keys: drag to retime (add/remove via each parameter's keyframe "
-                 "button or the curve editor). Snap puts every drag on the time grid.");
+                 "button or the curve editor). Ctrl+drag empty space = box-select a time range. Snap lands "
+                 "every drag on the time grid.");
     }
 }
 
@@ -6304,7 +6417,14 @@ static void DrawCurveEditor() {
     int activeN = keyCount(AL);
     PruneParamSel(); // drop selected param keys that no longer exist (deletes / loads)
 
-    float graphH = ImGui::GetContentRegionAvail().y - 30.0f; // leave a row for the toolbar below
+    // Reserve a FIXED slice for the toolbar + the block under it. That block swaps between the primary key's
+    // fields (one row) and the how-to hint (three wrapped lines) as the selection changes - and the height
+    // difference was enough to add or remove the WINDOW's scrollbar, which changes the content width, which
+    // rescales this graph horizontally. Clicking a key then moved it, because the pixel-to-time mapping had
+    // shifted under the cursor between the grab frame and the next one. A constant footer height means the
+    // scrollbar can't flip, so the graph can't rescale.
+    const float kFootH = ImGui::GetTextLineHeightWithSpacing() * 5.0f + 10.0f;
+    float graphH = ImGui::GetContentRegionAvail().y - kFootH;
     if (graphH < 80.0f) {
         graphH = 80.0f;
     }
@@ -6338,7 +6458,7 @@ static void DrawCurveEditor() {
     // The magnet's grid, derived from the VISIBLE span so it refines as you zoom in. Computed here, next to
     // the rest of the view maths, so the lines you SEE and the positions a drag LANDS on are the same numbers.
     float gridT = SnapTimeStep(vt1 - vt0);
-    float gridV = NiceStep(vspan, 8);
+    float gridV = SnapValueStep(vspan);
 
     for (int i = 0; i <= 4; i++) {
         float yy = gy0 + (gy1 - gy0) * i / 4.0f;
@@ -6510,14 +6630,21 @@ static void DrawCurveEditor() {
     // The GRABBED key's own start position. The magnet snaps this one key onto the grid and every other key in
     // the selection moves by the same delta - snapping each key on its own would pull the group's internal
     // spacing onto the gridlines and quietly destroy the rhythm you selected it for.
+    static int sCdAnchorId = -1;
     static float sCdAnchorT0 = 0.0f, sCdAnchorV0 = 0.0f;
+    static bool sCdMoved = false;   // this drag has passed the dead zone; until then nothing is written
+    static ImVec2 sCdGrabPx(0, 0);  // graph rect at grab, to notice the view moving under the hand
     static int sCdAxis = kAxisFree; // axis-lock latch for the key drag
     static int sHAxis = kAxisFree;  // ...and for the handle drag (separate: they can't be active at once,
                                     // but a shared latch would carry one drag's choice into the next)
     static bool sCdRipple = false;
-    static bool sHDrag = false; // dragging a Bezier handle endpoint
-    static int sHKeyId = -1;    // param key id whose handle is being dragged
-    static int sHWhich = 0;     // 0 = out handle, 1 = in handle
+    static bool sCdBox = false;    // rubber-band select in progress (drag started on empty graph space)
+    static ImVec2 sCdBoxA(0, 0);   // its anchor corner, in screen pixels
+    static bool sCdBoxAdd = false; // Ctrl was held: add to the selection instead of replacing it
+    static bool sHDrag = false;    // dragging a Bezier handle endpoint
+    static bool sHMoved = false;   // ...and whether it has passed the dead zone (same rule as the key drag)
+    static int sHKeyId = -1;       // param key id whose handle is being dragged
+    static int sHWhich = 0;        // 0 = out handle, 1 = in handle
     // Where the grab landed relative to the thing grabbed. Everything draggable moves by the cursor's DELTA
     // from here, never to the cursor's absolute position: you can hit a 4px dot anywhere inside its ~10px
     // catch radius, and picking something up must never be the same as changing it.
@@ -6559,16 +6686,23 @@ static void DrawCurveEditor() {
             sDragLo = vmin; // freeze the value range so the handle's value-to-pixel scale stays constant
             sDragHi = vmax;
             sDragRange = true;
-            PushUndo();
+            // Breaking the pair IS an edit even if the cursor never moves, so that case takes its undo step
+            // now; otherwise the undo waits for the dead zone, like every other drag here.
+            sHMoved = io.KeyAlt;
+            if (sHMoved) {
+                PushUndo();
+            }
             drag = -1;
         } else {
             int hit = nearestKey();
             if (hit < 0) {
-                if (!io.KeyCtrl) { // click on empty space clears the selection - curve keys AND camera
-                    ParamSelClear();
-                    sSelection.clear();
-                    sSelectedId = -1;
-                }
+                // Empty space starts a rubber band. It only becomes a selection once the cursor has actually
+                // travelled; a press that never moves is still a click, and a click on empty space clears
+                // (that decision is made on RELEASE, below, so a band that starts on empty space and lands on
+                // nothing behaves the same as the click it looks like).
+                sCdBox = true;
+                sCdBoxA = ImVec2(mx, my);
+                sCdBoxAdd = io.KeyCtrl;
                 drag = -1;
             } else if (io.KeyCtrl) { // Ctrl-click toggles this key in/out of the selection, no drag (matches the
                                      // timeline)
@@ -6578,15 +6712,20 @@ static void DrawCurveEditor() {
                 if (!isSelIdx(hit)) { // clicking an unselected point selects only it; a selected one keeps the group
                     ParamSelOnly(AL.track, keyIdAt(hit));
                 }
-                // Begin a drag of the whole selection (Shift ripples this key + all later ones).
-                PushUndo();
+                // Begin a drag of the whole selection (Shift ripples this key + all later ones). Nothing is
+                // written and no undo step is pushed until the cursor passes the dead zone below: picking a
+                // key up must never be the same as editing it. With the magnet on that is not a nicety -
+                // without it, merely clicking a key would snap it onto the nearest gridline.
+                sCdMoved = false;
+                sCdGrabPx = ImVec2(gx0, gy0);
                 sDragLo = vmin;
                 sDragHi = vmax;
                 sDragRange = true;
                 sCdRipple = io.KeyShift;
                 sCdGrabT0 = xToTime(mx); // the CURSOR at grab, not the key: the first frame's delta is zero
                 sCdGrabV0 = yToValActive(my);
-                sCdAnchorT0 = keyTime(AL, hit); // the KEY, which is what the grid snaps
+                sCdAnchorId = keyIdAt(hit); // the KEY the grid snaps; the rest ride its delta
+                sCdAnchorT0 = keyTime(AL, hit);
                 sCdAnchorV0 = keyValue(AL, hit);
                 sCdIds.clear();
                 sCdT0.clear();
@@ -6605,7 +6744,14 @@ static void DrawCurveEditor() {
     }
     // Bezier handle drag: move the grabbed in/out handle in (time, value), clamped so time stays inside the
     // adjacent segment (keeps the curve a proper function of time).
-    if (ImGui::IsItemActive() && sHDrag) {
+    if (ImGui::IsItemActive() && sHDrag && !sHMoved) {
+        ImVec2 dd = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
+        if (std::fabs(dd.x) + std::fabs(dd.y) >= 2.5f) {
+            PushUndo();
+            sHMoved = true;
+        }
+    }
+    if (ImGui::IsItemActive() && sHDrag && sHMoved) {
         int idx = ParamKeyIndexById(AL.track, sHKeyId);
         if (idx >= 0) {
             CineParamKey& k = AL.track->keys[idx];
@@ -6682,7 +6828,36 @@ static void DrawCurveEditor() {
             }
         }
     }
-    if (ImGui::IsItemActive() && drag >= 0) {
+    // A click that never travelled is a selection, not an edit: nothing is written and no undo step is pushed
+    // until the cursor leaves this dead zone. With the magnet on that is not a nicety - without it, merely
+    // clicking a key would snap it onto the nearest gridline.
+    if (ImGui::IsItemActive() && drag >= 0 && !sCdMoved) {
+        ImVec2 dd = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
+        if (std::fabs(dd.x) + std::fabs(dd.y) >= 2.5f) {
+            PushUndo();
+            sCdMoved = true;
+        }
+    }
+    if (ImGui::IsItemActive() && drag >= 0 && sCdMoved) {
+        // If the graph itself moved or resized since the grab (a section above expanded, the scrollbar
+        // flipped), the cursor is over a different time than it was. Re-anchor rather than reading the view's
+        // movement as the hand's.
+        if (std::fabs(sCdGrabPx.x - gx0) > 0.5f || std::fabs(sCdGrabPx.y - gy0) > 0.5f) {
+            sCdGrabPx = ImVec2(gx0, gy0);
+            sCdGrabT0 = xToTime(mx);
+            sCdGrabV0 = yToValActive(my);
+            for (size_t k = 0; k < sCdIds.size(); k++) {
+                int idx = ParamKeyIndexById(AL.track, sCdIds[k]);
+                if (idx >= 0) {
+                    sCdT0[k] = AL.track->keys[idx].time;
+                    sCdV0[k] = AL.track->keys[idx].value;
+                    if (sCdIds[k] == sCdAnchorId) {
+                        sCdAnchorT0 = sCdT0[k];
+                        sCdAnchorV0 = sCdV0[k];
+                    }
+                }
+            }
+        }
         float dtime = xToTime(mx) - sCdGrabT0;
         float dval = yToValActive(my) - sCdGrabV0;
         // Precision aids, in this order: the lock removes an axis, then the magnet quantizes what's left.
@@ -6737,10 +6912,57 @@ static void DrawCurveEditor() {
             }
         }
     }
+    // Rubber band: drag on empty graph space to select every key of the ACTIVE channel inside the rectangle
+    // (that is the only channel whose points are drawn as hittable dots, so it is the only one you could be
+    // aiming at). Ctrl adds to the selection instead of replacing it.
+    if (ImGui::IsItemActive() && sCdBox) {
+        ImVec2 a(std::min(sCdBoxA.x, mx), std::min(sCdBoxA.y, my));
+        ImVec2 b(std::max(sCdBoxA.x, mx), std::max(sCdBoxA.y, my));
+        if (b.x - a.x + (b.y - a.y) >= 2.5f) {
+            dl->AddRectFilled(a, b, IM_COL32(255, 220, 80, 30));
+            dl->AddRect(a, b, IM_COL32(255, 220, 80, 160));
+            int inside = 0;
+            for (int i = 0; i < activeN; i++) {
+                float px = timeToX(keyTime(AL, i)), py = valToY(keyValue(AL, i), vmin, vmax);
+                if (px >= a.x && px <= b.x && py >= a.y && py <= b.y) {
+                    inside++;
+                }
+            }
+            CineTooltip("%d key%s", inside, inside == 1 ? "" : "s");
+        }
+    }
     if (ImGui::IsItemDeactivated()) {
+        if (sCdBox) {
+            ImVec2 a(std::min(sCdBoxA.x, mx), std::min(sCdBoxA.y, my));
+            ImVec2 b(std::max(sCdBoxA.x, mx), std::max(sCdBoxA.y, my));
+            bool dragged = (b.x - a.x) + (b.y - a.y) >= 2.5f;
+            if (!dragged) {
+                // Never travelled: this was a click on empty space, which clears (unless Ctrl was held, which
+                // has always meant "leave my selection alone").
+                if (!sCdBoxAdd) {
+                    ParamSelClear();
+                    sSelection.clear();
+                    sSelectedId = -1;
+                }
+            } else {
+                if (!sCdBoxAdd) {
+                    ParamSelClear();
+                }
+                for (int i = 0; i < activeN; i++) {
+                    float px = timeToX(keyTime(AL, i)), py = valToY(keyValue(AL, i), vmin, vmax);
+                    if (px >= a.x && px <= b.x && py >= a.y && py <= b.y && !isSelIdx(i)) {
+                        ParamSelToggle(AL.track, keyIdAt(i));
+                    }
+                }
+            }
+            sCdBox = false;
+        }
         drag = -1;
         sHDrag = false;
+        sHMoved = false;
         sDragRange = false;
+        sCdMoved = false;
+        sCdAnchorId = -1;
         sCdAxis = kAxisFree; // a Q held across two drags must not carry the first one's axis into the second
         sHAxis = kAxisFree;
     }
@@ -6813,7 +7035,11 @@ static void DrawCurveEditor() {
     }
     dl->PopClipRect();
 
-    // Toolbar: add keys at the playhead, delete the selection, zoom reset, and edit the primary key.
+    // Toolbar + primary-key row, inside a child of FIXED height. The block below swaps between the key's
+    // fields and the how-to hint as the selection changes; letting it change the window's total height was
+    // what flipped the scrollbar and rescaled the graph mid-click (see kFootH above).
+    ImGui::BeginChild("##cvfoot", ImVec2(0.0f, kFootH), false,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     {
         if (ImGui::SmallButton("Add key at playhead")) {
             float v;
@@ -6824,21 +7050,8 @@ static void DrawCurveEditor() {
             ParamSelOnly(AL.track, TrackAddKey(*AL.track, sPlayhead, v)); // select the new key
         }
         ImGui::SameLine();
-        {
-            bool snap = SnapEnabled();
-            if (ImGui::SmallButton(snap ? "Snap: on" : "Snap: off")) {
-                CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.SnapGrid"), snap ? 0 : 1);
-                CVarSave();
-            }
-            if (ImGui::IsItemHovered()) {
-                CineTooltip("Magnet: dragged keys land on the grid instead of anywhere between it. The grid is "
-                            "drawn while this is on and refines as you zoom in (now %.2fs x %g).\n\n"
-                            "Separately: hold Q while dragging to lock the drag to one axis - time or value, "
-                            "whichever you were already moving along.",
-                            gridT, gridV);
-            }
-            ImGui::SameLine();
-        }
+        SnapToolbarUI("cv", gridT, gridV);
+        ImGui::SameLine();
         if (sCvT1 > sCvT0) {
             if (ImGui::SmallButton("Fit##cvzoom")) {
                 sCvT0 = 0.0f;
@@ -6926,13 +7139,12 @@ static void DrawCurveEditor() {
         }
     } else {
         ImGui::PushTextWrapPos(0.0f);
-        CineHint("click = select, Ctrl+click = multi, drag = move, Shift+drag = ripple, right-click / "
-                 "double-click = delete / add. Wheel = zoom, middle-drag = pan. Set a key to Bezier to "
-                 "drag its tangent handles.\n"
-                 "Precision: hold Q while dragging to lock it to one axis (time or value, whichever you were "
-                 "already moving along); Snap puts every drag on the grid.");
+        CineHint("drag = move, Shift+drag = ripple, Ctrl+click = multi, drag empty space = box-select.\n"
+                 "double-click / right-click = add / delete.  wheel = zoom, middle-drag = pan.\n"
+                 "Hold Q to lock an axis; Snap lands drags on the grid.");
         ImGui::PopTextWrapPos();
     }
+    ImGui::EndChild();
 }
 
 // Keyboard shortcuts (active while the editor window - full or bar - is focused and not typing into a field).
@@ -7174,8 +7386,10 @@ void CinematicCamPathWindow::DrawElement() {
                            "select it; drag to reposition / retime.");
         ImGui::BulletText("Sticks: left = move, right = look. Buttons (rebindable in Dev Tools > Cinematic Cam):");
         ImGui::Indent();
-        ImGui::TextUnformatted("Boost = A, Precision = L, Ascend = R, Descend = Z, FOV = D-pad up/down, "
-                               "Roll = D-pad left/right. Toggle = Additional Button 1 (map it first).");
+        ImGui::TextUnformatted("Boost = Modifier 2, Precision = L, Ascend = R, Descend = Z, FOV = D-pad "
+                               "up/down, Roll = D-pad left/right, Toggle = Modifier 1.");
+        CineHint("Modifier 1 and 2 are yours to assign: Settings > Controller Configuration > your port > "
+                 "Modifier Buttons. Map M1 to Select/Back and M2 to your right bumper.");
         ImGui::Unindent();
         ImGui::BulletText("Timeline: drag a marker to move; Ctrl+click = multi-select; Ctrl+Shift+click = "
                           "select range; Shift+drag = ripple (push this + later); Alt+drag a selection's end "

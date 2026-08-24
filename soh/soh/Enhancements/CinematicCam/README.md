@@ -180,13 +180,18 @@ live in **Dev Tools → Cinematic Cam → Controls** and are all rebindable.
 | --- | --- |
 | Move / strafe | Left stick (up = forward) |
 | Look (yaw / pitch) | Right stick |
-| Toggle camera | Additional Button 1 *(map Select/Back to it)* |
-| Boost (faster) | A |
+| Toggle camera | Modifier 1 *(map it to Select/Back)* |
+| Boost (faster) | Modifier 2 *(map it to RB)* |
 | Precision (slower) | L |
 | Ascend | R |
 | Descend | Z |
 | FOV in / out | D-pad ↑ / ↓ |
 | Roll left / right | D-pad ← / → |
+
+> **Modifier 1 and Modifier 2 do nothing until you assign them** — they are SoH's two spare buttons, not
+> real N64 ones. Map them once in **Settings → Controller Configuration → your port → Modifier
+> Buttons**: M1 to Select/Back, M2 to your right bumper. They're used here because the toggle has to be
+> safe to press during normal gameplay, and boost has to be holdable while both sticks are busy.
 
 ### Keyboard, with the path editor focused
 

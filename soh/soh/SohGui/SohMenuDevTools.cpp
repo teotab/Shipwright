@@ -248,7 +248,7 @@ void SohMenu::AddMenuDevTools() {
             "- Left stick: move / strafe (up = forward)\n"
             "- Right stick: look\n"
             "- R / Z: ascend / descend\n"
-            "- Hold A: boost (fast) modifier\n"
+            "- Hold Modifier 2 (map it to a bumper): boost (fast) modifier\n"
             "- Hold L: precision (slow) modifier\n"
             "- D-pad Up/Down: FOV\n"
             "- D-pad Left/Right: roll\n\n"
@@ -360,14 +360,18 @@ void SohMenu::AddMenuDevTools() {
         .CVar(CVAR_ENHANCEMENT("CinematicCam.ToggleBtn"))
         .Options(BtnSelectorOptions()
                      .DefaultValue(BTN_CUSTOM_MODIFIER1)
-                     .Tooltip("Toggles the cinematic camera on/off. Default is Additional Button 1 - map your "
-                              "Select/Back button to it in Controller Configuration."));
+                     .Tooltip("Toggles the cinematic camera on/off. Defaults to Modifier 1, because a real "
+                              "button would fire during normal gameplay.\n\n"
+                              "Modifier 1 needs mapping once before it does anything: Settings > Controller "
+                              "Configuration > your port > Modifier Buttons > M1, and set it to your Select / "
+                              "Back button."));
     AddWidget(path, "Boost (faster):", WIDGET_CVAR_BTN_SELECTOR)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.BoostBtn"))
-        .Options(BtnSelectorOptions().DefaultValue(BTN_A).Tooltip(
-            "Hold to fly faster. A is free while flying - the free camera only reads the sticks, L, R, Z and the "
-            "D-pad, and Link ignores input entirely - so it works without any setup. Rebind it to Additional "
-            "Button 2 if you would rather boost with your right bumper."));
+        .Options(BtnSelectorOptions().DefaultValue(BTN_CUSTOM_MODIFIER2).Tooltip(
+            "Hold to fly faster. Defaults to Modifier 2, which is a bumper rather than a face button because you "
+            "hold it while working both sticks.\n\n"
+            "Modifier 2 needs mapping once before it does anything: Settings > Controller Configuration > your "
+            "port > Modifier Buttons > M2, and set it to your right bumper (RB / R1)."));
     AddWidget(path, "Precision (slower):", WIDGET_CVAR_BTN_SELECTOR)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.PrecisionBtn"))
         .Options(BtnSelectorOptions().DefaultValue(BTN_L));
