@@ -1910,14 +1910,11 @@ static CineKeyframe SampleAt(float time) {
     const CineKeyframe& c = sKeyframes[i2];
     const CineKeyframe& d = sKeyframes[i3];
 
-    // Per-keyframe timing ease: reparametrize the segment so the camera slows leaving b (b.easeOut) and/or
-    // slows arriving at c (c.easeIn). A cubic with adjustable start/end slopes; slope 0 = fully eased (hold).
-    if (b.easeOut > 0.0f || c.easeIn > 0.0f) {
-        float m0 = 1.0f - std::min(std::max(b.easeOut, 0.0f), 1.0f);
-        float m1 = 1.0f - std::min(std::max(c.easeIn, 0.0f), 1.0f);
-        lt = Hermite1(0.0f, 1.0f, m0, m1, lt);
-        lt = std::min(std::max(lt, 0.0f), 1.0f);
-    }
+    // (Per-keyframe timing ease used to reparametrize the segment here. It was removed once the speed curve
+    // grew acceleration handles, which shape an ease directly and continuously. It also had a defect the
+    // handles don't: applied as easeOut leaving and easeIn arriving, a keyframe eased on one side only made
+    // the camera's actual speed JUMP as it crossed - the one thing a single speed per keyframe exists to
+    // prevent. Global easing is unaffected; it reshapes playback as a whole, not individual keyframes.)
 
     // Eye (spatial path): WHERE comes from the geometric spline (EyeSegmentTangents: centripetal knots, TCB,
     // overshoot guard, per-side direction/length overrides); WHEN comes from the arc-length speed schedule,
@@ -2477,34 +2474,29 @@ static void InsertAtPlayhead() {
         // (the same speed-schedule mapping SampleAt used to place kf.eye).
         float u = 0.0f;
         if (D > 1e-3f) {
-            float p = (t - b.time) / D;
-            if (b.easeOut > 0.0f || c.easeIn > 0.0f) {
-                float m0e = 1.0f - std::min(std::max(b.easeOut, 0.0f), 1.0f);
-                float m1e = 1.0f - std::min(std::max(c.easeIn, 0.0f), 1.0f);
-                p = std::min(std::max(Hermite1(0.0f, 1.0f, m0e, m1e, p), 0.0f), 1.0f);
-            }
             ArcEnsure();
-            u = ArcParamAtTime(i1, p);
+            u = ArcParamAtTime(i1, (t - b.time) / D);
         }
         // Degenerate split (the curve point essentially ON a keyframe): skip pinning - a nonzero weight baked
         // onto a near-coincident pair would fight the hold the overshoot guard provides.
         splitOk = D > 1e-3f && u > 1e-3f && u < 1.0f - 1e-3f;
         if (splitOk && i1 < sArc.segs) { // capture the pacing before the insert re-derives it
-            float pt = (t - b.time) / D;
-            float pe = pt, dfac = 1.0f;
-            if (b.easeOut > 0.0f || c.easeIn > 0.0f) {
-                float m0e = 1.0f - std::min(std::max(b.easeOut, 0.0f), 1.0f);
-                float m1e = 1.0f - std::min(std::max(c.easeIn, 0.0f), 1.0f);
-                pe = std::min(std::max(Hermite1(0.0f, 1.0f, m0e, m1e, pt), 0.0f), 1.0f);
-                dfac = std::max(Hermite1Deriv(0.0f, 1.0f, m0e, m1e, pt), 0.0f);
-            }
+            float pe = (t - b.time) / D;
             float dur = SegDurAt(i1);
             speedBake = true;
+            accelBake = true;
             spB = sArc.mOut[i1];
             spC = sArc.mIn[i1];
-            spK =
-                std::max(Hermite1Deriv(sArc.S[i1], sArc.S[i1 + 1], sArc.mOut[i1] * dur, sArc.mIn[i1] * dur, pe), 0.0f) *
-                dfac / D;
+            spK = std::max(Hermite5Deriv(sArc.S[i1], sArc.S[i1 + 1], sArc.mOut[i1] * dur, sArc.mIn[i1] * dur,
+                                         sArc.aOut[i1], sArc.aIn[i1], pe),
+                           0.0f) /
+                  D;
+            // The accelerations too, or the split would keep the speeds and lose the curvature between them.
+            acB = sArc.aOut[i1] / (dur * dur);
+            acC = sArc.aIn[i1] / (dur * dur);
+            acK = Hermite5Deriv2(sArc.S[i1], sArc.S[i1 + 1], sArc.mOut[i1] * dur, sArc.mIn[i1] * dur, sArc.aOut[i1],
+                                 sArc.aIn[i1], pe) /
+                  (dur * dur);
         }
         linearSeg = b.interp == CINE_INTERP_LINEAR;
         hasPrev = splitOk && ((i1 > 0) || LoopCyclic());
@@ -2545,8 +2537,7 @@ static void InsertAtPlayhead() {
             }
             // Aim: capture the current curve's rates at b, the split point, and c (skipped for locked/rail
             // segments - they don't interpolate an aim curve - and for linear ones, whose halves lerp
-            // identically anyway). Rates at b/c are stored WITHOUT the ease factor: evaluation reapplies each
-            // sub-segment's own ease, and b's easeOut / c's easeIn survive the split unchanged.
+            // identically anyway).
             // Inherit the aim MODE when both ends agree (and the target with it): a keyframe inserted between
             // two shots of the same actor should keep watching that actor, not freeze into a free framing.
             if (b.aimMode == c.aimMode) {
@@ -2564,23 +2555,44 @@ static void InsertAtPlayhead() {
             float yB2, yC2, pB2, pC2, moY, miY, moP, miP, lB2, lC2;
             if (aimSegOk && AimSegmentCurve(i1, &yB2, &yC2, &pB2, &pC2, &moY, &miY, &moP, &miP, &lB2, &lC2)) {
                 const float kR2D = 180.0f / 3.14159265f;
-                float pt = (t - b.time) / D; // raw time fraction; p above is the EASED param the aim curve uses
-                float pe = pt, dfac = 1.0f;
-                if (b.easeOut > 0.0f || c.easeIn > 0.0f) {
-                    float m0e = 1.0f - std::min(std::max(b.easeOut, 0.0f), 1.0f);
-                    float m1e = 1.0f - std::min(std::max(c.easeIn, 0.0f), 1.0f);
-                    pe = std::min(std::max(Hermite1(0.0f, 1.0f, m0e, m1e, pt), 0.0f), 1.0f);
-                    dfac = std::max(Hermite1Deriv(0.0f, 1.0f, m0e, m1e, pt), 0.0f);
-                }
+                float pe = (t - b.time) / D;
                 aimBake = true;
-                aimB[1] = kR2D * moY / D; // b's leaving side
-                aimB[3] = kR2D * moP / D;
-                aimC[0] = kR2D * miY / D; // c's arriving side
-                aimC[2] = kR2D * miP / D;
-                // The new key: the curve's true time-rate at the split (its sub-segments carry no ease of
-                // their own on this side, so the rate is stored WITH the ease factor).
-                aimK[0] = aimK[1] = kR2D * Hermite1Deriv(yB2, yC2, moY, miY, pe) * dfac / D;
-                aimK[2] = aimK[3] = kR2D * Hermite1Deriv(pB2, pC2, moP, miP, pe) * dfac / D;
+                // Measured off the curve the aim ACTUALLY evaluates - the quintic, with the same end
+                // curvatures - so what gets frozen is what was on screen. (This read the cubic's derivative
+                // for a moment after the aim went quintic, which would have quietly reshaped every insert.)
+                float qoY, qiY, qoP, qiP;
+                AimSegmentAccels(i1, yB2, yC2, pB2, pC2, moY, miY, moP, miP, &qoY, &qiY, &qoP, &qiP);
+                // Rates are per unit of the OWNING segment's progress, and the split hands each side a
+                // segment that is only a fraction of the original - so each rate is scaled by that fraction,
+                // exactly as the path tangents are (v3len * u / * (1-u) above). Same chain rule, same reason.
+                float fIn = std::max(pe, 1e-4f), fOut = std::max(1.0f - pe, 1e-4f);
+                aimB[1] = kR2D * moY * fIn; // b's leaving side: now spans only the first sub-segment
+                aimB[3] = kR2D * moP * fIn;
+                aimC[0] = kR2D * miY * fOut; // c's arriving side: only the second
+                aimC[2] = kR2D * miP * fOut;
+                float krY = Hermite5Deriv(yB2, yC2, moY, miY, qoY, qiY, pe);
+                float krP = Hermite5Deriv(pB2, pC2, moP, miP, qoP, qiP, pe);
+                aimK[0] = kR2D * krY * fIn;
+                aimK[1] = kR2D * krY * fOut;
+                aimK[2] = kR2D * krP * fIn;
+                aimK[3] = kR2D * krP * fOut;
+                // Curvature too, or the split would hold the angles and rates and let the BEND between them
+                // re-derive itself. Progress-relative like the rates, so it scales by the square of the split
+                // fraction (a curvature is a rate of a rate).
+                accB[1] = kR2D * qoY * fIn * fIn;
+                accB[3] = kR2D * qoP * fIn * fIn;
+                accC[0] = kR2D * qiY * fOut * fOut;
+                accC[2] = kR2D * qiP * fOut * fOut;
+                float kcY = Hermite5Deriv2(yB2, yC2, moY, miY, qoY, qiY, pe);
+                float kcP = Hermite5Deriv2(pB2, pC2, moP, miP, qoP, qiP, pe);
+                accK[0] = kR2D * kcY * fIn * fIn;
+                accK[1] = kR2D * kcY * fOut * fOut;
+                accK[2] = kR2D * kcP * fIn * fIn;
+                accK[3] = kR2D * kcP * fOut * fOut;
+                accB[0] = accB[1]; // the outer sides get the neighbour segments' values below, when they exist
+                accB[2] = accB[3];
+                accC[1] = accC[0];
+                accC[3] = accC[2];
                 // b's arriving side and c's leaving side belong to the NEIGHBOUR segments, whose auto slopes
                 // also re-derive against the new key - freeze them at their current values too.
                 aimB[0] = aimB[1]; // fallbacks when there is no usable neighbour segment
@@ -3000,8 +3012,8 @@ static void LoadPath() {
         } else {
             k.aimActorPos[0] = k.aimActorPos[1] = k.aimActorPos[2] = 0.0f;
         }
-        k.easeIn = e.value("easeIn", 0.0f);
-        k.easeOut = e.value("easeOut", 0.0f);
+        // "easeIn"/"easeOut" in older files are deliberately not read - per-keyframe ease is gone, replaced by
+        // the speed curve's acceleration handles.
         sKeyframes.push_back(k);
         sIds.push_back(sNextId++);
     }
@@ -3302,26 +3314,22 @@ static void SmoothPath() {
     }
 }
 
-// Arc length of the spline between keyframe i and i+1 (geometry is independent of timing, so we sample by
-// the segment's current time span). Used by speed normalization.
+// Arc length of the spline between keyframe i and i+1, straight off the schedule's own length table.
+//
+// It used to measure by walking SampleAt over the segment's time span - which samples the path at whatever
+// pace the schedule currently runs, so a fast stretch got fewer effective samples and measured SHORT. The
+// measurement therefore depended on the very timing it was about to rewrite: normalizing changed the times,
+// which changed the next measurement, so one pass never landed and a second click moved things again. The arc
+// table is built in curve-parameter space and is genuinely time-independent, which makes normalize a single
+// exact pass.
 static float SegmentArcLength(int i) {
-    const int kSub = 24;
-    float t0 = sKeyframes[i].time, t1 = sKeyframes[i + 1].time;
-    if (t1 - t0 < 1e-4f) {
-        float d[3] = { sKeyframes[i + 1].eye[0] - sKeyframes[i].eye[0], sKeyframes[i + 1].eye[1] - sKeyframes[i].eye[1],
-                       sKeyframes[i + 1].eye[2] - sKeyframes[i].eye[2] };
-        return std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    ArcEnsure();
+    if (i >= 0 && i + 1 < (int)sArc.S.size()) {
+        return sArc.S[i + 1] - sArc.S[i];
     }
-    float len = 0.0f;
-    CineKeyframe prev = SampleAt(t0);
-    for (int s = 1; s <= kSub; s++) {
-        float t = t0 + (t1 - t0) * (float)s / (float)kSub;
-        CineKeyframe cur = SampleAt(t);
-        float d[3] = { cur.eye[0] - prev.eye[0], cur.eye[1] - prev.eye[1], cur.eye[2] - prev.eye[2] };
-        len += std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-        prev = cur;
-    }
-    return len;
+    float d[3] = { sKeyframes[i + 1].eye[0] - sKeyframes[i].eye[0], sKeyframes[i + 1].eye[1] - sKeyframes[i].eye[1],
+                   sKeyframes[i + 1].eye[2] - sKeyframes[i].eye[2] };
+    return std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
 }
 
 // Re-time keyframes so each segment's duration is ~proportional to its physical path length: the camera then
@@ -3387,8 +3395,12 @@ static void NormalizeSpeed() {
     // Even speed is exactly what an explicit speed handle contradicts - clear them across the range, or the
     // schedule would keep forcing the old per-keyframe rates and the path would still play unevenly.
     for (int i = lo; i <= hi; i++) {
-        sKeyframes[i].speedRateIn = -1.0f;
-        sKeyframes[i].speedRateOut = -1.0f;
+        sKeyframes[i].speedRate = -1.0f;
+        sKeyframes[i].hasAccelIn = 0;
+        sKeyframes[i].hasAccelOut = 0;
+        sKeyframes[i].speedAccelIn = 0.0f;
+        sKeyframes[i].speedAccelOut = 0.0f;
+        sKeyframes[i].speedBroken = 0;
     }
     // A cyclic path's return leg is a real segment carrying real distance: give it the same speed as the rest,
     // otherwise the seam plays at whatever the old return time happened to be (fast or crawling).
@@ -3422,6 +3434,19 @@ static void ScaleSelection(int lo, int hi, float newDur) {
     for (int i = lo + 1; i <= hi; i++) {
         sKeyframes[i].time = base + (sKeyframes[i].time - base) * s;
     }
+    // Absolute speeds follow the stretch (see SetTotalDuration) - but only for keyframes STRICTLY inside the
+    // range. A speed belongs to the keyframe, shared by the segment either side of it, and the range's two
+    // end keyframes each keep one segment that wasn't scaled at all. Rescaling those would be right for the
+    // inner side and wrong for the outer one, so the outer segment would replay at a pace nobody asked for
+    // (and the value would then hit the ceiling and visibly snap). Left alone, they stay true for the side
+    // that didn't move.
+    for (int i = lo + 1; i < hi; i++) {
+        if (sKeyframes[i].speedRate >= 0.0f) {
+            sKeyframes[i].speedRate /= s;
+        }
+        sKeyframes[i].speedAccelIn /= s * s;
+        sKeyframes[i].speedAccelOut /= s * s;
+    }
     SortByTime();
 }
 
@@ -3441,6 +3466,22 @@ static void SetTotalDuration(float newTotal) {
     float s = newTotal / old;
     for (auto& k : sKeyframes) {
         k.time = base + (k.time - base) * s;
+    }
+    // The loop-return leg is part of the path's duration, so it scales with it. Leaving it fixed meant
+    // stretching a looping path changed its pacing everywhere EXCEPT the seam, which then only caught up when
+    // you happened to hit Normalize - the retime appeared to happen in two goes.
+    if (LoopCyclic()) {
+        sLoopReturnTime *= s;
+    }
+    // Hand-set speeds and accelerations are absolute (u/s, u/s^2), so stretching the path in time has to
+    // scale them or they'd contradict the new duration, get clamped, and come out as a jerk. Playing the same
+    // motion over twice the time is exactly half the speed and a quarter of the acceleration.
+    for (auto& k : sKeyframes) {
+        if (k.speedRate >= 0.0f) {
+            k.speedRate /= s;
+        }
+        k.speedAccelIn /= s * s;
+        k.speedAccelOut /= s * s;
     }
 }
 
@@ -7732,37 +7773,9 @@ void CinematicCamPathWindow::DrawElement() {
             }
         }
 
-        // Per-keyframe timing ease: slow the camera arriving at / leaving this keyframe (set both high to
-        // "hold" on it).
-        float eIn = sKeyframes[sel].easeIn, eOut = sKeyframes[sel].easeOut;
-        ImGui::SetNextItemWidth(130.0f);
-        ImGui::SliderFloat("Ease in", &eIn, 0.0f, 1.0f, "%.2f");
-        if (ImGui::IsItemActivated()) {
-            PushUndo();
-        }
-        if (ImGui::IsItemHovered()) {
-            CineTooltip("Decelerate as the camera arrives at this keyframe (slows the segment before it).");
-        }
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(130.0f);
-        ImGui::SliderFloat("Ease out", &eOut, 0.0f, 1.0f, "%.2f");
-        if (ImGui::IsItemActivated()) {
-            PushUndo();
-        }
-        if (ImGui::IsItemHovered()) {
-            CineTooltip("Accelerate gently as the camera leaves this keyframe (slows the segment after it). "
-                        "Set Ease in + Ease out high to pause on this keyframe.");
-        }
-        sKeyframes[sel].easeIn = eIn;
-        sKeyframes[sel].easeOut = eOut;
-        if ((eIn > 0.0f || eOut > 0.0f)) {
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Clear ease")) {
-                PushUndo();
-                sKeyframes[sel].easeIn = 0.0f;
-                sKeyframes[sel].easeOut = 0.0f;
-            }
-        }
+        CineHint("Ease: shape it on the Speed curve - drag this keyframe's point for how fast the camera is "
+                 "here, and its handles for how it gets there. (The old per-keyframe Ease in / Ease out "
+                 "sliders are gone: they made the speed jump across a keyframe eased on one side only.)");
 
         // Aim mode: how this keyframe's camera is oriented.
         const char* aimModes[] = { "Free orientation", "Look at point",  "Look at Link",

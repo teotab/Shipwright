@@ -99,10 +99,10 @@ struct CineKeyframe {
     float aimActorPos[3]; // actor position when it was picked - on reload, re-acquire the NEAREST actor of that
                           // id to this point (disambiguates multiple identical actors, e.g. several frogs)
 
-    // Per-keyframe timing ease (0..1). easeOut slows the camera leaving this keyframe; easeIn slows it
-    // arriving at this keyframe. Use both near 1 to "hold" on a keyframe (slow in, slow out).
-    float easeIn;
-    float easeOut;
+    // (Per-keyframe easeIn/easeOut lived here. Removed once the speed curve gained acceleration handles,
+    // which shape an ease continuously and per side without the defect these had: applied as easeOut leaving
+    // and easeIn arriving, a keyframe eased on one side only made the camera's speed jump as it crossed.
+    // Global easing is a separate, still-supported playback setting.)
 };
 
 // --- Parameter automation tracks -------------------------------------------------------------------------
