@@ -54,21 +54,44 @@ struct CineKeyframe {
     // the framing parks for a beat while the camera keeps moving. Off = the view flows through the keyframe.
     int aimHold;
 
-    // Explicit aim-curve rates at this keyframe (degrees/second of yaw and pitch, per side), baked by
-    // Insert @ playhead so adding a keyframe cannot reshape the aim curve: once baked, the neighbours stop
-    // re-deriving their slopes from the new arrangement. 0 = automatic (derived from the neighbours).
+    // Explicit aim-curve rates at this keyframe, baked by Insert @ playhead so adding a keyframe cannot
+    // reshape the aim curve: once baked, the neighbours stop re-deriving their slopes from the new
+    // arrangement. 0 = automatic (derived from the neighbours).
+    //
+    // Units are DEGREES PER UNIT OF SEGMENT PROGRESS, not degrees per second. A rate in deg/s is a claim about
+    // wall-clock time, so retiming the path left it fighting the new duration and the aim jerked; relative to
+    // progress it describes the shape of the turn, and retiming just plays that shape faster or slower.
     int hasAimTan;
     float aimTanYawIn, aimTanYawOut;
     float aimTanPitchIn, aimTanPitchOut;
 
-    // The camera's speed at this keyframe (world units/second) on the arc-length schedule, per side: In
-    // governs the segment arriving, Out the segment leaving. Negative = automatic (the monotone schedule's own
-    // value). Set by dragging the Speed curve's handles, and baked by Insert @ playhead so adding a keyframe
-    // cannot change the pacing. Always clamped to what exactness allows (the camera must still arrive on
-    // time), and mirrored across the keyframe unless speedBroken.
-    float speedRateIn = -1.0f;
-    float speedRateOut = -1.0f;
-    int speedBroken; // 0 = the two sides move together (alt-drag a handle to break them apart)
+    // The same for the aim curve's CURVATURE - how fast the turn is speeding up or slowing down at this
+    // keyframe, per side, in the same progress-relative units. Automatic is a value shared by both sides (so
+    // the turn has no acceleration step at a keyframe); these are baked by Insert @ playhead for the same
+    // reason the rates are, since a derived curvature would re-derive itself around a new keyframe.
+    int hasAimAcc;
+    float aimAccYawIn, aimAccYawOut;
+    float aimAccPitchIn, aimAccPitchOut;
+
+    // The camera's speed AT this keyframe (world units/second) on the arc-length schedule. Negative =
+    // automatic (the monotone schedule's own value). Set by dragging the point on the Speed curve, and baked
+    // by Insert @ playhead so adding a keyframe cannot change the pacing. Clamped to what exactness allows
+    // (the camera must still arrive on time).
+    //
+    // Single-valued on purpose: a speed that differs either side of a keyframe is an instantaneous jump in
+    // velocity - infinite acceleration - which reads as a hitch no matter how the rest of the curve is shaped.
+    // The keyframe holds ONE speed; the handles below shape how the camera gets to it and away from it.
+    float speedRate = -1.0f;
+
+    // Acceleration either side of the keyframe (units/second^2): the SLOPE of the speed curve arriving (In)
+    // and leaving (Out). These are the speed graph's Bezier handles - they rotate the speed curve through the
+    // keyframe without moving it, which is what shapes an ease. 0 = automatic (whatever a plain smooth
+    // schedule would do there, so an untouched keyframe behaves exactly as before).
+    // Flagged per SIDE, not per keyframe: a bake or a drag that only concerns the segment leaving must not
+    // also pin the side arriving, or it would reshape a segment nobody touched.
+    int hasAccelIn, hasAccelOut;
+    float speedAccelIn, speedAccelOut;
+    int speedBroken; // 0 = the two handles rotate together (alt-drag one to break them apart)
 
     int aimMode;          // CineAim: how the camera is aimed (free / point / Link / actor)
     int aimActorId;       // for CINE_AIM_ACTOR: the actor id to track (saved)

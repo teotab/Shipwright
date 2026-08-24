@@ -712,6 +712,81 @@ static float Hermite1Deriv(float p1, float p2, float m0, float m1, float s) {
            (3.0f * s2 - 2.0f * s) * m1;
 }
 
+// Quintic Hermite: like Hermite1 but the SECOND derivative is prescribed at both ends too (c0, c1), so the
+// curve has value, slope and curvature control at each knot. The arc-length schedule uses it for exactly that
+// reason: the slope is the camera's speed and the second derivative is its acceleration, which is what the
+// speed graph's handles edit. Passing the cubic's own end accelerations (AutoAccel below) reproduces Hermite1
+// to the last bit, so "no handle touched" costs nothing.
+static float Hermite5(float p0, float p1, float m0, float m1, float c0, float c1, float s) {
+    float s2 = s * s, s3 = s2 * s, s4 = s3 * s, s5 = s4 * s;
+    return p0 * (1.0f - 10.0f * s3 + 15.0f * s4 - 6.0f * s5) + m0 * (s - 6.0f * s3 + 8.0f * s4 - 3.0f * s5) +
+           c0 * 0.5f * (s2 - 3.0f * s3 + 3.0f * s4 - s5) + c1 * 0.5f * (s3 - 2.0f * s4 + s5) +
+           m1 * (-4.0f * s3 + 7.0f * s4 - 3.0f * s5) + p1 * (10.0f * s3 - 15.0f * s4 + 6.0f * s5);
+}
+static float Hermite5Deriv(float p0, float p1, float m0, float m1, float c0, float c1, float s) {
+    float s2 = s * s, s3 = s2 * s, s4 = s3 * s;
+    return p0 * (-30.0f * s2 + 60.0f * s3 - 30.0f * s4) + m0 * (1.0f - 18.0f * s2 + 32.0f * s3 - 15.0f * s4) +
+           c0 * 0.5f * (2.0f * s - 9.0f * s2 + 12.0f * s3 - 5.0f * s4) +
+           c1 * 0.5f * (3.0f * s2 - 8.0f * s3 + 5.0f * s4) + m1 * (-12.0f * s2 + 28.0f * s3 - 15.0f * s4) +
+           p1 * (30.0f * s2 - 60.0f * s3 + 30.0f * s4);
+}
+
+static float Hermite5Deriv2(float p0, float p1, float m0, float m1, float c0, float c1, float s) {
+    float s2 = s * s, s3 = s2 * s;
+    return p0 * (-60.0f * s + 180.0f * s2 - 120.0f * s3) + m0 * (-36.0f * s + 96.0f * s2 - 60.0f * s3) +
+           c0 * 0.5f * (2.0f - 18.0f * s + 36.0f * s2 - 20.0f * s3) + c1 * 0.5f * (6.0f * s - 24.0f * s2 + 20.0f * s3) +
+           m1 * (-24.0f * s + 84.0f * s2 - 60.0f * s3) + p1 * (60.0f * s - 180.0f * s2 + 120.0f * s3);
+}
+
+// Does the schedule ever run backwards on this segment? The speed is Hermite5's derivative, a quartic, so a
+// negative lobe can hide entirely between evenly spaced samples - sampling alone would call an unusable curve
+// fine. Sample coarsely to bracket the lowest point, then ternary-search inside that bracket (a quartic is
+// unimodal across two adjacent sample intervals) so the answer is about the actual minimum.
+static bool SpeedStaysForward(float p0, float p1, float m0, float m1, float c0, float c1) {
+    const int kN = 32;
+    float lowV = 1e30f;
+    int lowI = 0;
+    for (int s = 0; s <= kN; s++) {
+        float v = Hermite5Deriv(p0, p1, m0, m1, c0, c1, (float)s / (float)kN);
+        if (v < lowV) {
+            lowV = v;
+            lowI = s;
+        }
+    }
+    if (lowV < 0.0f) {
+        return false;
+    }
+    float lo = (float)std::max(lowI - 1, 0) / (float)kN;
+    float hi = (float)std::min(lowI + 1, kN) / (float)kN;
+    for (int it = 0; it < 24 && hi - lo > 1e-5f; it++) {
+        float a = lo + (hi - lo) / 3.0f, b = hi - (hi - lo) / 3.0f;
+        if (Hermite5Deriv(p0, p1, m0, m1, c0, c1, a) < Hermite5Deriv(p0, p1, m0, m1, c0, c1, b)) {
+            hi = b;
+        } else {
+            lo = a;
+        }
+    }
+    return Hermite5Deriv(p0, p1, m0, m1, c0, c1, 0.5f * (lo + hi)) >= 0.0f;
+}
+
+// True when a value curve stays between its two endpoints instead of bulging past one of them. The envelope
+// guarantee in one line: the view may never point somewhere neither neighbouring keyframe frames. A falling
+// curve is checked by flipping it, since "never turns back" is the same question either way round.
+static bool AngleStaysMonotone(float p0, float p1, float m0, float m1, float c0, float c1) {
+    if (p1 >= p0) {
+        return SpeedStaysForward(p0, p1, m0, m1, c0, c1);
+    }
+    return SpeedStaysForward(-p0, -p1, -m0, -m1, -c0, -c1);
+}
+
+// The end accelerations the plain cubic already has, in the same units as Hermite5's c0/c1. Used as the
+// last-resort fallback for a segment whose asked-for shape would run backwards.
+static void AutoAccel(float p0, float p1, float m0, float m1, float* c0, float* c1) {
+    float d = 6.0f * (p1 - p0);
+    *c0 = d - 4.0f * m0 - 2.0f * m1;
+    *c1 = -d + 2.0f * m0 + 4.0f * m1;
+}
+
 // Non-uniform Kochanek-Bartels tangents for the segment p1->p2 (mOut at p1, mIn at p2), given the three knot
 // intervals t01,t12,t23 (the "parameter distances" between the four control points; chord^alpha for
 // uniform/centripetal/chordal, or keyframe-time differences for velocity-continuous motion). tB/cB/bB are the
@@ -825,16 +900,28 @@ static float NuKbScalar(float p0, float p1, float p2, float p3, float t01, float
     return Hermite1(p1, p2, mOut, mIn, s);
 }
 
+// How much faster than its surroundings a keyframe may be taken - as a multiple of the smaller of the two
+// average rates it sits between. Governs both value schedules: the eye's distance-over-time and the aim's
+// angle-over-time.
+//
+// The classic Fritsch-Carlson number here is 3, and that is correct for a CUBIC. Both schedules are quintics
+// now, and a quintic asked to hold a smooth (continuous-curvature) shape through such a knot cannot: take a
+// symmetric segment whose two ends both run at V times its average, with the curvature levelled off at both
+// ends. Its mid-segment rate works out to 1.875 - 0.875*V times the average, which goes NEGATIVE past
+// V = 2.14 - the camera would have to reverse mid-segment to still arrive on time, or the view swing back on
+// itself. The curve then has no choice but to abandon smoothness exactly where it was pushed hardest, which
+// is what put a visible kink in the handles of keyframes dragged to their limit (and, through the knock-on
+// rescaling, in their neighbours' too). Capping at 2 keeps the whole reachable range inside what a smooth
+// curve can actually do.
+static const float kSpeedSlopeLimit = 2.0f;
+
 // Endpoint slopes for one aim angle (yaw or pitch) over segment b->c, in [0,1]-parameter space. Authority
 // order: automatic from the neighbours -> the keyframes' baked explicit rates (exOut/exIn, from Insert) ->
 // the envelope clamp -> Hold framing.
 //
-// The limiting here is deliberately gentler than the roll/FOV rule above, and that difference IS the fix for
-// the aim stalling at keyframes: `noPrev` / `noNext` mean there is no meaningful neighbour on that side (a
-// clamped path end, a locked tracked aim), so this segment continues at its OWN rate instead of pretending
-// the view was standing still there. The clamp keeps both slopes pointing the way this segment actually
-// turns, no steeper than 3x its own rate: monotone, so the view can never swing past either keyframe's
-// framing. (For exact bakes the clamp is a no-op - a monotone cubic's slopes already satisfy it.)
+// `noPrev` / `noNext` mean there is no meaningful neighbour on that side (a clamped path end, a locked
+// tracked aim), so this segment continues at its OWN rate instead of pretending the view was standing still
+// there - which is what used to make the aim stall at those keyframes.
 static void AimAngleSlopes(float p0, float p1, float p2, float p3, float t01, float t12, float t23,
                            const CineKeyframe& b, const CineKeyframe& c, bool noPrev, bool noNext, float exOut,
                            float exIn, float* mOut, float* mIn) {
@@ -1073,19 +1160,21 @@ struct CineArcCache {
     std::vector<float> cum;   // per segment: kArcSteps+1 cumulative lengths (local, 0 .. segment length)
     std::vector<float> S;     // cumulative arc length at each knot (segs+1 entries)
     std::vector<float> slope; // ds/dt at each knot, monotone-limited (world units/sec)
-    // Per-SEGMENT endpoint speeds (units/sec): the knot slopes above, with each keyframe's explicit rate
-    // substituted where it has one, clamped to 3x this segment's own average (the bound that keeps distance
-    // monotone in time - i.e. that keeps the camera arriving exactly on its keyframes).
+    // Per-SEGMENT endpoint speeds (units/sec), read off the knot slopes above. Both segments meeting at a
+    // keyframe therefore use the SAME speed there: the curve cannot jump at a knot, only bend.
     std::vector<float> mOut, mIn;
+    // Per-SEGMENT endpoint accelerations (units/sec^2): the automatic (cubic) value, or the keyframe's own
+    // handle where it has one, scaled back if that would drive the speed negative mid-segment.
+    std::vector<float> aOut, aIn;
 };
 static CineArcCache sArc;
 
 // Monotone (Fritsch-Carlson) knot slopes for a cumulative-quantity-over-time schedule (arc length for the
-// eye, view angle for the aim). All secants are >= 0, so limiting each knot's slope to 3x the smaller
-// adjacent secant guarantees the quantity never runs backwards; a zero-length segment (a hold) forces slope 0
-// on both of its ends, so motion eases to rest into it and out of it. When cyclic, knot 0 and the last knot
-// are the SAME keyframe: give them the same wrapped slope so the rate glides through the loop seam instead of
-// popping to a new pace each lap.
+// eye, view angle for the aim). All secants are >= 0, so limiting each knot's slope to a small multiple of
+// the smaller adjacent secant guarantees the quantity never runs backwards; a zero-length segment (a hold)
+// forces slope 0 on both of its ends, so motion eases to rest into it and out of it. When cyclic, knot 0 and
+// the last knot are the SAME keyframe: give them the same wrapped slope so the rate glides through the loop
+// seam instead of popping to a new pace each lap.
 static void BuildMonotoneSlopes(const std::vector<float>& S, int segs, std::vector<float>& slope) {
     bool cyc = LoopCyclic() && segs >= 2;
     for (int i = 0; i <= segs; i++) {
@@ -1109,11 +1198,39 @@ static void BuildMonotoneSlopes(const std::vector<float>& S, int segs, std::vect
             m = 0.0f; // bordering a hold: come to rest
         } else {
             m = 0.5f * (sigPrev + sigNext);
-            float lim = 3.0f * std::min(sigPrev, sigNext);
+            float lim = kSpeedSlopeLimit * std::min(sigPrev, sigNext);
             m = std::min(m, lim);
         }
         slope[i] = std::max(m, 0.0f);
     }
+}
+
+// The fastest a keyframe may be taken without breaking exactness OR smoothness - see kSpeedSlopeLimit. Past
+// it the schedule would have to run backwards somewhere in one of the two segments to still arrive on time.
+// Shared by the schedule and by the graph, which draws it as the ceiling line - so when a drag stops, the
+// reason is on screen instead of hidden in a clamp.
+static float KnotSpeedCap(const std::vector<float>& S, int segs, int i) {
+    bool cyc = LoopCyclic() && segs >= 2;
+    float sigPrev = -1.0f, sigNext = -1.0f;
+    if (i > 0) {
+        sigPrev = (S[i] - S[i - 1]) / SegDurAt(i - 1);
+    } else if (cyc) {
+        sigPrev = (S[segs] - S[segs - 1]) / SegDurAt(segs - 1);
+    }
+    if (i < segs) {
+        sigNext = (S[i + 1] - S[i]) / SegDurAt(i);
+    } else if (cyc) {
+        sigNext = (S[1] - S[0]) / SegDurAt(0);
+    }
+    float sig;
+    if (sigPrev < 0.0f) {
+        sig = sigNext;
+    } else if (sigNext < 0.0f) {
+        sig = sigPrev;
+    } else {
+        sig = std::min(sigPrev, sigNext);
+    }
+    return std::max(sig, 0.0f) * kSpeedSlopeLimit;
 }
 
 static void ArcRebuild() {
@@ -1157,21 +1274,171 @@ static void ArcRebuild() {
         sArc.S[i + 1] = sArc.S[i] + len;
     }
     BuildMonotoneSlopes(sArc.S, sArc.segs, sArc.slope);
-    // Per-segment endpoint speeds: start from the automatic knot slopes, substitute each keyframe's explicit
-    // rate for the side it governs, then clamp to 3x THIS segment's own average speed. The clamp is what keeps
-    // the camera arriving exactly on the next keyframe; automatic values already satisfy it, so only dragged
-    // handles are ever limited (and the handle draws at the limited value, so the graph shows the bound).
+    // Substitute each keyframe's own speed into its KNOT, not into the two segments separately: the value is
+    // shared by the segment arriving and the segment leaving, so the speed curve is continuous at every
+    // keyframe by construction. Capped at what still arrives on time (automatic values already satisfy it, so
+    // only a dragged point is ever limited - and it draws at the limited value, so the bound is visible).
+    for (int i = 0; i <= sArc.segs && n > 0; i++) {
+        float ex = sKeyframes[i % n].speedRate;
+        if (ex >= 0.0f) {
+            sArc.slope[i] = std::min(std::max(ex, 0.0f), KnotSpeedCap(sArc.S, sArc.segs, i));
+        }
+    }
     sArc.mOut.assign((size_t)std::max(sArc.segs, 0), 0.0f);
     sArc.mIn.assign((size_t)std::max(sArc.segs, 0), 0.0f);
+    sArc.aOut.assign((size_t)std::max(sArc.segs, 0), 0.0f);
+    sArc.aIn.assign((size_t)std::max(sArc.segs, 0), 0.0f);
     for (int i = 0; i < sArc.segs; i++) {
-        float sig = (sArc.S[i + 1] - sArc.S[i]) / SegDurAt(i);
-        float cap = 3.0f * sig;
-        float exOut = (n > 0) ? sKeyframes[i % n].speedRateOut : -1.0f;
-        float exIn = (n > 0) ? sKeyframes[(i + 1) % n].speedRateIn : -1.0f;
-        float mo = (exOut >= 0.0f) ? exOut : sArc.slope[i];
-        float mi = (exIn >= 0.0f) ? exIn : sArc.slope[i + 1];
-        sArc.mOut[i] = std::min(std::max(mo, 0.0f), cap);
-        sArc.mIn[i] = std::min(std::max(mi, 0.0f), cap);
+        sArc.mOut[i] = sArc.slope[i];
+        sArc.mIn[i] = sArc.slope[i + 1];
+    }
+    // Automatic acceleration is picked PER KNOT and shared by both of its segments, which makes the schedule
+    // C2 in time: acceleration is continuous through every keyframe, not just speed.
+    //
+    // A plain cubic is only C1 - each segment arrives at a keyframe with one acceleration and the next leaves
+    // with another. That step is a jerk impulse at every single keyframe, the exact thing this whole system is
+    // supposed to not do, and it is also why an untouched keyframe used to draw its two handles at different
+    // angles: they were honestly reporting a broken curve. Averaging the two one-sided cubic accelerations
+    // (weighted the standard non-uniform way, by the OPPOSITE interval) removes the step. Keyframe times,
+    // positions and speeds are untouched, so the camera still arrives exactly on time.
+    bool cyc = LoopCyclic() && sArc.segs >= 2;
+    std::vector<float> knotA((size_t)std::max(sArc.segs, 0) + 1, 0.0f);
+    auto cubicEnds = [&](int seg, float* aStart, float* aEnd) {
+        float d = SegDurAt(seg);
+        float c0, c1;
+        AutoAccel(sArc.S[seg], sArc.S[seg + 1], sArc.mOut[seg] * d, sArc.mIn[seg] * d, &c0, &c1);
+        float dd = d * d;  // SegDurAt floors d at 1e-4, so this cannot be zero and needs no floor of its own
+        *aStart = c0 / dd; // physical u/s^2, so the two sides are comparable across different durations
+        *aEnd = c1 / dd;
+    };
+    for (int i = 0; i <= sArc.segs; i++) {
+        int segPrev = (i > 0) ? i - 1 : (cyc ? sArc.segs - 1 : -1);
+        int segNext = (i < sArc.segs) ? i : (cyc ? 0 : -1);
+        float s0, s1;
+        if (segPrev >= 0 && segNext >= 0) {
+            float aPrev, aNext, dummy;
+            cubicEnds(segPrev, &dummy, &aPrev);
+            cubicEnds(segNext, &aNext, &dummy);
+            float hPrev = SegDurAt(segPrev), hNext = SegDurAt(segNext);
+            float w = hPrev + hNext;
+            knotA[i] = (w > 1e-5f) ? (aPrev * hNext + aNext * hPrev) / w : 0.5f * (aPrev + aNext);
+        } else if (segPrev >= 0) {
+            cubicEnds(segPrev, &s0, &s1);
+            knotA[i] = s1; // path end: only one side exists, so there is nothing to reconcile
+        } else if (segNext >= 0) {
+            cubicEnds(segNext, &s0, &s1);
+            knotA[i] = s0;
+        }
+    }
+    // A curve can be asked for that would run backwards mid-segment - the camera reversing to make the
+    // arithmetic work - either by the automatic values above or by a hand-rotated handle. It has to be pulled
+    // back to something feasible, and HOW that is done decides whether the continuity above survives.
+    //
+    // Scaling each knot's single acceleration is the move: both of its segments read the same number, so a
+    // knot stays continuous no matter how far it gets scaled back. (The obvious alternative - blending each
+    // segment separately toward its own cubic - quietly reintroduces the step, because the cubic's
+    // acceleration differs on the two sides of a knot. That is a jerk at a keyframe nobody touched, which is
+    // the exact bug this rebuild exists to remove.) Halve the offending knots, re-check, repeat.
+    std::vector<float> beta((size_t)std::max(sArc.segs, 0) + 1, 1.0f);
+    auto endAccel = [&](int knot, bool leaving) {
+        const CineKeyframe& k = sKeyframes[knot % n];
+        if (leaving ? (k.hasAccelOut != 0) : (k.hasAccelIn != 0)) {
+            return leaving ? k.speedAccelOut : k.speedAccelIn;
+        }
+        return beta[knot] * knotA[knot];
+    };
+    auto segOk = [&](int i) {
+        float dur = SegDurAt(i);
+        return SpeedStaysForward(sArc.S[i], sArc.S[i + 1], sArc.mOut[i] * dur, sArc.mIn[i] * dur,
+                                 endAccel(i, true) * dur * dur, endAccel(i + 1, false) * dur * dur);
+    };
+    // Scale down ONLY the knots that are actually the problem, and by a continuous amount.
+    //
+    // Halving both ends of any unhappy segment - the obvious first idea - is wrong twice over. It spreads:
+    // pulling a knot down changes its OTHER segment, which can then fail and pull ITS far knot down, so one
+    // keyframe dragged to its limit visibly reshapes keyframes several places away. And it is discontinuous:
+    // 1, 0.5, 0.25 are jumps, so sliding a speed slowly makes the curve snap through a sequence of shapes
+    // instead of following the cursor. Bisecting each knot's own scale fixes both - the value moves smoothly
+    // with the drag, and a knot only moves if one of ITS segments is unhappy.
+    bool anyBad = false;
+    for (int i = 0; i < sArc.segs && !anyBad; i++) {
+        anyBad = !segOk(i);
+    }
+    for (int pass = 0; pass < 3 && anyBad; pass++) {
+        for (int i = 0; i <= sArc.segs; i++) {
+            bool autoK = (i < sArc.segs) ? (sKeyframes[i % n].hasAccelOut == 0) : true;
+            if (i > 0) {
+                autoK = autoK && sKeyframes[i % n].hasAccelIn == 0;
+            }
+            if (!autoK) {
+                continue; // hand-set: not ours to scale
+            }
+            auto knotOk = [&]() {
+                bool ok = (i >= sArc.segs) || segOk(i);
+                if (ok && i > 0) {
+                    ok = segOk(i - 1);
+                }
+                if (ok && i == 0 && cyc) {
+                    ok = segOk(sArc.segs - 1);
+                }
+                return ok;
+            };
+            float keep = beta[i];
+            if (knotOk()) {
+                continue;
+            }
+            float lo = 0.0f, hi = keep; // 0 = level acceleration here, which the speed cap keeps reachable
+            for (int it = 0; it < 12; it++) {
+                float mid = 0.5f * (lo + hi);
+                beta[i] = mid;
+                if (cyc && (i == 0 || i == sArc.segs)) {
+                    beta[0] = beta[sArc.segs] = mid; // same keyframe on both ends of a loop
+                }
+                if (knotOk()) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            beta[i] = lo;
+            if (cyc && (i == 0 || i == sArc.segs)) {
+                beta[0] = beta[sArc.segs] = lo;
+            }
+        }
+        anyBad = false;
+        for (int i = 0; i < sArc.segs && !anyBad; i++) {
+            anyBad = !segOk(i);
+        }
+    }
+    for (int i = 0; i < sArc.segs; i++) {
+        float dur = SegDurAt(i);
+        float a0 = endAccel(i, true) * dur * dur; // physical u/s^2 -> Hermite5's per-progress units
+        float a1 = endAccel(i + 1, false) * dur * dur;
+        if (!segOk(i)) {
+            // Still impossible with both knots scaled, so a hand-set handle is the cause. Fall back on this
+            // segment alone to the plain cubic, which the monotone slope limit already proved safe. This is
+            // the one place acceleration can step at a keyframe - the user asked for a shape the camera
+            // cannot take, and the handle draws where it actually ended up rather than where it was dropped.
+            float c0, c1;
+            AutoAccel(sArc.S[i], sArc.S[i + 1], sArc.mOut[i] * dur, sArc.mIn[i] * dur, &c0, &c1);
+            auto feasible = [&](float f) {
+                return SpeedStaysForward(sArc.S[i], sArc.S[i + 1], sArc.mOut[i] * dur, sArc.mIn[i] * dur,
+                                         c0 + (a0 - c0) * f, c1 + (a1 - c1) * f);
+            };
+            float lo = 0.0f, hi = 1.0f; // f = 0 (the cubic) is always feasible; f = 1 is known infeasible here
+            for (int it = 0; it < 14; it++) {
+                float mid = 0.5f * (lo + hi);
+                if (feasible(mid)) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            a0 = c0 + (a0 - c0) * lo;
+            a1 = c1 + (a1 - c1) * lo;
+        }
+        sArc.aOut[i] = a0;
+        sArc.aIn[i] = a1;
     }
 }
 
@@ -1191,7 +1458,9 @@ static float ArcParamAtTime(int i1, float p) {
         return p; // no schedule (degenerate path): fall back to raw progress
     }
     float dur = SegDurAt(i1);
-    float d = Hermite1(sArc.S[i1], sArc.S[i1 + 1], sArc.mOut[i1] * dur, sArc.mIn[i1] * dur, p) - sArc.S[i1];
+    float d =
+        Hermite5(sArc.S[i1], sArc.S[i1 + 1], sArc.mOut[i1] * dur, sArc.mIn[i1] * dur, sArc.aOut[i1], sArc.aIn[i1], p) -
+        sArc.S[i1];
     const float* cum = &sArc.cum[(size_t)i1 * (kArcSteps + 1)];
     float len = cum[kArcSteps];
     if (len < 1e-5f) {
@@ -1530,10 +1799,11 @@ static uint32_t PathShapeHash() {
         h = HashF32(h, k.tangentIn[2]);
         h = HashF32(h, k.tanWOut);
         h = HashF32(h, k.tanWIn);
-        h = HashF32(h, k.easeIn);
-        h = HashF32(h, k.easeOut);
-        h = HashF32(h, k.speedRateIn); // these drive the arc schedule, which this hash keys
-        h = HashF32(h, k.speedRateOut);
+        h = HashF32(h, (float)k.hasAimAcc);
+        h = HashF32(h, k.speedRate); // these drive the arc schedule, which this hash keys
+        h = HashF32(h, (float)(k.hasAccelIn * 2 + k.hasAccelOut));
+        h = HashF32(h, k.speedAccelIn);
+        h = HashF32(h, k.speedAccelOut);
     }
     return h;
 }
@@ -2331,13 +2601,15 @@ static void SavePathTo(const char* base, bool bindEntrance) {
                         { "tanWIn", k.tanWIn },
                         { "aimMode", k.aimMode },
                         { "aimHold", k.aimHold },
-                        { "hasAimTan", k.hasAimTan },
-                        { "aimTan", { k.aimTanYawIn, k.aimTanYawOut, k.aimTanPitchIn, k.aimTanPitchOut } },
-                        { "speedRate", { k.speedRateIn, k.speedRateOut, (float)k.speedBroken } },
+                        { "hasAimTanP", k.hasAimTan },
+                        { "aimTanP", { k.aimTanYawIn, k.aimTanYawOut, k.aimTanPitchIn, k.aimTanPitchOut } },
+                        { "hasAimAcc", k.hasAimAcc },
+                        { "aimAcc", { k.aimAccYawIn, k.aimAccYawOut, k.aimAccPitchIn, k.aimAccPitchOut } },
+                        { "speed",
+                          { k.speedRate, k.speedAccelIn, k.speedAccelOut, (float)k.hasAccelIn, (float)k.hasAccelOut,
+                            (float)k.speedBroken } },
                         { "aimActorId", k.aimActorId },
-                        { "aimActorPos", { k.aimActorPos[0], k.aimActorPos[1], k.aimActorPos[2] } },
-                        { "easeIn", k.easeIn },
-                        { "easeOut", k.easeOut } });
+                        { "aimActorPos", { k.aimActorPos[0], k.aimActorPos[1], k.aimActorPos[2] } } });
     }
     // Object wrapper carries path-level state (the shared aim target) alongside the keyframes.
     nlohmann::json j;
@@ -2473,17 +2745,35 @@ static void LoadPath() {
         k.aimMode = e.value("aimMode", 0);
         // "Flat" on either side of the short-lived Aim in/out controls becomes the hold flag.
         k.aimHold = e.value("aimHold", (e.value("aimTanIn", 0) == 1 || e.value("aimTanOut", 0) == 1) ? 1 : 0);
-        k.hasAimTan = e.value("hasAimTan", 0);
-        if (e.contains("aimTan") && e["aimTan"].size() >= 4) {
-            k.aimTanYawIn = e["aimTan"][0];
-            k.aimTanYawOut = e["aimTan"][1];
-            k.aimTanPitchIn = e["aimTan"][2];
-            k.aimTanPitchOut = e["aimTan"][3];
+        // Only the progress-relative form is read. Files written while these were deg/s carry the old
+        // "aimTan" key, which is deliberately ignored: the numbers mean something different now, and falling
+        // back to automatic rates gives those paths a correct curve rather than a plausible wrong one.
+        k.hasAimTan = e.value("hasAimTanP", 0);
+        if (e.contains("aimTanP") && e["aimTanP"].size() >= 4) {
+            k.aimTanYawIn = e["aimTanP"][0];
+            k.aimTanYawOut = e["aimTanP"][1];
+            k.aimTanPitchIn = e["aimTanP"][2];
+            k.aimTanPitchOut = e["aimTanP"][3];
         }
-        if (e.contains("speedRate") && e["speedRate"].is_array() && e["speedRate"].size() >= 3) {
-            k.speedRateIn = e["speedRate"][0];
-            k.speedRateOut = e["speedRate"][1];
-            k.speedBroken = (int)(float)e["speedRate"][2];
+        k.hasAimAcc = e.value("hasAimAcc", 0);
+        if (e.contains("aimAcc") && e["aimAcc"].size() >= 4) {
+            k.aimAccYawIn = e["aimAcc"][0];
+            k.aimAccYawOut = e["aimAcc"][1];
+            k.aimAccPitchIn = e["aimAcc"][2];
+            k.aimAccPitchOut = e["aimAcc"][3];
+        }
+        if (e.contains("speed") && e["speed"].is_array() && e["speed"].size() >= 6) {
+            k.speedRate = e["speed"][0];
+            k.speedAccelIn = e["speed"][1];
+            k.speedAccelOut = e["speed"][2];
+            k.hasAccelIn = (int)(float)e["speed"][3];
+            k.hasAccelOut = (int)(float)e["speed"][4];
+            k.speedBroken = (int)(float)e["speed"][5];
+        } else if (e.contains("speedRate") && e["speedRate"].is_array() && e["speedRate"].size() >= 3) {
+            // Paths saved while speed was per-side: take whichever side was set. The two can no longer differ,
+            // so a file that had them apart collapses onto the leaving speed.
+            float in = e["speedRate"][0], out = e["speedRate"][1];
+            k.speedRate = (out >= 0.0f) ? out : in;
         }
         k.aimActorId = e.value("aimActorId", 0);
         k.aimActorPtr = nullptr;
@@ -4877,18 +5167,12 @@ static void ScheduleSpeedsAt(float time, float* outEye) {
     }
     const CineKeyframe& b = sKeyframes[i1];
     const CineKeyframe& c = sKeyframes[(i1 + 1) % n];
-    float elt = p, dfac = 1.0f; // keyframe ease reparametrization + its slope (chain rule)
-    if (b.easeOut > 0.0f || c.easeIn > 0.0f) {
-        float m0 = 1.0f - std::min(std::max(b.easeOut, 0.0f), 1.0f);
-        float m1 = 1.0f - std::min(std::max(c.easeIn, 0.0f), 1.0f);
-        elt = std::min(std::max(Hermite1(0.0f, 1.0f, m0, m1, p), 0.0f), 1.0f);
-        dfac = std::max(Hermite1Deriv(0.0f, 1.0f, m0, m1, p), 0.0f);
-    }
     float dur = SegDurAt(i1);
     if (i1 < sArc.segs) {
-        *outEye =
-            std::max(Hermite1Deriv(sArc.S[i1], sArc.S[i1 + 1], sArc.mOut[i1] * dur, sArc.mIn[i1] * dur, elt), 0.0f) /
-            D * dfac;
+        *outEye = std::max(Hermite5Deriv(sArc.S[i1], sArc.S[i1 + 1], sArc.mOut[i1] * dur, sArc.mIn[i1] * dur,
+                                         sArc.aOut[i1], sArc.aIn[i1], p),
+                           0.0f) /
+                  D;
     }
 }
 
