@@ -2807,6 +2807,16 @@ static void TrackFromJson(CineParamTrack& t, const nlohmann::json& j) {
     }
 }
 
+// The saved-path format version, stamped into every file from now on.
+//
+// Up to this point the format changed freely and old files quietly lost whatever had been renamed - which was
+// fine while the only paths in existence were throwaway test ones. It stops being fine the moment somebody
+// else saves a shot they spent an evening on. From here: bump this when the meaning of a field changes, and
+// either read the old form correctly or say plainly what was dropped. Version 0 (no field) means a file from
+// before this line existed - those carry per-keyframe ease and deg/s aim rates, both of which mean something
+// different now, so they load with those values left automatic rather than misinterpreted.
+static const int kPathFormatVersion = 1;
+
 // Write the whole path to cinematics/<base>.json. `bindEntrance` updates the path-bound location from the
 // current scene (manual saves only - the autosave must not silently rebind or unbind it).
 static void SavePathTo(const char* base, bool bindEntrance) {
@@ -2848,6 +2858,7 @@ static void SavePathTo(const char* base, bool bindEntrance) {
         sPathEntrance = sBindLocation ? CinematicCam_GetCurrentEntrance() : -1;
     }
     j["entrance"] = sPathEntrance;
+    j["formatVersion"] = kPathFormatVersion;
     // Playback settings that define how the path MOVES, not just where: without these, loading a path in a fresh
     // session could play back visibly differently than authored (the spline parameterization even changes the
     // curve shape). Old files without this block simply keep the session's current settings.
@@ -3021,7 +3032,22 @@ static void LoadPath() {
     SelectOnly(sIds.empty() ? -1 : sIds[0]);
     sDirty = false;
     sDirtyForAutosave = false;
-    snprintf(sFileStatus, sizeof(sFileStatus), "Loaded %s.json (%d keyframes)", sFilename, (int)sKeyframes.size());
+    // Say what happened, including what was dropped - a file that loads "fine" while silently discarding
+    // shaping the author set is worse than one that admits it.
+    int fileVer = j.value("formatVersion", 0);
+    if (fileVer > kPathFormatVersion) {
+        snprintf(sFileStatus, sizeof(sFileStatus),
+                 "Loaded %s.json (%d keyframes) - saved by a NEWER build; "
+                 "anything it added was ignored",
+                 sFilename, (int)sKeyframes.size());
+    } else if (fileVer < kPathFormatVersion) {
+        snprintf(sFileStatus, sizeof(sFileStatus),
+                 "Loaded %s.json (%d keyframes) - older format: per-keyframe ease and baked aim rates are "
+                 "automatic now",
+                 sFilename, (int)sKeyframes.size());
+    } else {
+        snprintf(sFileStatus, sizeof(sFileStatus), "Loaded %s.json (%d keyframes)", sFilename, (int)sKeyframes.size());
+    }
 
     // If this path is bound to a location, warp there - unless we're already in that scene (avoids a needless
     // fade reload when re-loading a path in its home area).
