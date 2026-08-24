@@ -7174,12 +7174,17 @@ void CinematicCamPathWindow::DrawElement() {
                            "select it; drag to reposition / retime.");
         ImGui::BulletText("Sticks: left = move, right = look. Buttons (rebindable in Dev Tools > Cinematic Cam):");
         ImGui::Indent();
-        ImGui::TextUnformatted("Boost = RB, Precision = L, Ascend = R, Descend = Z, FOV = D-pad up/down, "
-                               "Roll = D-pad left/right.");
+        ImGui::TextUnformatted("Boost = A, Precision = L, Ascend = R, Descend = Z, FOV = D-pad up/down, "
+                               "Roll = D-pad left/right. Toggle = Additional Button 1 (map it first).");
         ImGui::Unindent();
         ImGui::BulletText("Timeline: drag a marker to move; Ctrl+click = multi-select; Ctrl+Shift+click = "
                           "select range; Shift+drag = ripple (push this + later); Alt+drag a selection's end "
                           "= compress/expand it. -/+/Fit zoom the ruler.");
+        ImGui::BulletText("Curve editor: drag a point to retime + revalue it; double-click empty space to add "
+                          "one, right-click to delete. Ctrl+click = multi-select, Shift+drag = ripple. Wheel "
+                          "zooms time, middle-drag pans.");
+        ImGui::BulletText("Precision (both graphs): hold Q while dragging to lock the drag to one axis, and "
+                          "Snap to land every drag on the grid (the grid refines as you zoom in).");
         ImGui::BulletText("Keyboard (this window focused): Space = play/stop, , / . = step a tick, "
                           "[ / ] = prev/next keyframe, K = add keyframe, Del = delete (curve-editor keys first), "
                           "Ctrl+A = select all, Ctrl+Z / Ctrl+Y = undo/redo.");
@@ -8005,9 +8010,9 @@ void CinematicCamPathWindow::DrawElement() {
             }
         }
 
-        CineHint("Ease: shape it on the Speed curve - drag this keyframe's point for how fast the camera is "
-                 "here, and its handles for how it gets there. (The old per-keyframe Ease in / Ease out "
-                 "sliders are gone: they made the speed jump across a keyframe eased on one side only.)");
+        CineHint("Ease: shape it on the Speed curve - tick 'Speed graph' at the top of the Curve editor, then "
+                 "drag this keyframe's point for how fast the camera is here, and its handles for how it gets "
+                 "there.");
 
         // Aim mode: how this keyframe's camera is oriented.
         const char* aimModes[] = { "Free orientation", "Look at point",  "Look at Link",

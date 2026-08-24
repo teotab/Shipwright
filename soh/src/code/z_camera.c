@@ -8145,7 +8145,12 @@ static void CinematicCam_Update(Camera* camera) {
 
     // Rebindable button actions (defaults below; configurable in the menu's Cinematic Cam > Controls).
     s32 btnPrecision = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.PrecisionBtn"), BTN_L);
-    s32 btnBoost = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.BoostBtn"), BTN_CUSTOM_MODIFIER2);
+    // Boost defaults to A, not an Additional Button: A/B/C are all free while flying (the freecam reads
+    // only the sticks, L, R, Z and the D-pad, and Link ignores input entirely), and A exists on a fresh
+    // install on both pad and keyboard. An Additional Button has to be created before it does anything,
+    // which is no default at all. The toggle stays on Additional Button 1 - it has to be safe to press
+    // during normal gameplay, and no real button is.
+    s32 btnBoost = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.BoostBtn"), BTN_A);
     s32 btnUp = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.UpBtn"), BTN_R);
     s32 btnDown = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.DownBtn"), BTN_Z);
     s32 btnFovIn = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.FovInBtn"), BTN_DUP);

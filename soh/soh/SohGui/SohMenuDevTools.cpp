@@ -244,7 +244,7 @@ void SohMenu::AddMenuDevTools() {
         .CVar(CVAR_ENHANCEMENT("CinematicCam.Enabled"))
         .Options(CheckboxOptions().DefaultValue(false).Tooltip(
             "A fully detached, controller-driven free camera for cinematic capture.\n\n"
-            "Controls (player 1):\n"
+            "Controls (player 1, all rebindable below):\n"
             "- Left stick: move / strafe (up = forward)\n"
             "- Right stick: look\n"
             "- R / Z: ascend / descend\n"
@@ -252,7 +252,9 @@ void SohMenu::AddMenuDevTools() {
             "- Hold L: precision (slow) modifier\n"
             "- D-pad Up/Down: FOV\n"
             "- D-pad Left/Right: roll\n\n"
-            "While active the controller drives only the camera — Link ignores all input."));
+            "While active the controller drives only the camera — Link ignores all input. (The one exception "
+            "is 'Control Link during playback' in the path editor, which hands the stick back to Link "
+            "while a path plays.)"));
     AddWidget(path, "Move Speed: %.0f", WIDGET_CVAR_SLIDER_FLOAT)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.MoveSpeed"))
         .Options(FloatSliderOptions().Min(1.0f).Max(200.0f).DefaultValue(30.0f).Format("%.0f").Tooltip(
@@ -308,7 +310,8 @@ void SohMenu::AddMenuDevTools() {
     AddWidget(path, "Bar size: %.2f", WIDGET_CVAR_SLIDER_FLOAT)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.LetterboxAmount"))
         .Options(FloatSliderOptions().Min(0.02f).Max(0.30f).DefaultValue(0.12f).Format("%.2f").Tooltip(
-            "Height of each letterbox bar as a fraction of the screen (0.12 ~= 2.39:1 from 16:9)."))
+            "Height of each letterbox bar as a fraction of the screen. From 16:9, 0.12 gives about 2.35:1 and "
+            "0.13 about 2.40:1 (CinemaScope); 0.06 gives about 2.00:1."))
         .PreFunc(
             [](WidgetInfo& info) { info.isHidden = !CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.Letterbox"), 0); });
     static const std::map<int32_t, const char*> cineGridModes = {
@@ -361,10 +364,10 @@ void SohMenu::AddMenuDevTools() {
                               "Select/Back button to it in Controller Configuration."));
     AddWidget(path, "Boost (faster):", WIDGET_CVAR_BTN_SELECTOR)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.BoostBtn"))
-        .Options(BtnSelectorOptions()
-                     .DefaultValue(BTN_CUSTOM_MODIFIER2)
-                     .Tooltip("Hold to fly faster. Default is Additional Button 2 - map your right bumper (RB) to "
-                              "it in Controller Configuration."));
+        .Options(BtnSelectorOptions().DefaultValue(BTN_A).Tooltip(
+            "Hold to fly faster. A is free while flying - the free camera only reads the sticks, L, R, Z and the "
+            "D-pad, and Link ignores input entirely - so it works without any setup. Rebind it to Additional "
+            "Button 2 if you would rather boost with your right bumper."));
     AddWidget(path, "Precision (slower):", WIDGET_CVAR_BTN_SELECTOR)
         .CVar(CVAR_ENHANCEMENT("CinematicCam.PrecisionBtn"))
         .Options(BtnSelectorOptions().DefaultValue(BTN_L));
