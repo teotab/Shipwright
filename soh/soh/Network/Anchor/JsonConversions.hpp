@@ -1,9 +1,8 @@
-#ifndef NETWORK_ANCHOR_JSON_CONVERSIONS_H
-#define NETWORK_ANCHOR_JSON_CONVERSIONS_H
+#pragma once
+
 #ifdef __cplusplus
 
 #include <nlohmann/json.hpp>
-#include <libultraship/libultraship.h>
 #include "Anchor.h"
 
 extern "C" {
@@ -192,6 +191,9 @@ inline void from_json(const json& j, SaveContext& saveContext) {
     j.at("swordHealth").get_to(saveContext.swordHealth);
     std::vector<u32> sceneFlagsArray;
     j.at("sceneFlags").get_to(sceneFlagsArray);
+    if (sceneFlagsArray.size() < 124 * 4) {
+        sceneFlagsArray.resize(124 * 4, 0);
+    }
     for (int i = 0; i < 124; i++) {
         saveContext.sceneFlags[i].chest = sceneFlagsArray[i * 4];
         saveContext.sceneFlags[i].swch = sceneFlagsArray[i * 4 + 1];
@@ -207,4 +209,3 @@ inline void from_json(const json& j, SaveContext& saveContext) {
 }
 
 #endif // __cplusplus
-#endif // NETWORK_ANCHOR_JSON_CONVERSIONS_H

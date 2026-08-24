@@ -86,8 +86,7 @@ void RegisterShouldPlayBlueWarp() {
      * should also account for the difference between your first and following visits to the blue warp.
      */
     REGISTER_VB_SHOULD(VB_PLAY_TRANSITION_CS, {
-        // Do nothing when in a boss rush
-        if (IS_BOSS_RUSH) {
+        if (IS_BOSS_RUSH || gSaveContext.gameMode == GAMEMODE_END_CREDITS) {
             return;
         }
 
@@ -158,6 +157,11 @@ void RegisterShouldPlayBlueWarp() {
             }
 
             if (isBlueWarpCutscene) {
+                // Skip bypasses Chamber of Sages, which would have cleared heat timer
+                if (gSaveContext.timerState <= TIMER_STATE_ENV_HAZARD_TICK) {
+                    gSaveContext.timerState = TIMER_STATE_OFF;
+                }
+
                 if (gSaveContext.entranceIndex != ENTR_LAKE_HYLIA_WATER_TEMPLE_BLUE_WARP) {
                     // Normally set in the blue warp cutscene
                     gSaveContext.dayTime = gSaveContext.skyboxTime = 0x8000;

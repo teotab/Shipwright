@@ -1,5 +1,4 @@
 #include "Anchor.h"
-#include <libultraship/libultraship.h>
 #include "soh/Enhancements/cosmetics/cosmeticsTypes.h"
 #include "soh/Enhancements/game-interactor/GameInteractor.h"
 #include "soh/frame_interpolation.h"
@@ -116,8 +115,26 @@ void Anchor::RegisterHooks() {
         }
     });
 
-    COND_HOOK(OnFlagSet, isConnected,
-              [&](s16 flagType, s16 flag) { SendPacket_SetFlag(SCENE_ID_MAX, flagType, flag); });
+    COND_HOOK(OnFlagSet, isConnected, [&](s16 flagType, s16 flag) {
+        SendPacket_SetFlag(SCENE_ID_MAX, flagType, flag);
+
+        // If we're not in rando, we have to sync some of the great fairy rewards manually
+        if (!IS_RANDO) {
+            if (flagType == FLAG_RANDOMIZER_INF) {
+                switch (flag) {
+                    case RAND_INF_DMT_GREAT_FAIRY_REWARD:
+                        SendPacket_GiveItem(1, RG_MAGIC_SINGLE);
+                        break;
+                    case RAND_INF_DMC_GREAT_FAIRY_REWARD:
+                        SendPacket_GiveItem(1, RG_MAGIC_DOUBLE);
+                        break;
+                    case RAND_INF_OGC_GREAT_FAIRY_REWARD:
+                        SendPacket_GiveItem(1, RG_DOUBLE_DEFENSE);
+                        break;
+                }
+            }
+        }
+    });
 
     COND_HOOK(OnFlagUnset, isConnected,
               [&](s16 flagType, s16 flag) { SendPacket_UnsetFlag(SCENE_ID_MAX, flagType, flag); });
@@ -452,8 +469,8 @@ void Anchor::RegisterHooks() {
         s16 rightMinimapMargin = CVarGetInteger(CVAR_COSMETIC("HUD.Margin.R"), 0);
         s16 bottomMinimapMargin = CVarGetInteger(CVAR_COSMETIC("HUD.Margin.B"), 0);
 
-        s16 xMarginsMinimap;
-        s16 yMarginsMinimap;
+        s16 xMarginsMinimap = 0;
+        s16 yMarginsMinimap = 0;
         if (CVarGetInteger(CVAR_COSMETIC("HUD.Minimap.UseMargins"), 0) != 0) {
             if (CVarGetInteger(CVAR_COSMETIC("HUD.Minimap.PosType"), 0) == ORIGINAL_LOCATION) {
                 xMarginsMinimap = rightMinimapMargin;

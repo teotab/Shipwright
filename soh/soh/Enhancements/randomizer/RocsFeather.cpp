@@ -9,7 +9,6 @@ extern "C" {
 #include "functions.h"
 #include "variables.h"
 #include "macros.h"
-#include "objects/gameplay_keep/gameplay_keep.h"
 extern PlayState* gPlayState;
 }
 
@@ -20,7 +19,9 @@ static uint8_t groundTimer = 0;
 static f32 effectsScale = 1.0f;
 
 void RegisterRocsFeather() {
-    bool shouldRegister = IS_RANDO && RAND_GET_OPTION(RSK_ROCS_FEATHER);
+    // Always register hooks - they only activate when ITEM_ROCS_FEATHER is actually used
+    // Rando-specific logic (item pool, accessibility, etc.) is handled elsewhere
+    bool shouldRegister = true;
 
     COND_HOOK(OnPlayerUpdate, shouldRegister, []() {
         Player* player = GET_PLAYER(gPlayState);
@@ -71,8 +72,9 @@ void RegisterRocsFeather() {
                 Vec3f effectsPos = player->actor.home.pos;
                 effectsPos.y += 3;
 
-                EffectSsGRipple_Spawn(gPlayState, &effectsPos, 200 * effectsScale, 300 * effectsScale, 1);
-                EffectSsGSplash_Spawn(gPlayState, &effectsPos, NULL, NULL, 0, 150 * effectsScale);
+                EffectSsGRipple_Spawn(gPlayState, &effectsPos, static_cast<s16>(200 * effectsScale),
+                                      static_cast<s16>(300 * effectsScale), 1);
+                EffectSsGSplash_Spawn(gPlayState, &effectsPos, NULL, NULL, 0, static_cast<s16>(150 * effectsScale));
 
                 // Remove hopping state when using Roc's after sidehop/backflip to allow grabbing ledges again
                 player->stateFlags2 &= ~(PLAYER_STATE2_HOPPING);
@@ -99,4 +101,4 @@ void RegisterRocsFeather() {
     });
 }
 
-static RegisterShipInitFunc registerRocsFeather(RegisterRocsFeather, { "IS_RANDO" });
+static RegisterShipInitFunc registerRocsFeather(RegisterRocsFeather);

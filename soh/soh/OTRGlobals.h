@@ -1,3 +1,4 @@
+// vim: ft=cpp
 #pragma once
 
 #define BTN_CUSTOM_MODIFIER1 0x0040
@@ -47,7 +48,7 @@ class OTRGlobals {
   public:
     static OTRGlobals* Instance;
 
-    std::shared_ptr<Ship::Context> context;
+    Ship::Context* context;
     std::shared_ptr<SaveStateMgr> gSaveStateMgr;
     std::shared_ptr<Randomizer> gRandomizer;
     std::shared_ptr<Rando::Context> gRandoContext;
@@ -135,8 +136,6 @@ void SaveManager_ThreadPoolWait();
 GetItemID RetrieveGetItemIDFromItemID(ItemID itemID);
 RandomizerGet RetrieveRandomizerGetFromItemID(ItemID itemID);
 void Messagebox_ShowErrorBox(char* title, char* body);
-
-uint32_t Ship_GetInterpolationFrameCount();
 #endif
 
 #ifdef __cplusplus

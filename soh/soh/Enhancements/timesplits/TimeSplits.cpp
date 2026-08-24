@@ -1,5 +1,6 @@
 #include <vector>
 #include <fstream>
+#include <spdlog/common.h>
 
 #include <ship/Context.h>
 #include "TimeSplits.h"
@@ -252,7 +253,7 @@ std::string formatTimestampTimeSplit(uint32_t value) {
     uint32_t mm = (sec - hh * 3600) / 60;
     uint32_t ss = sec - hh * 3600 - mm * 60;
     uint32_t ds = value % 10;
-    return fmt::format("{}:{:0>2}:{:0>2}.{}", hh, mm, ss, ds);
+    return spdlog::fmt_lib::format("{}:{:0>2}:{:0>2}.{}", hh, mm, ss, ds);
 }
 
 nlohmann::json ImVec4_to_json(const ImVec4& vec) {
@@ -347,7 +348,7 @@ void HandleDragAndDrop(std::vector<SplitObject>& objectList, int targetIndex, co
 }
 
 void TimeSplitCompleteSplits() {
-    gSaveContext.ship.stats.itemTimestamp[TIMESTAMP_DEFEAT_GANON] = GAMEPLAYSTAT_TOTAL_TIME;
+    gSaveContext.ship.stats.itemTimestamp[TIMESTAMP_DEFEAT_GANON] = static_cast<u32>(GAMEPLAYSTAT_TOTAL_TIME);
     gSaveContext.ship.stats.gameComplete = true;
 }
 
@@ -430,16 +431,14 @@ void TimeSplitsFileManagement(uint32_t action, const char* listEntry, std::vecto
 
 void TimeSplitsPopUpContext() {
     if ((popupID != -1) && ImGui::BeginPopup("TimeSplitsPopUp")) {
+        auto gui = std::dynamic_pointer_cast<Fast::Fast3dGui>(Ship::Context::GetRawInstance()->GetWindow()->GetGui());
         if (popupID == ITEM_SKULL_TOKEN) {
             ImGui::BeginTable("Token Table", 2);
             ImGui::TableNextColumn();
             SplitsPushImageButtonStyle();
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2.0f, 2.0f));
-            ImGui::ImageButton(
-                "QUEST_SKULL_TOKEN",
-                std::dynamic_pointer_cast<Fast::Fast3dGui>(Ship::Context::GetInstance()->GetWindow()->GetGui())
-                    ->GetTextureByName("QUEST_SKULL_TOKEN"),
-                ImVec2(32.0f, 32.0f), ImVec2(0, 0), ImVec2(1, 1), ImVec4(0, 0, 0, 0));
+            ImGui::ImageButton("QUEST_SKULL_TOKEN", gui->GetTextureByName("QUEST_SKULL_TOKEN"), ImVec2(32.0f, 32.0f),
+                               ImVec2(0, 0), ImVec2(1, 1), ImVec4(0, 0, 0, 0));
             ImGui::PopStyleVar();
             ImGui::TableNextColumn();
             SplitsPopImageButtonStyle();
@@ -489,11 +488,9 @@ void TimeSplitsPopUpContext() {
                 ImGui::BeginGroup();
                 ImGui::PushID(popupObject.splitID);
                 ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2.0f, 2.0f));
-                auto ret = ImGui::ImageButton(
-                    popupObject.splitImage.c_str(),
-                    std::dynamic_pointer_cast<Fast::Fast3dGui>(Ship::Context::GetInstance()->GetWindow()->GetGui())
-                        ->GetTextureByName(popupObject.splitImage),
-                    ImVec2(32.0f, 32.0f), ImVec2(0, 0), ImVec2(1, 1), ImVec4(0, 0, 0, 0), popupObject.splitTint);
+                auto ret = ImGui::ImageButton(popupObject.splitImage.c_str(),
+                                              gui->GetTextureByName(popupObject.splitImage), ImVec2(32.0f, 32.0f),
+                                              ImVec2(0, 0), ImVec2(1, 1), ImVec4(0, 0, 0, 0), popupObject.splitTint);
                 ImGui::PopStyleVar();
                 if (ret) {
                     splitList.push_back(popupObject);
@@ -509,9 +506,7 @@ void TimeSplitsPopUpContext() {
 
                 if (popupObject.splitType == SPLIT_TYPE_UPGRADE) {
                     if (popupID <= ITEM_SLINGSHOT && popupID != -1) {
-                        ImVec2 imageMin = ImGui::GetItemRectMin();
                         ImVec2 imageMax = ImGui::GetItemRectMax();
-                        // ImVec2 imageSize = ImVec2(imageMax.x - imageMin.x, imageMax.y - imageMin.y); UNUSED
                         ImVec2 textPos = ImVec2(imageMax.x - ImGui::CalcTextSize("00").x - 5,
                                                 imageMax.y - ImGui::CalcTextSize("00").y - 5);
 
@@ -562,7 +557,7 @@ void TimeSplitsItemSplitEvent(uint32_t type, u8 item) {
         }
         if (item == ITEM_SKULL_TOKEN) {
             auto it = std::find_if(splitList.begin(), splitList.end(), [item](const SplitObject& split) {
-                if (split.splitSkullTokenCount == gSaveContext.inventory.gsTokens) {
+                if (split.splitSkullTokenCount == static_cast<uint32_t>(gSaveContext.inventory.gsTokens)) {
                     return split.splitID == item;
                 } else {
                     return split.splitID == ITEM_NONE;
@@ -585,13 +580,13 @@ void TimeSplitsItemSplitEvent(uint32_t type, u8 item) {
         if (split.splitType == type) {
             if (item == split.splitID) {
                 if (split.splitTimeStatus == SPLIT_STATUS_ACTIVE) {
-                    split.splitTimeCurrent = GAMEPLAYSTAT_TOTAL_TIME;
+                    split.splitTimeCurrent = static_cast<u32>(GAMEPLAYSTAT_TOTAL_TIME);
                     split.splitTimeStatus = SPLIT_STATUS_COLLECTED;
                     if (split.splitTimeBest > GAMEPLAYSTAT_TOTAL_TIME || split.splitTimeBest == 0) {
-                        split.splitTimeBest = GAMEPLAYSTAT_TOTAL_TIME;
+                        split.splitTimeBest = static_cast<u32>(GAMEPLAYSTAT_TOTAL_TIME);
                     }
                     if (split.splitTimePreviousBest == 0) {
-                        split.splitTimePreviousBest = GAMEPLAYSTAT_TOTAL_TIME;
+                        split.splitTimePreviousBest = static_cast<u32>(GAMEPLAYSTAT_TOTAL_TIME);
                     }
                     if (index == splitList.size() - 1) {
                         TimeSplitCompleteSplits();
@@ -610,15 +605,15 @@ void TimeSplitsSplitBestTimeDisplay(SplitObject split) {
     if (split.splitTimeStatus == SPLIT_STATUS_ACTIVE) {
         if (GAMEPLAYSTAT_TOTAL_TIME > split.splitTimePreviousBest) {
             splitTimeColor = COLOR_RED;
-            splitBestTimeDisplay = (GAMEPLAYSTAT_TOTAL_TIME - split.splitTimePreviousBest);
+            splitBestTimeDisplay = (static_cast<u32>(GAMEPLAYSTAT_TOTAL_TIME) - split.splitTimePreviousBest);
         }
         if (GAMEPLAYSTAT_TOTAL_TIME == split.splitTimePreviousBest) {
             splitTimeColor = COLOR_WHITE;
-            splitBestTimeDisplay = GAMEPLAYSTAT_TOTAL_TIME;
+            splitBestTimeDisplay = static_cast<u32>(GAMEPLAYSTAT_TOTAL_TIME);
         }
         if (GAMEPLAYSTAT_TOTAL_TIME < split.splitTimePreviousBest) {
             splitTimeColor = COLOR_GREEN;
-            splitBestTimeDisplay = (split.splitTimePreviousBest - GAMEPLAYSTAT_TOTAL_TIME);
+            splitBestTimeDisplay = (split.splitTimePreviousBest - static_cast<u32>(GAMEPLAYSTAT_TOTAL_TIME));
         }
         activeSplitHighlight = COLOR_LIGHT_BLUE;
     }
@@ -647,6 +642,7 @@ void TimeSplitsDrawSplitsList() {
     ImGui::BeginChild("SplitTable", ImVec2(0.0f, ImGui::GetWindowHeight() - 128.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(4, 0));
     if (ImGui::BeginTable("Splits", 5, ImGuiTableFlags_Hideable | ImGuiTableFlags_Reorderable)) {
+        auto gui = std::dynamic_pointer_cast<Fast::Fast3dGui>(Ship::Context::GetRawInstance()->GetWindow()->GetGui());
         ImGui::TableSetupColumn("Item Image", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoHeaderLabel,
                                 34.0f);
         ImGui::TableSetupColumn("Item Name");
@@ -666,11 +662,8 @@ void TimeSplitsDrawSplitsList() {
             }
             TimeSplitsGetImageSize(split.splitID);
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(imagePadding, imagePadding));
-            auto ret = ImGui::ImageButton(
-                split.splitImage.c_str(),
-                std::dynamic_pointer_cast<Fast::Fast3dGui>(Ship::Context::GetInstance()->GetWindow()->GetGui())
-                    ->GetTextureByName(split.splitImage),
-                imageSize, ImVec2(0, 0), ImVec2(1, 1), ImVec4(0, 0, 0, 0), split.splitTint);
+            auto ret = ImGui::ImageButton(split.splitImage.c_str(), gui->GetTextureByName(split.splitImage), imageSize,
+                                          ImVec2(0, 0), ImVec2(1, 1), ImVec4(0, 0, 0, 0), split.splitTint);
             ImGui::PopStyleVar();
             if (ret) {
                 TimeSplitsSkipSplit(dragIndex);
@@ -683,7 +676,7 @@ void TimeSplitsDrawSplitsList() {
             ImGui::TableNextColumn();
             // Current Time
             ImGui::Text("%s", (split.splitTimeStatus == SPLIT_STATUS_ACTIVE)
-                                  ? formatTimestampTimeSplit(GAMEPLAYSTAT_TOTAL_TIME).c_str()
+                                  ? formatTimestampTimeSplit(static_cast<u32>(GAMEPLAYSTAT_TOTAL_TIME)).c_str()
                               : (split.splitTimeStatus == SPLIT_STATUS_COLLECTED)
                                   ? formatTimestampTimeSplit(split.splitTimeCurrent).c_str()
                                   : "--:--:-");
@@ -746,16 +739,15 @@ void TimeSplitsDrawItemList(uint32_t type) {
 
     for (auto& split : splitObjectList) {
         if (split.splitType == type) {
+            auto gui =
+                std::dynamic_pointer_cast<Fast::Fast3dGui>(Ship::Context::GetRawInstance()->GetWindow()->GetGui());
             ImGui::TableNextColumn();
             ImGui::PushID(split.splitID);
             TimeSplitsGetImageSize(split.splitID);
             SplitsPushImageButtonStyle();
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(imagePadding, imagePadding));
-            auto ret = ImGui::ImageButton(
-                split.splitImage.c_str(),
-                std::dynamic_pointer_cast<Fast::Fast3dGui>(Ship::Context::GetInstance()->GetWindow()->GetGui())
-                    ->GetTextureByName(split.splitImage),
-                imageSize, ImVec2(0, 0), ImVec2(1, 1), ImVec4(0, 0, 0, 0), split.splitTint);
+            auto ret = ImGui::ImageButton(split.splitImage.c_str(), gui->GetTextureByName(split.splitImage), imageSize,
+                                          ImVec2(0, 0), ImVec2(1, 1), ImVec4(0, 0, 0, 0), split.splitTint);
             ImGui::PopStyleVar();
             if (ret) {
                 if (popupList.contains(split.splitID) && (split.splitType < SPLIT_TYPE_BOSS)) {
@@ -884,6 +876,8 @@ void TimeSplitsDrawManageList() {
         ImGui::TableNextColumn();
         ImGui::BeginTabBar("List Preview");
         if (ImGui::BeginTabItem("Preview")) {
+            auto gui =
+                std::dynamic_pointer_cast<Fast::Fast3dGui>(Ship::Context::GetRawInstance()->GetWindow()->GetGui());
             ImGui::BeginChild("PreviewChild");
             for (auto& data : splitList) {
                 float availableWidth = ImGui::GetContentRegionAvail().x;
@@ -895,11 +889,9 @@ void TimeSplitsDrawManageList() {
                 }
                 TimeSplitsGetImageSize(data.splitID);
                 ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(imagePadding, imagePadding));
-                auto ret = ImGui::ImageButton(
-                    data.splitImage.c_str(),
-                    std::dynamic_pointer_cast<Fast::Fast3dGui>(Ship::Context::GetInstance()->GetWindow()->GetGui())
-                        ->GetTextureByName(data.splitImage),
-                    imageSize, ImVec2(0, 0), ImVec2(1, 1), ImVec4(0, 0, 0, 0), data.splitTint);
+                auto ret =
+                    ImGui::ImageButton(data.splitImage.c_str(), gui->GetTextureByName(data.splitImage), imageSize,
+                                       ImVec2(0, 0), ImVec2(1, 1), ImVec4(0, 0, 0, 0), data.splitTint);
                 ImGui::PopStyleVar();
                 if (ret) {
                     removeIndex = index;
@@ -981,12 +973,11 @@ void TimeSplitWindow::DrawElement() {
 }
 
 void TimeSplitWindow::InitElement() {
+    auto gui = std::dynamic_pointer_cast<Fast::Fast3dGui>(Ship::Context::GetRawInstance()->GetWindow()->GetGui());
     TimeSplitsUpdateWindowSize();
 
-    std::dynamic_pointer_cast<Fast::Fast3dGui>(Ship::Context::GetInstance()->GetWindow()->GetGui())
-        ->LoadGuiTexture("SPECIAL_TRIFORCE_PIECE_WHITE", gWTriforcePieceTex, ImVec4(1, 1, 1, 1));
-    std::dynamic_pointer_cast<Fast::Fast3dGui>(Ship::Context::GetInstance()->GetWindow()->GetGui())
-        ->LoadGuiTexture("SPECIAL_SPLIT_ENTRANCE", gSplitEntranceTex, ImVec4(1, 1, 1, 1));
+    gui->LoadGuiTexture("SPECIAL_TRIFORCE_PIECE_WHITE", gWTriforcePieceTex, "", ImVec4(1, 1, 1, 1));
+    gui->LoadGuiTexture("SPECIAL_SPLIT_ENTRANCE", gSplitEntranceTex, "", ImVec4(1, 1, 1, 1));
     Color_RGBA8 defaultColour = { 0, 0, 0, 255 };
     windowColor = VecFromRGBA8(CVarGetColor(CVAR_ENHANCEMENT("TimeSplits.WindowColor.Value"), defaultColour));
 
@@ -1004,7 +995,6 @@ void TimeSplitWindow::InitElement() {
     });
 
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnItemReceive>([](GetItemEntry itemEntry) {
-        GetItemEntry testItem = itemEntry;
         if (itemEntry.itemId == ITEM_SKULL_TOKEN || itemEntry.itemId == ITEM_BOTTLE || itemEntry.itemId == ITEM_POE ||
             itemEntry.itemId == ITEM_BIG_POE) {
             uint32_t tempType = SPLIT_TYPE_ITEM;
@@ -1014,21 +1004,21 @@ void TimeSplitWindow::InitElement() {
                     break;
                 }
             }
-            TimeSplitsItemSplitEvent(tempType, itemEntry.itemId);
+            TimeSplitsItemSplitEvent(tempType, static_cast<u8>(itemEntry.itemId));
         }
     });
 
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnPlayerBottleUpdate>(
-        [](int16_t contents) { TimeSplitsItemSplitEvent(SPLIT_TYPE_UPGRADE, contents); });
+        [](int16_t contents) { TimeSplitsItemSplitEvent(SPLIT_TYPE_UPGRADE, static_cast<u8>(contents)); });
 
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnBossDefeat>([](void* refActor) {
         Actor* bossActor = (Actor*)refActor;
-        TimeSplitsItemSplitEvent(SPLIT_TYPE_BOSS, bossActor->id);
+        TimeSplitsItemSplitEvent(SPLIT_TYPE_BOSS, static_cast<u8>(bossActor->id));
     });
 
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnSceneInit>([](int16_t sceneNum) {
         if (gPlayState->sceneNum != SCENE_KAKARIKO_VILLAGE) {
-            TimeSplitsItemSplitEvent(SPLIT_TYPE_ENTRANCE, sceneNum);
+            TimeSplitsItemSplitEvent(SPLIT_TYPE_ENTRANCE, static_cast<u8>(sceneNum));
         }
     });
 
@@ -1036,7 +1026,7 @@ void TimeSplitWindow::InitElement() {
         if (gPlayState->sceneNum == SCENE_KAKARIKO_VILLAGE) {
             Player* player = GET_PLAYER(gPlayState);
             if (player->fallDistance > 500 && gSaveContext.health <= 0) {
-                TimeSplitsItemSplitEvent(SPLIT_TYPE_MISC, gPlayState->sceneNum);
+                TimeSplitsItemSplitEvent(SPLIT_TYPE_MISC, static_cast<u8>(gPlayState->sceneNum));
             }
         }
     });

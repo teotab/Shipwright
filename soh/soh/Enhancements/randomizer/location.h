@@ -1,12 +1,10 @@
 #pragma once
 
 #include <utility>
-#include <vector>
 
 #include "3drando/spoiler_log.hpp"
 #include "3drando/hints.hpp"
 
-#include "randomizerTypes.h"
 #include "z64actor_enum.h"
 #include "z64scene.h"
 #include "../../util.h"
@@ -309,7 +307,6 @@ class Location {
     ActorID actorId;
     SceneID scene;
     int32_t actorParams;
-    bool checked = false;
     std::string shortName;
     std::string spoilerName;
     RandomizerHintTextKey hintKey;
@@ -317,7 +314,6 @@ class Location {
     bool isVanillaCompletion;
     SpoilerCollectionCheck collectionCheck;
     int16_t vanillaPrice;
-    bool isHintable = false;
     Option excludedOption;
 };
 } // namespace Rando
