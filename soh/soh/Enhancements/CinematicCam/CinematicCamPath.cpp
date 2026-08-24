@@ -5813,7 +5813,6 @@ static void DrawCurveEditor() {
     static int drag = -1;
     static float sDragLo = 0.0f, sDragHi = 1.0f; // active channel's value range, frozen for the duration of a drag
     static bool sDragRange = false;
-    static float sCvT0 = 0.0f, sCvT1 = -1.0f; // visible time window (sCvT1 <= sCvT0 = the whole timeline)
     int active = -1;
     for (int i = 0; i < (int)curves.size(); i++) {
         if (curves[i].track == sActTrack) {
@@ -6118,6 +6117,16 @@ static void DrawCurveEditor() {
             sHDrag = true;
             sHKeyId = hKey;
             sHWhich = hWhich;
+            {
+                int bi = ParamKeyIndexById(AL.track, hKey);
+                if (bi >= 0) {
+                    const CineParamKey& gk = AL.track->keys[bi];
+                    float hT = (hWhich == 0) ? gk.hOutT : gk.hInT;
+                    float hV = (hWhich == 0) ? gk.hOutV : gk.hInV;
+                    sHGrabDT = (gk.time + hT) - xToTime(mx); // offset from cursor to the handle's own position
+                    sHGrabDV = (gk.value + hV) - yToValActive(my);
+                }
+            }
             if (io.KeyAlt) { // Alt breaks the pair apart; without it the two handles stay mirrored
                 int bi = ParamKeyIndexById(AL.track, hKey);
                 if (bi >= 0) {
@@ -6152,8 +6161,8 @@ static void DrawCurveEditor() {
                 sDragHi = vmax;
                 sDragRange = true;
                 sCdRipple = io.KeyShift;
-                sCdGrabT0 = keyTime(AL, hit);
-                sCdGrabV0 = keyValue(AL, hit);
+                sCdGrabT0 = xToTime(mx); // the CURSOR at grab, not the key: the first frame's delta is zero
+                sCdGrabV0 = yToValActive(my);
                 sCdIds.clear();
                 sCdT0.clear();
                 sCdV0.clear();
@@ -6214,23 +6223,26 @@ static void DrawCurveEditor() {
             if (!k.brokenHandles) {
                 float dt = (sHWhich == 0) ? k.hOutT : -k.hInT;
                 float dv = (sHWhich == 0) ? k.hOutV : -k.hInV;
-                float len = std::sqrt(dt * dt + dv * dv);
-                if (len > 1e-6f) {
+                float dxp = dt * pxT, dyp = dv * pxV;
+                float lenPx = std::sqrt(dxp * dxp + dyp * dyp);
+                if (lenPx > 1e-4f) {
                     float oT = (sHWhich == 0) ? -k.hInT : k.hOutT;
                     float oV = (sHWhich == 0) ? -k.hInV : k.hOutV;
-                    float oLen = std::sqrt(oT * oT + oV * oV);
-                    if (oLen < 1e-6f) {
-                        oLen = len;
+                    float oxp = oT * pxT, oyp = oV * pxV;
+                    float oLenPx = std::sqrt(oxp * oxp + oyp * oyp);
+                    if (oLenPx < 1e-4f) {
+                        oLenPx = lenPx;
                     }
-                    float ux = dt / len * oLen, uy = dv / len * oLen;
+                    float mt = (dxp / lenPx * oLenPx) / pxT; // opposite arm: this direction, its own length
+                    float mv = (dyp / lenPx * oLenPx) / pxV;
                     if (sHWhich == 0) { // mirror onto the in side
-                        float segPrev = (idx > 0) ? (k.time - AL.track->keys[idx - 1].time) : ux;
-                        k.hInT = -std::min(ux, std::max(segPrev, 0.0f));
-                        k.hInV = -uy;
+                        clampArm(mt, mv, segPrev);
+                        k.hInT = -mt;
+                        k.hInV = -mv;
                     } else { // mirror onto the out side
-                        float segNext = (idx < activeN - 1) ? (AL.track->keys[idx + 1].time - k.time) : ux;
-                        k.hOutT = std::min(ux, std::max(segNext, 0.0f));
-                        k.hOutV = uy;
+                        clampArm(mt, mv, segNext);
+                        k.hOutT = mt;
+                        k.hOutV = mv;
                     }
                 }
             }
