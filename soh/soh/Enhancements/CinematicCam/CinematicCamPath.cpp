@@ -939,15 +939,8 @@ static void AimAngleSlopes(float p0, float p1, float p2, float p3, float t01, fl
     if (c.hasAimTan) {
         *mIn = exIn;
     }
-    float secant = p2 - p1; // this segment's straight-line slope, in [0,1] parameter space
-    float lim = 3.0f * std::fabs(secant);
-    if (secant >= 0.0f) {
-        *mOut = std::min(std::max(*mOut, 0.0f), lim);
-        *mIn = std::min(std::max(*mIn, 0.0f), lim);
-    } else {
-        *mOut = std::min(std::max(*mOut, -lim), 0.0f);
-        *mIn = std::min(std::max(*mIn, -lim), 0.0f);
-    }
+    // No clamp here. The envelope is enforced once, on the finished curve, by AimEnvelopeScale below - see
+    // the note there for why four slope rules became one measurement.
     if (b.aimHold) { // "hold framing" on either end parks the view's turn there
         *mOut = 0.0f;
     }
@@ -1498,13 +1491,53 @@ static void EyePosAt(int i1, int i2, float u, float* out) {
     }
 }
 
+// THE envelope rule, and the only one: the view may never point somewhere neither of the two keyframes it is
+// travelling between is looking. Returns how much of a segment's natural turn survives that - 1 when the
+// curve was never going to leave anyway, less when it was, and only as much less as it takes.
+//
+// This replaced four separate rules that used to sit on the slopes: clamp the sign, limit the magnitude, use
+// the SMALLER of the two neighbouring rates, and special-case zero. Those come from monotone-interpolation
+// numerics, where they are a SUFFICIENT condition - conservative on purpose, and they fire whether or not
+// there is anything to prevent. Measured on a real path they cost far more than they bought: at one keyframe
+// they cut the view's turn rate by 45% to prevent 0.06 degrees of overshoot, and cut the pitch by 66% to
+// prevent none at all - the curve there was already inside the envelope. That is what the hesitate-then-whip
+// bump was made of.
+//
+// Testing the actual curve costs a few evaluations and gives back every special case for free: at a
+// turnaround, any nonzero slope leaves the box, so it scales to zero on its own; against a keyframe with no
+// turn at all, the box has no width, so the same thing happens. Nothing to write down, nothing to tune.
+// s = 0 is a plain smoothstep between the two framings, which is always inside, so the search always lands.
+// Per channel, deliberately: yaw and pitch are independent curves, and one scale covering both lets a tight
+// pitch hold a wide pan back for no reason (measured: it cost the yaw 13% at a keyframe whose own curve was
+// nowhere near the envelope).
+static float AimEnvelopeScale(float v0, float v1, float mO, float mI) {
+    auto inside = [&](float s) {
+        float c0, c1;
+        AutoAccel(v0, v1, mO * s, mI * s, &c0, &c1);
+        return AngleStaysMonotone(v0, v1, mO * s, mI * s, c0, c1);
+    };
+    if (inside(1.0f)) {
+        return 1.0f;
+    }
+    float lo = 0.0f, hi = 1.0f;
+    for (int i = 0; i < 12; i++) {
+        float mid = 0.5f * (lo + hi);
+        if (inside(mid)) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
 // The aim's value curves for segment i1: endpoint yaw/pitch (radians, yaw unwrapped the short way round),
-// look-at distances, and the four Hermite slopes with explicit bakes, the envelope clamp and holds applied.
+// look-at distances, and the four Hermite slopes with explicit bakes, the envelope scale and holds applied.
 // Returns false when the segment has no direction to interpolate (degenerate look-at on an endpoint).
 // Shared by evaluation (AimPointAt) and by Insert @ playhead's bake, so what gets baked is exactly what
-// renders.
+// renders. `raw` skips the envelope scale, which is how the neighbour lookups avoid recursing forever.
 static bool AimSegmentCurve(int i1, float* oyB, float* oyC, float* opB, float* opC, float* moY, float* miY, float* moP,
-                            float* miP, float* olenB, float* olenC) {
+                            float* miP, float* olenB, float* olenC, bool raw = false) {
     int n = (int)sKeyframes.size();
     int i2 = (i1 + 1) % n;
     int i0, i3;
@@ -1574,11 +1607,69 @@ static bool AimSegmentCurve(int i1, float* oyB, float* oyC, float* opB, float* o
     bool nextLocked = (i2 != i3) && AimLockedBetween(c, d);
     bool noPrev = (i0 == i1) || prevLocked;
     bool noNext = (i2 == i3) || nextLocked;
-    const float kD2R = kPi / 180.0f; // stored explicit rates are deg/s; slopes are per [0,1] segment param
-    AimAngleSlopes(yA, yB, yC, yD, at01, at12, at23, b, c, noPrev, noNext, b.aimTanYawOut * kD2R * at12,
-                   c.aimTanYawIn * kD2R * at12, moY, miY);
-    AimAngleSlopes(pA, pB, pC, pD, at01, at12, at23, b, c, noPrev, noNext, b.aimTanPitchOut * kD2R * at12,
-                   c.aimTanPitchIn * kD2R * at12, moP, miP);
+    // Stored explicit rates are degrees per unit of SEGMENT PROGRESS, not degrees per second, so they only
+    // need the radian conversion here. That distinction is the whole point: a rate in deg/s is a promise about
+    // wall-clock time, so retiming the path left the baked value fighting the new duration - the slope grew
+    // with the segment, overshot, hit the envelope clamp, and came out as a jerk. Progress-relative rates
+    // describe the SHAPE of the turn, which is what a bake is supposed to preserve; retiming then changes how
+    // fast that shape is played and nothing else. (Same reasoning as the path's relative tangent weights.)
+    const float kD2R = kPi / 180.0f;
+    AimAngleSlopes(yA, yB, yC, yD, at01, at12, at23, b, c, noPrev, noNext, b.aimTanYawOut * kD2R, c.aimTanYawIn * kD2R,
+                   moY, miY);
+    AimAngleSlopes(pA, pB, pC, pD, at01, at12, at23, b, c, noPrev, noNext, b.aimTanPitchOut * kD2R,
+                   c.aimTanPitchIn * kD2R, moP, miP);
+    // A keyframe where the framing turns back on itself has exactly one rate both of its segments allow:
+    // zero. Any other value points the view further than the keyframe does, in the direction it is about to
+    // leave - straight out of the envelope. This is not a limiter with a number in it, it is the answer to
+    // the constraint, and it has to be settled BEFORE the scale below: one scale serves a whole segment, so
+    // an end that must go to zero would otherwise drag the far end of that segment down with it (which is
+    // how the first attempt at this made the very keyframe it was fixing worse than the old clamp did).
+    {
+        float s01y = (yB - yA) / at01, s12y = (yC - yB) / at12, s23y = (yD - yC) / at23;
+        float s01p = (pB - pA) / at01, s12p = (pC - pB) / at12, s23p = (pD - pC) / at23;
+        if (noPrev) { // no real neighbour on that side: this segment's own rate continues, nothing turns back
+            s01y = s12y;
+            s01p = s12p;
+        }
+        if (noNext) {
+            s23y = s12y;
+            s23p = s12p;
+        }
+        if (s01y * s12y <= 0.0f) {
+            *moY = 0.0f;
+        }
+        if (s12y * s23y <= 0.0f) {
+            *miY = 0.0f;
+        }
+        if (s01p * s12p <= 0.0f) {
+            *moP = 0.0f;
+        }
+        if (s12p * s23p <= 0.0f) {
+            *miP = 0.0f;
+        }
+    }
+    // The envelope, measured. Each keyframe's scale is the smaller of what its two segments can carry, so
+    // both sides of a knot end up with the same number and the turn rate cannot step across a keyframe.
+    // Every scale here is computed from its own segment's natural curve alone, which is what keeps this from
+    // recursing outward along the whole path.
+    if (!raw) {
+        float sYThis = AimEnvelopeScale(yB, yC, *moY, *miY);
+        float sPThis = AimEnvelopeScale(pB, pC, *moP, *miP);
+        float sYPrev = 1.0f, sPPrev = 1.0f, sYNext = 1.0f, sPNext = 1.0f;
+        float q0, q1, q2, q3, nmoY, nmiY, nmoP, nmiP, ql0, ql1;
+        if (!noPrev && AimSegmentCurve(i0, &q0, &q1, &q2, &q3, &nmoY, &nmiY, &nmoP, &nmiP, &ql0, &ql1, true)) {
+            sYPrev = AimEnvelopeScale(q0, q1, nmoY, nmiY);
+            sPPrev = AimEnvelopeScale(q2, q3, nmoP, nmiP);
+        }
+        if (!noNext && AimSegmentCurve(i2, &q0, &q1, &q2, &q3, &nmoY, &nmiY, &nmoP, &nmiP, &ql0, &ql1, true)) {
+            sYNext = AimEnvelopeScale(q0, q1, nmoY, nmiY);
+            sPNext = AimEnvelopeScale(q2, q3, nmoP, nmiP);
+        }
+        *moY *= std::min(sYPrev, sYThis);
+        *miY *= std::min(sYThis, sYNext);
+        *moP *= std::min(sPPrev, sPThis);
+        *miP *= std::min(sPThis, sPNext);
+    }
     *oyB = yB;
     *oyC = yC;
     *opB = pB;
@@ -1591,6 +1682,100 @@ static bool AimSegmentCurve(int i1, float* oyB, float* oyC, float* opB, float* o
 // Look-at point on arc segment i1 at aim-curve parameter pAim. eyePos / ueEye are the eye's position and
 // geometric parameter at the same moment. Three rules total: locked tracking is exact, rail follows the
 // travel direction, and everything else is the yaw/pitch value curves from AimSegmentCurve.
+// The aim curve's end CURVATURES for segment i1, in Hermite5's per-progress units.
+//
+// Picked per KNOT and shared by both of its segments, the same way the eye's schedule does it, and for the
+// same reason: a cubic angle curve is only C1, so the view arrives at a keyframe slowing its turn at one rate
+// and leaves speeding up at another. That step is a jerk at every single keyframe - it is what "the aim feels
+// jumpy and clunky" has been made of, and it was invisible because nothing ever drew the aim's curvature.
+static void AimSegmentAccels(int i1, float yB, float yC, float pB, float pC, float moY, float miY, float moP, float miP,
+                             float* aoY, float* aiY, float* aoP, float* aiP) {
+    int n = (int)sKeyframes.size();
+    int i2 = (i1 + 1) % n;
+    bool cyc = LoopCyclic();
+    float at12 = SegDurAt(i1);
+    float dd = at12 * at12;
+    // This segment's own cubic end curvatures, converted to per-second^2 so the two sides of a knot are
+    // comparable even when their segments run at different lengths.
+    float sy0, sy1, sp0, sp1;
+    AutoAccel(yB, yC, moY, miY, &sy0, &sy1);
+    AutoAccel(pB, pC, moP, miP, &sp0, &sp1);
+    sy0 /= dd;
+    sy1 /= dd;
+    sp0 /= dd;
+    sp1 /= dd;
+    // A neighbouring segment's curvature at the shared knot, if that segment has an aim curve at all.
+    auto neighbour = [&](int seg, bool wantEnd, float* oy, float* op) {
+        float q0, q1, q2, q3, mo1, mi1, mo2, mi2, l0, l1;
+        if (seg < 0 || !AimSegmentCurve(seg, &q0, &q1, &q2, &q3, &mo1, &mi1, &mo2, &mi2, &l0, &l1, true)) {
+            return false; // raw: this only needs the neighbour's shape, and it keeps the lookup one level deep
+        }
+        float d = SegDurAt(seg), d2 = d * d;
+        float ay0, ay1, ap0, ap1;
+        AutoAccel(q0, q1, mo1, mi1, &ay0, &ay1);
+        AutoAccel(q2, q3, mo2, mi2, &ap0, &ap1);
+        *oy = (wantEnd ? ay1 : ay0) / d2;
+        *op = (wantEnd ? ap1 : ap0) / d2;
+        return true;
+    };
+    float kY0 = sy0, kP0 = sp0, kY1 = sy1, kP1 = sp1; // one-sided defaults (path ends, locked neighbours)
+    int segPrev = (i1 > 0) ? i1 - 1 : (cyc ? n - 1 : -1);
+    if (segPrev >= 0 && !AimLockedBetween(sKeyframes[segPrev], sKeyframes[i1])) {
+        float ny, np;
+        if (neighbour(segPrev, true, &ny, &np)) {
+            float h0 = SegDurAt(segPrev), w = h0 + at12;
+            kY0 = (w > 1e-5f) ? (ny * at12 + sy0 * h0) / w : 0.5f * (ny + sy0);
+            kP0 = (w > 1e-5f) ? (np * at12 + sp0 * h0) / w : 0.5f * (np + sp0);
+        }
+    }
+    int segNext = (i2 < n - 1) ? i2 : (cyc ? i2 % n : -1);
+    if (segNext >= 0 && segNext != i1 && !AimLockedBetween(sKeyframes[i2], sKeyframes[(segNext + 1) % n])) {
+        float ny, np;
+        if (neighbour(segNext, false, &ny, &np)) {
+            float h1 = SegDurAt(segNext), w = at12 + h1;
+            kY1 = (w > 1e-5f) ? (ny * at12 + sy1 * h1) / w : 0.5f * (ny + sy1);
+            kP1 = (w > 1e-5f) ? (np * at12 + sp1 * h1) / w : 0.5f * (np + sp1);
+        }
+    }
+    float y0 = kY0 * dd, y1 = kY1 * dd, p0 = kP0 * dd, p1v = kP1 * dd; // back to per-progress
+    const CineKeyframe& b = sKeyframes[i1];
+    const CineKeyframe& c = sKeyframes[i2];
+    if (b.hasAimAcc) { // baked values are already progress-relative, so they are used as they stand
+        y0 = b.aimAccYawOut;
+        p0 = b.aimAccPitchOut;
+    }
+    if (c.hasAimAcc) {
+        y1 = c.aimAccYawIn;
+        p1v = c.aimAccPitchIn;
+    }
+    // Curvature this strong would carry the view past one of the two keyframes it sits between - the one
+    // thing the aim may never do. Scale it back just far enough. Level curvature (0) is always within the
+    // envelope because the slopes were already limited to kSpeedSlopeLimit, which is exactly what that limit
+    // is for, so this search always has somewhere safe to land.
+    bool okY = AngleStaysMonotone(yB, yC, moY, miY, y0, y1);
+    bool okP = AngleStaysMonotone(pB, pC, moP, miP, p0, p1v);
+    if (!okY || !okP) {
+        float lo = 0.0f, hi = 1.0f;
+        for (int it = 0; it < 12; it++) {
+            float f = 0.5f * (lo + hi);
+            if (AngleStaysMonotone(yB, yC, moY, miY, y0 * f, y1 * f) &&
+                AngleStaysMonotone(pB, pC, moP, miP, p0 * f, p1v * f)) {
+                lo = f;
+            } else {
+                hi = f;
+            }
+        }
+        y0 *= lo;
+        y1 *= lo;
+        p0 *= lo;
+        p1v *= lo;
+    }
+    *aoY = y0;
+    *aiY = y1;
+    *aoP = p0;
+    *aiP = p1v;
+}
+
 static void AimPointAt(int i1, float pAim, float ueEye, const float* eyePos, float* out) {
     int n = (int)sKeyframes.size();
     int i2 = (i1 + 1) % n;
@@ -1639,8 +1824,10 @@ static void AimPointAt(int i1, float pAim, float ueEye, const float* eyePos, flo
         yaw = yB + (yC - yB) * pAim;
         pitch = pB + (pC - pB) * pAim;
     } else {
-        yaw = Hermite1(yB, yC, moY, miY, pAim);
-        pitch = Hermite1(pB, pC, moP, miP, pAim);
+        float aoY, aiY, aoP, aiP;
+        AimSegmentAccels(i1, yB, yC, pB, pC, moY, miY, moP, miP, &aoY, &aiY, &aoP, &aiP);
+        yaw = Hermite5(yB, yC, moY, miY, aoY, aiY, pAim);
+        pitch = Hermite5(pB, pC, moP, miP, aoP, aiP, pAim);
     }
     float cp = std::cos(pitch);
     float dir[3] = { std::sin(yaw) * cp, std::sin(pitch), std::cos(yaw) * cp };
@@ -2268,13 +2455,15 @@ static void InsertAtPlayhead() {
     // reshape the aim curve.
     bool aimBake = false;
     float aimB[4] = {}, aimK[4] = {}, aimC[4] = {};
+    float accB[4] = {}, accK[4] = {}, accC[4] = {}; // matching curvatures, same {YawIn,YawOut,PitchIn,PitchOut}
     // Speed bake: same idea for the pacing. The schedule derives its knot speeds from the (time, distance)
     // knots, so a new knot re-derives the whole profile - the camera would visibly change speed around an
     // insert even though the path and aim were preserved. Freezing the three keyframes' current speeds keeps
     // the motion identical. (b's leaving speed and c's arriving speed are unchanged by an exact split; the
     // new key takes the schedule's instantaneous speed at the split.)
-    bool speedBake = false;
+    bool speedBake = false, accelBake = false;
     float spB = -1.0f, spK = -1.0f, spC = -1.0f;
+    float acB = 0.0f, acK = 0.0f, acC = 0.0f; // matching accelerations (u/s^2), so the ease shape survives too
     if (t > sKeyframes[0].time + 1e-4f && t < sKeyframes[n - 1].time - 1e-4f) {
         int i1 = 0;
         while (i1 < n - 1 && t >= sKeyframes[i1 + 1].time) {
@@ -2403,17 +2592,23 @@ static void InsertAtPlayhead() {
                     int p1 = (i1 > 0) ? i1 - 1 : n - 1;
                     if (!AimLockedBetween(sKeyframes[p1], b) &&
                         AimSegmentCurve(p1, &q0, &q1, &q2, &q3, &nmoY, &nmiY, &nmoP, &nmiP, &ql0, &ql1)) {
-                        float Dp = SegDurAt(p1);
-                        aimB[0] = kR2D * nmiY / Dp;
-                        aimB[2] = kR2D * nmiP / Dp;
+                        aimB[0] = kR2D * nmiY; // this segment isn't split, so its progress is unchanged
+                        aimB[2] = kR2D * nmiP;
+                        float ry, riy, rp, rip;
+                        AimSegmentAccels(p1, q0, q1, q2, q3, nmoY, nmiY, nmoP, nmiP, &ry, &riy, &rp, &rip);
+                        accB[0] = kR2D * riy;
+                        accB[2] = kR2D * rip;
                     }
                 }
                 if (hasNext) {
                     if (!AimLockedBetween(c, sKeyframes[(i2 < n - 1) ? i2 + 1 : 0]) &&
                         AimSegmentCurve(i2, &q0, &q1, &q2, &q3, &nmoY, &nmiY, &nmoP, &nmiP, &ql0, &ql1)) {
-                        float Dn = SegDurAt(i2);
-                        aimC[1] = kR2D * nmoY / Dn;
-                        aimC[3] = kR2D * nmoP / Dn;
+                        aimC[1] = kR2D * nmoY;
+                        aimC[3] = kR2D * nmoP;
+                        float ry, riy, rp, rip;
+                        AimSegmentAccels(i2, q0, q1, q2, q3, nmoY, nmiY, nmoP, nmiP, &ry, &riy, &rp, &rip);
+                        accC[1] = kR2D * ry;
+                        accC[3] = kR2D * rp;
                     }
                 }
             }
@@ -2515,13 +2710,34 @@ static void InsertAtPlayhead() {
     // the sides that touch the split are pinned - b's arriving side and c's leaving side belong to segments
     // the insert didn't touch, and their automatic values are still correct.
     if (speedBake) {
-        B.speedRateOut = spB;
-        C.speedRateIn = spC;
-        K.speedRateIn = spK;
-        K.speedRateOut = spK;
+        B.speedRate = spB;
+        C.speedRate = spC;
+        K.speedRate = spK;
+        if (accelBake) {
+            B.hasAccelOut = 1;
+            B.speedAccelOut = acB;
+            C.hasAccelIn = 1;
+            C.speedAccelIn = acC;
+            K.hasAccelIn = K.hasAccelOut = 1;
+            K.speedAccelIn = acK;
+            K.speedAccelOut = acK;
+        }
     }
     // Aim bake: write the captured rates as explicit values on all three keyframes.
     if (aimBake) {
+        B.hasAimAcc = C.hasAimAcc = K.hasAimAcc = 1;
+        B.aimAccYawIn = accB[0];
+        B.aimAccYawOut = accB[1];
+        B.aimAccPitchIn = accB[2];
+        B.aimAccPitchOut = accB[3];
+        C.aimAccYawIn = accC[0];
+        C.aimAccYawOut = accC[1];
+        C.aimAccPitchIn = accC[2];
+        C.aimAccPitchOut = accC[3];
+        K.aimAccYawIn = accK[0];
+        K.aimAccYawOut = accK[1];
+        K.aimAccPitchIn = accK[2];
+        K.aimAccPitchOut = accK[3];
         B.hasAimTan = 1;
         B.aimTanYawIn = aimB[0];
         B.aimTanYawOut = aimB[1];
