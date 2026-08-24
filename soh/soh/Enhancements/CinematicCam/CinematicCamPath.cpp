@@ -5208,6 +5208,30 @@ static int SpeedGraphMask() {
 // range (printed in the legend), so shape is comparable across wildly different units. forceSpeedMax > 0
 // pins the Speed channel's scale (used while a handle drag is live, so the graph can't rescale under the
 // cursor); outSpeedMax reports the scale actually used, for the handles.
+// Peak speed over the entire timeline, cached against the path hash. This is the Speed channel's scale, so
+// that zooming or panning the graph never moves a handle: the picture changes, what it measures does not.
+static float SpeedPeakWhole() {
+    static uint32_t sCached = 0;
+    static float sPeak = 0.0f;
+    static bool sHave = false;
+    uint32_t h = PathShapeHash();
+    if (sHave && h == sCached) {
+        return sPeak;
+    }
+    float total = EffectiveTotal();
+    float peak = 0.0f;
+    const int kN = 256;
+    for (int i = 0; i <= kN; i++) {
+        float s = 0.0f;
+        ScheduleSpeedsAt(total * (float)i / (float)kN, &s);
+        peak = std::max(peak, s);
+    }
+    sCached = h;
+    sPeak = peak;
+    sHave = true;
+    return peak;
+}
+
 static void DrawSpeedGraphInto(ImDrawList* dl, float gx0, float gx1, float gy0, float gy1, float vt0, float vt1,
                                float forceSpeedMax, float* outSpeedMax) {
     if (outSpeedMax) {
@@ -5291,9 +5315,12 @@ static void DrawSpeedGraphInto(ImDrawList* dl, float gx0, float gx1, float gy0, 
             hi = std::max(hi, v[c][i]);
         }
         char lab[80];
-        if (c == 0 && forceSpeedMax > 0.0f) { // frozen scale during a handle drag
+        if (c == 0) {
+            // Speed fits the WHOLE timeline, not the visible window: it is the one channel you edit, and a
+            // scale that changed every time you zoomed would move the handles and the ceiling out from under
+            // the cursor. A drag freezes it outright.
             lo = 0.0f;
-            hi = forceSpeedMax;
+            hi = (forceSpeedMax > 0.0f) ? forceSpeedMax : SpeedPeakWhole();
         }
         bool flat = (hi - lo) < kSgChans[c].minSpan;
         if (kSgChans[c].rate) {
@@ -5337,16 +5364,27 @@ static void DrawSpeedGraphInto(ImDrawList* dl, float gx0, float gx1, float gy0, 
     }
 }
 
-// Draggable handles on the Speed curve: a pair per keyframe (arriving on the left, leaving on the right),
-// each sitting at the speed the schedule actually crosses that side with. Drag one vertically to set the
-// camera's speed there - the schedule reshapes around it and keyframe TIMES never move. The two sides move
-// together unless you Alt-drag, which breaks them apart (same convention as the Bezier handles); right-click
-// returns the keyframe to automatic, and a white ring marks one you have set. Handles draw at the EFFECTIVE
-// rate, so when the exactness bound limits a drag you can see it stop.
+// Editing the Speed curve, with the same grammar as every other curve in the editor:
+//
+//   the POINT on a keyframe is its speed      - drag it up or down to make the camera faster or slower there
+//   the two HANDLES are Bezier tangents       - drag one to rotate the curve through the point, shaping the
+//                                               ease into and out of the keyframe
+//
+// So the point moves the curve and the handles bend it, and breaking a pair (Alt-drag) gives a CORNER, not a
+// step: the speed at a keyframe is one number, because two different speeds at the same instant is a jump the
+// camera can only take as a hitch. Handles belong to selected keyframes only - drawing every pair at once
+// buried the curve they were meant to describe.
+//
+// Everything draws at its EFFECTIVE value, so when exactness limits a drag you watch it stop against the
+// ceiling line rather than wondering why the number disagrees with the picture.
 static int sSpDragKnot = -1;    // keyframe index being dragged (-1 = none)
-static int sSpDragSide = 0;     // 0 = arriving (in) handle, 1 = leaving (out) handle
+static int sSpDragSide = -1;    // -1 = the point itself, 0 = arriving handle, 1 = leaving handle
 static float sSpDragMax = 0.0f; // frozen Speed scale for the duration of the drag
 static bool sSpHot = false;     // a handle is hovered or dragged: the editor's own click handlers must yield
+// Grab bookkeeping. Picking something up must not change it: the drag applies the cursor's OFFSET from where
+// it grabbed, and nothing is written (nor pushed to undo) until the cursor has actually moved.
+static ImVec2 sSpGrabOff(0.0f, 0.0f);
+static bool sSpDragMoved = false;
 static void SpeedHandlesUI(ImDrawList* dl, float gx0, float gx1, float gy0, float gy1, float vt0, float vt1,
                            float speedMax, bool hovered) {
     sSpHot = sSpDragKnot >= 0;
@@ -5356,93 +5394,231 @@ static void SpeedHandlesUI(ImDrawList* dl, float gx0, float gx1, float gy0, floa
     }
     ArcEnsure();
     ImGuiIO& io = ImGui::GetIO();
-    const float kArm = 22.0f; // handle arm length in pixels, matching the curve editor's Bezier handles
-    auto yOf = [&](float rate) { return gy1 - std::min(std::max(rate / speedMax, 0.0f), 1.0f) * (gy1 - gy0) * 0.92f; };
+    const float kArm = 26.0f; // handle arm length in pixels, matching the curve editor's Bezier handles
+    float scale = (sSpDragKnot >= 0 && sSpDragMax > 0.0f) ? sSpDragMax : speedMax;
+    auto yOf = [&](float rate) { return gy1 - std::min(std::max(rate / scale, 0.0f), 1.0f) * (gy1 - gy0) * 0.92f; };
+    auto rateOfY = [&](float y) { return std::max((gy1 - y) / ((gy1 - gy0) * 0.92f), 0.0f) * scale; };
     auto xOf = [&](float t) { return gx0 + ((t - vt0) / (vt1 - vt0)) * (gx1 - gx0); };
-    // The EFFECTIVE speeds either side of keyframe i, as the schedule ended up using them.
-    auto ratesAt = [&](int i, float* rIn, float* rOut) {
+    float secPerPx = (vt1 - vt0) / std::max(gx1 - gx0, 1.0f);
+    float pxPerRate = (gy1 - gy0) * 0.92f / std::max(scale, 1e-5f); // pixels per unit of speed
+    // An acceleration, drawn: convert it to a screen slope, then walk kArm pixels ALONG that slope. dir is +1
+    // for the leaving handle, -1 for the arriving one (which reaches back in time).
+    auto ArmEnd = [&](ImVec2 knot, float accel, float dir) {
+        float vx = dir, vy = -accel * secPerPx * pxPerRate * dir;
+        float len = std::sqrt(vx * vx + vy * vy);
+        return ImVec2(knot.x + vx / len * kArm, knot.y + vy / len * kArm);
+    };
+    // ...and back: the acceleration implied by a handle sitting at `hp`.
+    auto AccelOfArm = [&](ImVec2 knot, ImVec2 hp, float dir) {
+        // Floor the horizontal reach at a real fraction of the arm, not a few pixels. A tiny floor doesn't
+        // saturate the angle, it AMPLIFIES it: drag the handle back past its own knot and dy keeps its full
+        // size over a 4px dx, asking for an acceleration ~7x steeper than the arm is even pointing. The
+        // schedule then refuses it, the handle springs back to where it was, and the drag looks broken while
+        // having quietly marked the keyframe as hand-set. This bounds the steepest handle to ~70 degrees.
+        float dx = std::max((hp.x - knot.x) * dir, kArm * 0.35f);
+        float dy = (hp.y - knot.y) * dir;
+        return -dy / dx / std::max(secPerPx * pxPerRate, 1e-9f);
+    };
+    // The speed at keyframe i, and the accelerations either side, exactly as the schedule ended up using them.
+    auto stateAt = [&](int i, float* rate, float* aIn, float* aOut) {
         int segIn = (i > 0) ? i - 1 : (LoopCyclic() ? sArc.segs - 1 : -1);
         int segOut = (i < sArc.segs) ? i : -1;
-        *rIn = (segIn >= 0 && segIn < (int)sArc.mIn.size()) ? sArc.mIn[segIn] : -1.0f;
-        *rOut = (segOut >= 0 && segOut < (int)sArc.mOut.size()) ? sArc.mOut[segOut] : -1.0f;
-        if (*rIn < 0.0f) {
-            *rIn = *rOut; // path ends have only one real side; mirror it so the pair still reads
-        }
-        if (*rOut < 0.0f) {
-            *rOut = *rIn;
-        }
+        *rate = (segOut >= 0) ? sArc.mOut[segOut] : ((segIn >= 0) ? sArc.mIn[segIn] : 0.0f);
+        // Stored per local progress; the handle is drawn in real seconds, so undo the segment's duration.
+        float dIn = (segIn >= 0) ? SegDurAt(segIn) : 1.0f;
+        float dOut = (segOut >= 0) ? SegDurAt(segOut) : 1.0f;
+        *aIn = (segIn >= 0) ? sArc.aIn[segIn] / std::max(dIn * dIn, 1e-6f) : 0.0f;
+        *aOut = (segOut >= 0) ? sArc.aOut[segOut] / std::max(dOut * dOut, 1e-6f) : 0.0f;
     };
-    int hover = -1, hoverSide = 0;
+    int hover = -1, hoverSide = -2;
     for (int i = 0; i < n; i++) {
         float t = sKeyframes[i].time;
         if (t < vt0 - 1e-4f || t > vt1 + 1e-4f) {
             continue;
         }
-        float rIn, rOut;
-        ratesAt(i, &rIn, &rOut);
-        if (rIn < 0.0f || rOut < 0.0f) {
-            continue;
-        }
+        float rate, aIn, aOut;
+        stateAt(i, &rate, &aIn, &aOut);
         float x = xOf(t);
-        bool ex = sKeyframes[i].speedRateIn >= 0.0f || sKeyframes[i].speedRateOut >= 0.0f;
-        ImVec2 pIn(x - kArm, yOf(rIn)), pOut(x + kArm, yOf(rOut));
-        ImVec2 knot(x, yOf(0.5f * (rIn + rOut)));
-        dl->AddLine(pIn, knot, IM_COL32(255, 140, 50, 160), 1.2f);
-        dl->AddLine(knot, pOut, IM_COL32(255, 140, 50, 160), 1.2f);
-        for (int sd = 0; sd < 2; sd++) {
-            ImVec2 hp = sd ? pOut : pIn;
-            bool hot = (sSpDragKnot == i && sSpDragSide == sd);
-            if (hovered && sSpDragKnot < 0 && std::fabs(io.MousePos.x - hp.x) < 7.0f &&
-                std::fabs(io.MousePos.y - hp.y) < 8.0f) {
-                hover = i;
-                hoverSide = sd;
-                hot = true;
+        ImVec2 knot(x, yOf(rate));
+        bool showHandles = IsSelected(sIds[i]) || sSpDragKnot == i;
+        if (showHandles) {
+            // A path end has a segment on one side only; the missing side's handle would shape nothing, so it
+            // isn't drawn rather than sitting there ignoring drags.
+            bool haveIn = (i > 0) || LoopCyclic();
+            bool haveOut = (i < sArc.segs);
+            // Fixed-length arms: the acceleration sets the handle's ANGLE, and the arm keeps the same length
+            // whatever that angle is. Drawing the tangent at a fixed horizontal reach instead made the arms
+            // stretch and shrink as the slope changed, which read as the handles jumping around while you
+            // dragged the point. Every curve editor draws them this way for exactly this reason.
+            ImVec2 pIn = ArmEnd(knot, aIn, -1.0f);
+            ImVec2 pOut = ArmEnd(knot, aOut, 1.0f);
+            if (haveIn) {
+                dl->AddLine(pIn, knot, IM_COL32(255, 140, 50, 150), 1.2f);
             }
-            dl->AddCircleFilled(hp, hot ? 5.0f : 3.5f, IM_COL32(255, 140, 50, 255));
-            if (ex) {
-                dl->AddCircle(hp, 6.5f, IM_COL32(255, 255, 255, 200));
+            if (haveOut) {
+                dl->AddLine(knot, pOut, IM_COL32(255, 140, 50, 150), 1.2f);
+            }
+            for (int sd = 0; sd < 2; sd++) {
+                if (!(sd ? haveOut : haveIn)) {
+                    continue;
+                }
+                ImVec2 hp = sd ? pOut : pIn;
+                bool hot = (sSpDragKnot == i && sSpDragSide == sd);
+                if (hovered && sSpDragKnot < 0 && std::fabs(io.MousePos.x - hp.x) < 7.0f &&
+                    std::fabs(io.MousePos.y - hp.y) < 8.0f) {
+                    hover = i;
+                    hoverSide = sd;
+                    hot = true;
+                }
+                // Hollow while automatic, solid once you've set it. An automatic handle re-derives itself
+                // when the curve around it changes - including when you drag this keyframe's own speed - and
+                // that is worth being able to see at a glance, since it's the difference between a handle
+                // that follows the curve and one that commands it.
+                bool manual = sd ? (sKeyframes[i].hasAccelOut != 0) : (sKeyframes[i].hasAccelIn != 0);
+                if (manual) {
+                    dl->AddCircleFilled(hp, hot ? 5.0f : 3.5f, IM_COL32(255, 175, 90, 235));
+                } else {
+                    dl->AddCircleFilled(hp, hot ? 5.0f : 3.5f, IM_COL32(40, 42, 48, 255));
+                    dl->AddCircle(hp, hot ? 5.0f : 3.5f, IM_COL32(255, 175, 90, 200), 0, 1.4f);
+                }
             }
         }
-        dl->AddCircleFilled(knot, 2.5f, IM_COL32(255, 190, 120, 220));
+        bool hotKnot = (sSpDragKnot == i && sSpDragSide == -1);
+        if (hovered && sSpDragKnot < 0 && hover < 0 && std::fabs(io.MousePos.x - knot.x) < 7.0f &&
+            std::fabs(io.MousePos.y - knot.y) < 8.0f) {
+            hover = i;
+            hoverSide = -1;
+            hotKnot = true;
+        }
+        dl->AddCircleFilled(knot, hotKnot ? 6.0f : 4.0f, IM_COL32(255, 140, 50, 255));
+        if (sKeyframes[i].speedRate >= 0.0f) { // a speed you set, as opposed to one the schedule chose
+            dl->AddCircle(knot, 7.5f, IM_COL32(255, 255, 255, 200));
+        }
+    }
+    // The exactness ceiling for the keyframe in hand, drawn where it bites. The bound is a property of the
+    // path (3x the slower of the two segments it sits between), so it holds still while the view moves. Shown
+    // for a selected keyframe as well as a dragged one - waiting for the drag meant it only ever appeared
+    // once you were already pushing against it.
+    int capKnot = (sSpDragKnot >= 0) ? sSpDragKnot : ((hover >= 0) ? hover : -1);
+    if (capKnot < 0) {
+        for (int i = 0; i < n && capKnot < 0; i++) {
+            if (IsSelected(sIds[i])) {
+                capKnot = i;
+            }
+        }
+    }
+    if (capKnot >= 0 && capKnot < n) {
+        float cap = KnotSpeedCap(sArc.S, sArc.segs, capKnot);
+        if (cap > 0.0f && cap <= scale) {
+            float cy = yOf(cap);
+            for (float x = gx0; x < gx1; x += 9.0f) {
+                dl->AddLine(ImVec2(x, cy), ImVec2(std::min(x + 5.0f, gx1), cy), IM_COL32(255, 90, 90, 170), 1.0f);
+            }
+        }
     }
     if (hover >= 0) {
         sSpHot = true;
-        float rIn, rOut;
-        ratesAt(hover, &rIn, &rOut);
-        ImGui::SetTooltip("%.0f u/s %s this keyframe - drag to set, Alt-drag to break the two sides apart, "
-                          "right-click for automatic",
-                          hoverSide ? rOut : rIn, hoverSide ? "leaving" : "arriving");
+        float rate, aIn, aOut;
+        stateAt(hover, &rate, &aIn, &aOut);
+        if (hoverSide == -1) {
+            ImGui::SetTooltip("%.0f u/s at this keyframe - drag to set the speed here (the times never move), "
+                              "right-click for automatic",
+                              rate);
+        } else {
+            bool manual = hoverSide ? (sKeyframes[hover].hasAccelOut != 0) : (sKeyframes[hover].hasAccelIn != 0);
+            ImGui::SetTooltip("%+.0f u/s^2 %s (%s) - drag to shape the ease through this keyframe, Alt-drag to "
+                              "break the two handles apart",
+                              hoverSide ? aOut : aIn, hoverSide ? "leaving" : "arriving",
+                              manual ? "set by you" : "automatic: follows the curve until you drag it");
+        }
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            PushUndo();
             sSpDragKnot = hover;
             sSpDragSide = hoverSide;
+            sSpDragMoved = false;
+            // Freeze the scale as it is. It used to expand here to fit the ceiling, which squashed the whole
+            // curve the instant you touched a point - a rescale nobody asked for, in response to a click that
+            // wasn't meant to change anything. If the drag actually pushes into the top of the graph the scale
+            // opens up then (below), when the extra room is the thing being asked for.
             sSpDragMax = speedMax;
-            if (io.KeyAlt) {
+            // Clicking a point selects its keyframe, like clicking it anywhere else in the editor - that is
+            // also what makes its handles stay up after the mouse is released.
+            if (hoverSide == -1) {
+                if (io.KeyCtrl) {
+                    ToggleSelect(sIds[hover]);
+                } else if (!IsSelected(sIds[hover])) {
+                    SelectOnly(sIds[hover]);
+                } else {
+                    sSelectedId = sIds[hover];
+                }
+            }
+            // Remember where inside the dot the grab landed, so picking it up doesn't move it.
+            float rate2, aIn2, aOut2;
+            stateAt(hover, &rate2, &aIn2, &aOut2);
+            ImVec2 knot(xOf(sKeyframes[hover].time), yOf(rate2));
+            ImVec2 grabbed =
+                (hoverSide == -1) ? knot : ArmEnd(knot, hoverSide ? aOut2 : aIn2, hoverSide ? 1.0f : -1.0f);
+            sSpGrabOff = ImVec2(grabbed.x - io.MousePos.x, grabbed.y - io.MousePos.y);
+            if (io.KeyAlt && hoverSide >= 0) {
+                PushUndo();
+                sSpDragMoved = true; // breaking the pair IS an edit, even if the cursor never moves
                 sKeyframes[hover].speedBroken = 1;
             }
         } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
             PushUndo();
-            sKeyframes[hover].speedRateIn = -1.0f;
-            sKeyframes[hover].speedRateOut = -1.0f;
-            sKeyframes[hover].speedBroken = 0;
+            CineKeyframe& k = sKeyframes[hover];
+            k.speedRate = -1.0f;
+            k.hasAccelIn = k.hasAccelOut = 0;
+            k.speedAccelIn = k.speedAccelOut = 0.0f;
+            k.speedBroken = 0;
         }
     }
     if (sSpDragKnot >= 0) {
         if (sSpDragKnot < n && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-            CineKeyframe& k = sKeyframes[sSpDragKnot];
-            float u = (gy1 - io.MousePos.y) / ((gy1 - gy0) * 0.92f);
-            float rate = std::max(u, 0.0f) * sSpDragMax;
-            if (sSpDragSide) {
-                k.speedRateOut = rate;
-            } else {
-                k.speedRateIn = rate;
+            ImVec2 at(io.MousePos.x + sSpGrabOff.x, io.MousePos.y + sSpGrabOff.y);
+            if (!sSpDragMoved) {
+                // A click that never travelled is a selection, not an edit: nothing written, no undo entry.
+                // The dead zone is what keeps a slightly shaky click from nudging the value.
+                ImVec2 dd = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
+                if (std::fabs(dd.x) + std::fabs(dd.y) < 2.5f) {
+                    return;
+                }
+                PushUndo();
+                sSpDragMoved = true;
             }
-            if (!k.speedBroken) { // both sides together unless broken
-                k.speedRateIn = rate;
-                k.speedRateOut = rate;
+            CineKeyframe& k = sKeyframes[sSpDragKnot];
+            if (sSpDragSide == -1) {
+                float want = rateOfY(at.y);
+                float cap = KnotSpeedCap(sArc.S, sArc.segs, sSpDragKnot);
+                // Only now, with the drag pressed against the top of the graph, is more headroom what you're
+                // asking for - so open the scale up to the ceiling and let the point run to it.
+                if (want > sSpDragMax * 0.98f && cap > sSpDragMax) {
+                    sSpDragMax = cap * 1.06f;
+                }
+                // Clamp before storing, and against the bound shared by BOTH neighbouring segments: a value
+                // the two sides would have to disagree about is exactly the jump this curve cannot have.
+                k.speedRate = std::min(want, cap);
+            } else {
+                float rate, aIn, aOut;
+                stateAt(sSpDragKnot, &rate, &aIn, &aOut);
+                ImVec2 knot(xOf(sKeyframes[sSpDragKnot].time), yOf(rate));
+                float a = AccelOfArm(knot, at, sSpDragSide ? 1.0f : -1.0f);
+                if (k.speedBroken) {
+                    if (sSpDragSide) {
+                        k.hasAccelOut = 1;
+                        k.speedAccelOut = a;
+                    } else {
+                        k.hasAccelIn = 1;
+                        k.speedAccelIn = a;
+                    }
+                } else { // unbroken: one straight tangent through the point, so both sides take the same slope
+                    k.hasAccelIn = k.hasAccelOut = 1;
+                    k.speedAccelIn = k.speedAccelOut = a;
+                }
             }
         } else {
             sSpDragKnot = -1;
+            sSpDragSide = -1;
+            sSpDragMoved = false;
         }
     }
 }
@@ -5524,9 +5700,20 @@ static void DrawCurveEditor() {
                     ImGui::SameLine();
                 }
             }
+            if (SpeedGraphMask() & 1) { // the Speed channel is the editable one - say how, since it looks like a plot
+                CineHint("Speed: drag a keyframe's point to set the speed there. Select keyframes to get their "
+                         "ease handles; Alt-drag a handle to bend one side alone. Right-click a point for "
+                         "automatic. The red line is the fastest that keyframe can be taken and still arrive on "
+                         "time.");
+            }
         }
     }
     bool showSpeed = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.SpeedGraph"), 0) != 0;
+    // The visible time window, declared up here because BOTH graphs use it: the channel editor below and the
+    // standalone speed graph, which is what you get when no parameter track is enabled. The speed graph used
+    // to be stuck at the full timeline in that case - you could only zoom by first keying something you didn't
+    // want, which is a strange price for a closer look at the speed.
+    static float sCvT0 = 0.0f, sCvT1 = -1.0f; // sCvT1 <= sCvT0 = the whole timeline
 
     std::vector<CurveChannel> curves;
     int pc = 0;
@@ -5557,14 +5744,65 @@ static void DrawCurveEditor() {
                 tEnd = 1.0f;
             }
             float sgx0 = q0.x + 6.0f, sgx1 = q1.x - 6.0f;
+            // The window is shared with the channel editor and outlives the path it was set on: shorten the
+            // path (or delete keyframes) while zoomed and it can end up entirely past the end, drawing an
+            // empty graph with no hint as to why. Clamp it back into the timeline, and drop to Fit if there's
+            // nothing left of it.
+            if (sCvT1 > sCvT0) {
+                sCvT0 = std::min(std::max(sCvT0, 0.0f), tEnd);
+                sCvT1 = std::min(std::max(sCvT1, 0.0f), tEnd);
+                if (sCvT1 - sCvT0 < tEnd * 0.01f) {
+                    sCvT0 = 0.0f;
+                    sCvT1 = -1.0f;
+                }
+            }
+            float vt0 = (sCvT1 > sCvT0) ? sCvT0 : 0.0f;
+            float vt1 = (sCvT1 > sCvT0) ? sCvT1 : tEnd;
+            // Same wheel-zoom / middle-drag-pan as the channel editor, on the same window state, so switching
+            // between the two views keeps your place.
+            ImGuiIO& sio = ImGui::GetIO();
+            if (ImGui::IsItemHovered() && sio.MouseWheel != 0.0f && sSpDragKnot < 0) {
+                float mt = vt0 + ((sio.MousePos.x - sgx0) / std::max(sgx1 - sgx0, 1.0f)) * (vt1 - vt0);
+                mt = std::min(std::max(mt, 0.0f), tEnd);
+                float fz = std::pow(0.8f, sio.MouseWheel); // wheel up = zoom in
+                float nt0 = mt - (mt - vt0) * fz, nt1 = mt + (vt1 - mt) * fz;
+                float minSpan = tEnd * 0.02f;
+                if (nt1 - nt0 < minSpan) {
+                    float c = (nt0 + nt1) * 0.5f;
+                    nt0 = c - minSpan * 0.5f;
+                    nt1 = c + minSpan * 0.5f;
+                }
+                nt0 = std::max(nt0, 0.0f);
+                nt1 = std::min(nt1, tEnd);
+                if (nt1 - nt0 >= tEnd * 0.999f) {
+                    sCvT0 = 0.0f;
+                    sCvT1 = -1.0f; // zoomed right out: back to the full timeline
+                } else {
+                    sCvT0 = nt0;
+                    sCvT1 = nt1;
+                }
+                vt0 = (sCvT1 > sCvT0) ? sCvT0 : 0.0f;
+                vt1 = (sCvT1 > sCvT0) ? sCvT1 : tEnd;
+            }
+            if (ImGui::IsItemHovered() && ImGui::IsMouseDown(ImGuiMouseButton_Middle) && sCvT1 > sCvT0) {
+                float dt = -sio.MouseDelta.x * (vt1 - vt0) / std::max(sgx1 - sgx0, 1.0f);
+                dt = std::min(std::max(dt, -vt0), tEnd - vt1);
+                sCvT0 = vt0 + dt;
+                sCvT1 = vt1 + dt;
+                vt0 = sCvT0;
+                vt1 = sCvT1;
+            }
             sdl->PushClipRect(q0, q1, true); // belt and braces: nothing painted past the graph frame
             float spMax = 0.0f;
-            DrawSpeedGraphInto(sdl, sgx0, sgx1, q0.y + 8.0f, q1.y - 8.0f, 0.0f, tEnd,
+            DrawSpeedGraphInto(sdl, sgx0, sgx1, q0.y + 8.0f, q1.y - 8.0f, vt0, vt1,
                                (sSpDragKnot >= 0) ? sSpDragMax : 0.0f, &spMax);
-            SpeedHandlesUI(sdl, sgx0, sgx1, q0.y + 8.0f, q1.y - 8.0f, 0.0f, tEnd, spMax, ImGui::IsItemHovered());
-            float sphx = sgx0 + (std::min(sPlayhead, tEnd) / tEnd) * (sgx1 - sgx0);
-            sdl->AddLine(ImVec2(sphx, q0.y + 4.0f), ImVec2(sphx, q1.y - 4.0f), IM_COL32(60, 255, 90, 150), 1.5f);
+            SpeedHandlesUI(sdl, sgx0, sgx1, q0.y + 8.0f, q1.y - 8.0f, vt0, vt1, spMax, ImGui::IsItemHovered());
+            if (sPlayhead >= vt0 && sPlayhead <= vt1) {
+                float sphx = sgx0 + ((sPlayhead - vt0) / std::max(vt1 - vt0, 1e-5f)) * (sgx1 - sgx0);
+                sdl->AddLine(ImVec2(sphx, q0.y + 4.0f), ImVec2(sphx, q1.y - 4.0f), IM_COL32(60, 255, 90, 150), 1.5f);
+            }
             sdl->PopClipRect();
+            CineHint("Wheel: zoom time. Middle-drag: pan. Zoom right out to fit.");
         }
         return;
     }
@@ -5858,6 +6096,10 @@ static void DrawCurveEditor() {
     static bool sHDrag = false; // dragging a Bezier handle endpoint
     static int sHKeyId = -1;    // param key id whose handle is being dragged
     static int sHWhich = 0;     // 0 = out handle, 1 = in handle
+    // Where the grab landed relative to the thing grabbed. Everything draggable moves by the cursor's DELTA
+    // from here, never to the cursor's absolute position: you can hit a 4px dot anywhere inside its ~10px
+    // catch radius, and picking something up must never be the same as changing it.
+    static float sHGrabDT = 0.0f, sHGrabDV = 0.0f;
 
     if (ImGui::IsItemActivated() && !sSpHot) { // a hovered/dragged Speed handle owns the click
         // A Bezier handle grab takes priority over selecting/moving keys.
@@ -5936,16 +6178,35 @@ static void DrawCurveEditor() {
             if (!k.hasHandles) {
                 SeedBezierHandles(k, *AL.track, idx);
             }
-            float nt = xToTime(mx) - k.time;
-            float nv = yToValActive(my) - k.value;
-            if (sHWhich == 0) { // out handle: time in [0, next segment duration]
-                float segNext = (idx < activeN - 1) ? (AL.track->keys[idx + 1].time - k.time) : std::max(nt, 0.0f);
-                k.hOutT = std::min(std::max(nt, 0.0f), std::max(segNext, 0.0f));
-                k.hOutV = nv;
-            } else { // in handle: time in [-prev segment duration, 0]
-                float segPrev = (idx > 0) ? (k.time - AL.track->keys[idx - 1].time) : std::max(-nt, 0.0f);
-                k.hInT = std::max(std::min(nt, 0.0f), -std::max(segPrev, 0.0f));
-                k.hInV = nv;
+            // Handles live in (seconds, value) but are SEEN in pixels, and the two axes are scaled nothing
+            // like each other - a roll track spans hundreds of degrees across a handful of seconds. Every
+            // length and direction below is therefore computed in pixels and converted back, which is the
+            // only way an arm that looks 30px long stays 30px long when it swings.
+            float pxT = (gx1 - gx0) / std::max(vt1 - vt0, 1e-5f); // pixels per second
+            float pxV = (gy1 - gy0) / std::max(vspan, 1e-5f);     // pixels per value unit
+            // Shorten by SCALING the whole arm, never by truncating its time reach: cutting one component
+            // alone rotates the handle, and the handle's angle is the curve's shape. This is what made a
+            // near-flat handle fling itself sideways as the segment length changed.
+            auto clampArm = [](float& dt, float& dv, float maxT) {
+                if (maxT > 1e-6f && dt > maxT) {
+                    dv *= maxT / dt;
+                    dt = maxT;
+                }
+            };
+            float segPrev = (idx > 0) ? (k.time - AL.track->keys[idx - 1].time) : 1e9f;
+            float segNext = (idx < activeN - 1) ? (AL.track->keys[idx + 1].time - k.time) : 1e9f;
+            float nt = (xToTime(mx) + sHGrabDT) - k.time;
+            float nv = (yToValActive(my) + sHGrabDV) - k.value;
+            if (sHWhich == 0) { // out handle: reaches forward, toward the next key
+                float dt = std::max(nt, 0.0f), dv = nv;
+                clampArm(dt, dv, segNext);
+                k.hOutT = dt;
+                k.hOutV = dv;
+            } else { // in handle: reaches back, toward the previous key (stored negative)
+                float dt = std::max(-nt, 0.0f), dv = -nv;
+                clampArm(dt, dv, segPrev);
+                k.hInT = -dt;
+                k.hInV = -dv;
             }
             // Unless the pair is broken (Alt-drag), the opposite handle mirrors this one's DIRECTION while
             // keeping its own arm length - so the curve passes through the key smoothly, which is what you
