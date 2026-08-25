@@ -6235,6 +6235,24 @@ static void SpeedHandlesUI(ImDrawList* dl, float gx0, float gx1, float gy0, floa
     }
 }
 
+// ONE height rule for both graphs in this editor - the channel curve editor and the standalone speed graph.
+// They used to disagree: the standalone one was capped at 126px while the channel one subtracted a five-line
+// footer, so keying a channel made the graph SHORTER, which is backwards - you key a channel precisely because
+// you want to look at it. Same minimum, same footer, no cap, both grow with the window.
+static const float kCurveGraphMinH = 200.0f;
+
+// Space kept below a graph for the toolbar row plus either the primary key's fields (one row) or the how-to
+// hint (two, three if the window is narrow). Fixed on purpose: letting it change flipped the window scrollbar,
+// which changed the content width, which rescaled the graph mid-click.
+static float CurveFooterH() {
+    return ImGui::GetTextLineHeightWithSpacing() * 4.0f + 8.0f;
+}
+
+// Rows drawn ABOVE a graph: the camera key row, the speed-graph channel toggles, and the channel picker.
+static float CurveHeaderRowsH() {
+    return ImGui::GetTextLineHeightWithSpacing() * 4.0f;
+}
+
 // Curve editor: a value-over-time graph overlaying the enabled continuous parameter tracks - including the
 // camera channels (Cam roll / Cam FOV), which are ordinary tracks with their own keys. Drag a point in 2D to
 // retime + revalue it; right-click deletes; double-click empty space drops a key; per-key interpolation (Step /
@@ -6341,9 +6359,8 @@ static void DrawCurveEditor() {
                  "Shake, Letterbox, Target X/Y/Z) to shape its curve here.");
         ImGui::PopTextWrapPos();
         if (showSpeed && sKeyframes.size() >= 2) { // the speed graph stands on its own - no tracks needed
-            // Fixed slice (matched by the layout budget in DrawElement) so it never pushes the timeline
-            // off-screen - taking all remaining height made the bottom region scroll.
-            float sgH = std::min(std::max(ImGui::GetContentRegionAvail().y - 6.0f, 80.0f), 126.0f);
+            // Same rule as the channel editor below, so turning a channel on never changes the height.
+            float sgH = std::max(ImGui::GetContentRegionAvail().y - CurveFooterH(), kCurveGraphMinH);
             ImVec2 sz(std::max(ImGui::GetContentRegionAvail().x, 80.0f), sgH);
             ImVec2 q0 = ImGui::GetCursorScreenPos();
             ImGui::InvisibleButton("##speedgraph", sz);
@@ -6522,11 +6539,8 @@ static void DrawCurveEditor() {
     // rescales this graph horizontally. Clicking a key then moved it, because the pixel-to-time mapping had
     // shifted under the cursor between the grab frame and the next one. A constant footer height means the
     // scrollbar can't flip, so the graph can't rescale.
-    const float kFootH = ImGui::GetTextLineHeightWithSpacing() * 5.0f + 10.0f;
-    float graphH = ImGui::GetContentRegionAvail().y - kFootH;
-    if (graphH < 80.0f) {
-        graphH = 80.0f;
-    }
+    const float kFootH = CurveFooterH();
+    float graphH = std::max(ImGui::GetContentRegionAvail().y - kFootH, kCurveGraphMinH);
     ImVec2 size(ImGui::GetContentRegionAvail().x, graphH);
     if (size.x < 80.0f) {
         size.x = 80.0f;
@@ -7238,9 +7252,9 @@ static void DrawCurveEditor() {
         }
     } else {
         ImGui::PushTextWrapPos(0.0f);
-        CineHint("drag = move, Shift+drag = ripple, Ctrl+click = multi, drag empty space = box-select.\n"
-                 "double-click / right-click = add / delete.  wheel = zoom, middle-drag = pan.\n"
-                 "Hold Q to lock an axis; Snap lands drags on the grid.");
+        CineHint("drag = move, Shift+drag = ripple, Ctrl+click = multi, drag empty = box-select, double / right-click "
+                 "= add / delete.\n"
+                 "wheel = zoom, middle-drag = pan, hold Q = lock an axis, Snap = land on the grid.");
         ImGui::PopTextWrapPos();
     }
     ImGui::EndChild();
@@ -7658,13 +7672,17 @@ void CinematicCamPathWindow::DrawElement() {
             break;
         }
     }
-    // key row + legend + adaptive graph + toolbar (84 = row + hint when there is no curve). With no curve but
-    // the speed graph on, the standalone graph needs its own slice budgeted or the bottom region scrolls and
-    // the timeline and the graph can't be on screen at the same time.
+    // Budget the curve editor from the SAME numbers it lays itself out with, and budget the two kinds of
+    // graph identically - a channel curve and the standalone speed graph are the same object as far as the
+    // window is concerned. Reserving different amounts is what made the graph shrink when you keyed a channel.
+    // With no graph at all to draw it is just a key row and a hint, so only reserve that.
     bool cineSpeedGraph = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.SpeedGraph"), 0) != 0;
-    float cineCurveH = cineHaveCurves ? 280.0f : (cineSpeedGraph ? 84.0f + 158.0f : 84.0f);
+    bool cineHasGraph = cineHaveCurves || cineSpeedGraph;
+    float cineCurveH = cineHasGraph ? (CurveHeaderRowsH() + kCurveGraphMinH + CurveFooterH() + 12.0f) : 84.0f;
     float cineWantBottom = cineTimelineH + cineHeaderH + (sCurveEditorOpen ? cineCurveH : 0.0f);
-    float cineMinTop = 160.0f;
+    // The top region holds the keyframe list and the inspector. While the curve editor is OPEN you are working
+    // on curves, so it gives up more of the window before the graph starts losing height.
+    float cineMinTop = (sCurveEditorOpen && cineHasGraph) ? 118.0f : 160.0f;
     // Give the bottom exactly what it wants; only when the window is too short to fit both do we cap the top at its
     // minimum and let the bottom take the (smaller) remainder.
     float cineTopH = cineAvail.y - cineWantBottom - 8.0f;
