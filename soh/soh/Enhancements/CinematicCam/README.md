@@ -1,6 +1,8 @@
 # 🎥 Cinematic Camera for Ship of Harkinian
 
-A **cinematic camera toolkit** for [Ship of Harkinian](https://github.com/HarbourMasters/Shipwright) with everything you could need to make cool cinematics in the one and only OOT. At your disposal, you've got :
+Welcome ! I've been working on this mod for a while now with the help of Claude. We've been though many iterations and now it finally feels complete enough to release as a beta. All feedback is more than welcome !
+
+This is a full **cinematic camera toolkit** for [Ship of Harkinian](https://github.com/HarbourMasters/Shipwright) with everything you could need to make cool cinematics in this timeless game. At your disposal, you've got :
 
 - An easy to use, proper freecam mode
 - A full-fledged keyframe and path system, editable in 3D or via the UI
@@ -19,7 +21,7 @@ crane rather than snapped between poses.
 
 ---
 
-## ✨ What it does
+## What's in the box?
 
 ### The free camera
 
@@ -29,11 +31,11 @@ A fully detached, controller-driven camera that flies anywhere in the scene, ind
   and out of a shot.
 - **Inertia** : full control over how precise/cinematic you want the camera to be.
 - **Time control**, Slider for the day/night cycle, time freeze.
-- **Boost** and **precision** modifiers to glyde through hyrule at light speed.
+- **Boost** and **precision** modifiers to glide through hyrule at light speed.
 - Fully rebindable; sticks remap in SoH's normal Controller Configuration. I set my camera toggle to "select"
 
-> **📷 Image slot : `docs/media/freecam.gif`**
-> A few seconds of flying: boost across a field, then precision-crawl up to a detail.
+![Orbit+DayNight cycle](docs/media/DayNight.gif)
+
 
 ### Keyframes and the path
 
@@ -46,7 +48,7 @@ Fly to a pose, press **Add Keyframe**, repeat. The camera plays a smooth spline 
   - **Move** : drag the X/Y/Z axes to reposition it.
   - **Rotate (aim)** : drag rings for yaw / pitch / roll.
   - **Bend (path)** : rotate the spline's tangent to bend the curve through the point, without touching the aim.
-- **Per-keyframe shape** : per-side handle weights (how wide the curve bulges leaving vs arriving), or plain Linear.
+- **Per-keyframe shape** : Tension / Continuity / Bias, or plain Linear.
 - **Numeric fields** for exact position, yaw, pitch, roll and FOV. (they're useful, you'll need 'em)
 - **Six aim modes per keyframe**: free orientation, look at a point, look at **Link**, look at **any actor**
   (searchable, distance-sorted picker), look at the **shared movable target**, or **follow the path** like a
@@ -55,14 +57,11 @@ Fly to a pose, press **Add Keyframe**, repeat. The camera plays a smooth spline 
 - **Record from freecam** : not quite like an FPV drone but close enough, you record the path as you move.
 - **Smooth path** and **Normalize speed** clean up a hand-built or recorded path in one press. (or just a selection, important)
 - **Auto-orbit** : generate a circle or arc of keyframes around Link, an actor, the target or the camera, each
-  one already aimed at the centre. And if you wanna record a looped animation, you can even sync link's idle animation to the start of your timeline, to get a perfect loop every 8 seconds
+  one already aimed at the centre. And if you wanna record a looped animation, you can even sync link's idle animation to the start of your timeline, to get a perfect loop every 9 seconds
 
-> **📷 Image slot : `docs/media/world-overlay.png`**
-> A screenshot of the in-world overlay: the spline curve, numbered markers, and the move gizmo on a selected
-> keyframe. Ideally somewhere with depth so the curve reads in 3D.
+>![UI](docs/media/UI2.png)
 
-> **📷 Image slot : `docs/media/gizmos.gif`**
-> Dragging the three gizmo modes in turn — move, rotate (aim), bend (path) — so the difference is obvious.
+>![UI](docs/media/UI3.png)
 
 ### The timeline
 
@@ -76,8 +75,8 @@ Again, all the usual amenities :
 - **Automation lanes** underneath for every keyframed parameter.
 - Type a new **total duration**, or select a span and retime just that span.
 
-> **📷 Image slot — `docs/media/timeline.png`**
-> The timeline with several keyframes, a multi-selection, and at least one automation lane populated.
+![timeline](docs/media/timeline.png)
+
 
 ### The curve editor
 

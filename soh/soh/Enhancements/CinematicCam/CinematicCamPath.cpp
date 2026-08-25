@@ -6239,7 +6239,46 @@ static void SpeedHandlesUI(ImDrawList* dl, float gx0, float gx1, float gy0, floa
 // They used to disagree: the standalone one was capped at 126px while the channel one subtracted a five-line
 // footer, so keying a channel made the graph SHORTER, which is backwards - you key a channel precisely because
 // you want to look at it. Same minimum, same footer, no cap, both grow with the window.
-static const float kCurveGraphMinH = 200.0f;
+// The graph's height is YOURS: drag the grip under it. Persisted, so it survives a restart.
+static float CurveGraphH() {
+    float h = CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.CurveGraphH"), 200.0f);
+    return std::min(std::max(h, 90.0f), 700.0f);
+}
+
+// A grip under a graph: drag it to set the height, double-click to go back to the default. Drawn by both
+// graphs from this one function, so they resize the same way and share the one stored height.
+static void CurveGraphSplitter(const char* id) {
+    const float kGripH = 7.0f;
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    float w = std::max(ImGui::GetContentRegionAvail().x, 40.0f);
+    char btn[32];
+    snprintf(btn, sizeof(btn), "##grip%s", id);
+    ImGui::InvisibleButton(btn, ImVec2(w, kGripH));
+    bool hot = ImGui::IsItemHovered() || ImGui::IsItemActive();
+    if (hot) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+    }
+    if (ImGui::IsItemActive()) {
+        float nh = CurveGraphH() + ImGui::GetIO().MouseDelta.y;
+        CVarSetFloat(CVAR_ENHANCEMENT("CinematicCam.CurveGraphH"), std::min(std::max(nh, 90.0f), 700.0f));
+    }
+    if (ImGui::IsItemDeactivated()) {
+        CVarSave(); // one write when the drag ends, not one per frame of it
+    }
+    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && ImGui::IsItemHovered()) {
+        CVarSetFloat(CVAR_ENHANCEMENT("CinematicCam.CurveGraphH"), 200.0f);
+        CVarSave();
+    }
+    // Three short rules, brighter while grabbed - the standard "this edge moves" affordance.
+    ImU32 col = hot ? IM_COL32(200, 200, 210, 220) : IM_COL32(110, 110, 120, 160);
+    float cx = p0.x + w * 0.5f, cy = p0.y + kGripH * 0.5f;
+    for (int i = -1; i <= 1; i++) {
+        ImGui::GetWindowDrawList()->AddLine(ImVec2(cx - 14.0f, cy + i * 2.0f), ImVec2(cx + 14.0f, cy + i * 2.0f), col);
+    }
+    if (ImGui::IsItemHovered()) {
+        CineTooltip("Drag to set the graph's height (%.0f px). Double-click to reset.", CurveGraphH());
+    }
+}
 
 // Space kept below a graph for the toolbar row plus either the primary key's fields (one row) or the how-to
 // hint (two, three if the window is narrow). Fixed on purpose: letting it change flipped the window scrollbar,
@@ -6306,10 +6345,12 @@ static void DrawCurveEditor() {
             CVarSave();
         }
         if (ImGui::IsItemHovered()) {
-            CineTooltip("Debugging overlay: what the camera actually does over the timeline. Speed and Aim "
-                        "are rates read off the motion schedules; Pitch / Yaw / X / Y / Z are the values "
-                        "playback produces. Toggle channels below - each is scaled to its own range, printed "
-                        "in the legend.");
+            CineTooltip("What the camera actually does over the timeline, drawn behind the value curves.\n\n"
+                        "Speed is EDITABLE and is where you shape the pacing: drag a keyframe's point for "
+                        "how fast the camera is there, its handles for how it gets there. Aim is the view's "
+                        "turn rate, and Pitch / Yaw / X / Y / Z are the values playback produces - those "
+                        "five are read-outs, for diagnosing a move that feels wrong.\n\n"
+                        "Each channel is scaled to its own range, printed in the legend.");
         }
         if (spd) { // per-channel toggles, so the graph shows only what you're diagnosing
             int mask = SpeedGraphMask();
@@ -6325,6 +6366,10 @@ static void DrawCurveEditor() {
                     CVarSave();
                 }
                 ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered()) {
+                    CineTooltip("Show or hide this channel on the graph. A leading * means it is on. Speed is "
+                                "the editable one; the rest are read-outs.");
+                }
                 ImGui::PopID();
                 if (c < kSgCount - 1) {
                     ImGui::SameLine();
@@ -6360,7 +6405,7 @@ static void DrawCurveEditor() {
         ImGui::PopTextWrapPos();
         if (showSpeed && sKeyframes.size() >= 2) { // the speed graph stands on its own - no tracks needed
             // Same rule as the channel editor below, so turning a channel on never changes the height.
-            float sgH = std::max(ImGui::GetContentRegionAvail().y - CurveFooterH(), kCurveGraphMinH);
+            float sgH = std::max(ImGui::GetContentRegionAvail().y - CurveFooterH(), CurveGraphH());
             ImVec2 sz(std::max(ImGui::GetContentRegionAvail().x, 80.0f), sgH);
             ImVec2 q0 = ImGui::GetCursorScreenPos();
             ImGui::InvisibleButton("##speedgraph", sz);
@@ -6432,6 +6477,7 @@ static void DrawCurveEditor() {
             }
             sdl->PopClipRect();
             CineHint("Wheel: zoom time. Middle-drag: pan. Zoom right out to fit.");
+            CurveGraphSplitter("sg");
         }
         return;
     }
@@ -6540,7 +6586,7 @@ static void DrawCurveEditor() {
     // shifted under the cursor between the grab frame and the next one. A constant footer height means the
     // scrollbar can't flip, so the graph can't rescale.
     const float kFootH = CurveFooterH();
-    float graphH = std::max(ImGui::GetContentRegionAvail().y - kFootH, kCurveGraphMinH);
+    float graphH = std::max(ImGui::GetContentRegionAvail().y - kFootH, CurveGraphH());
     ImVec2 size(ImGui::GetContentRegionAvail().x, graphH);
     if (size.x < 80.0f) {
         size.x = 80.0f;
@@ -7148,6 +7194,7 @@ static void DrawCurveEditor() {
     }
     dl->PopClipRect();
 
+    CurveGraphSplitter("cv");
     // Toolbar + primary-key row, inside a child of FIXED height. The block below swaps between the key's
     // fields and the how-to hint as the selection changes; letting it change the window's total height was
     // what flipped the scrollbar and rescaled the graph mid-click (see kFootH above).
@@ -7161,6 +7208,11 @@ static void DrawCurveEditor() {
             }
             PushUndo();
             ParamSelOnly(AL.track, TrackAddKey(*AL.track, sPlayhead, v)); // select the new key
+        }
+        if (ImGui::IsItemHovered()) {
+            CineTooltip("Add a key to the active channel at the playhead, holding the value the curve already "
+                        "has there - so the shape does not jump. Double-clicking empty graph space does the "
+                        "same wherever you click.");
         }
         ImGui::SameLine();
         SnapToolbarUI("cv", gridT, gridV);
@@ -7183,6 +7235,10 @@ static void DrawCurveEditor() {
                 PushUndo();
                 DeleteSelectedParamKeys();
                 primIdx = -1; // computed before the erase - stale (same crash as the right-click delete)
+            }
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("Delete every selected key in this channel. Right-clicking a selected point does "
+                            "the same.");
             }
             ImGui::SameLine();
         }
@@ -7658,11 +7714,16 @@ void CinematicCamPathWindow::DrawElement() {
         }
     }
     static bool sCurveEditorOpen = false; // remembered from last frame to size the bottom region
+    static float sBottomPreCurveH = 0.0f; // measured last frame: everything above the curve editor
     // Reserve the bottom region for everything it actually holds - the dope-sheet timeline, the separator + the
     // "Curve editor" collapsing header, and (when open) the curve editor itself - then give the top the remainder.
     // The earlier estimate under-budgeted the header, so the bottom child scrolled and clipped it behind the edge.
-    float cineTimelineH = (15.0f + 22.0f * cineLanes + 6.0f) + 80.0f; // dope-sheet canvas + toolbar + hint row
-    float cineHeaderH = 34.0f;                                        // separator + "Curve editor" header + spacing
+    // Measured last frame (see sBottomPreCurveH below): the dope sheet, its toolbar, its hint - however many
+    // lines that wrapped to - plus the separator and the "Curve editor" header. The first frame has nothing to
+    // go on, so it falls back to an estimate.
+    float cineTimelineH =
+        (sBottomPreCurveH > 1.0f) ? sBottomPreCurveH : (15.0f + 22.0f * cineLanes + 6.0f) + 80.0f + 34.0f;
+    float cineHeaderH = 0.0f; // folded into the measurement above
     // With no curve to show (no continuous track enabled) the open editor is just the camera key-row + a hint,
     // so only reserve that much instead of leaving a large empty region.
     bool cineHaveCurves = false;
@@ -7678,7 +7739,7 @@ void CinematicCamPathWindow::DrawElement() {
     // With no graph at all to draw it is just a key row and a hint, so only reserve that.
     bool cineSpeedGraph = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.SpeedGraph"), 0) != 0;
     bool cineHasGraph = cineHaveCurves || cineSpeedGraph;
-    float cineCurveH = cineHasGraph ? (CurveHeaderRowsH() + kCurveGraphMinH + CurveFooterH() + 12.0f) : 84.0f;
+    float cineCurveH = cineHasGraph ? (CurveHeaderRowsH() + CurveGraphH() + CurveFooterH() + 12.0f) : 84.0f;
     float cineWantBottom = cineTimelineH + cineHeaderH + (sCurveEditorOpen ? cineCurveH : 0.0f);
     // The top region holds the keyframe list and the inspector. While the curve editor is OPEN you are working
     // on curves, so it gives up more of the window before the graph starts losing height.
@@ -7734,6 +7795,11 @@ void CinematicCamPathWindow::DrawElement() {
         float h = CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.SpectateHeight"), 40.0f);
         if (ImGui::SliderFloat("Eye height", &h, -100.0f, 200.0f, "%.2f", ImGuiSliderFlags_NoRoundToFormat)) {
             CVarSetFloat(CVAR_ENHANCEMENT("CinematicCam.SpectateHeight"), h);
+        }
+        if (ImGui::IsItemHovered()) {
+            CineTooltip("How far above the actor's origin the camera sits, in world units. With \"Ride the "
+                        "focus point\" on you usually want this LOWER - the focus point is already up "
+                        "at the head.");
         }
         CineHint("Locks the camera to the actor's viewpoint (aimed along its facing). "
                  "The world keeps running so you see what it sees.");
@@ -7956,9 +8022,15 @@ void CinematicCamPathWindow::DrawElement() {
             if (ImGui::Button("Face camera")) {
                 CinematicCam_FaceLinkToCamera(0);
             }
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("Turn Link to look straight down the lens.");
+            }
             ImGui::SameLine();
             if (ImGui::Button("Face away")) {
                 CinematicCam_FaceLinkToCamera(1);
+            }
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("Turn Link to face directly away from the camera - the over-the-shoulder pose.");
             }
             ImGui::EndGroup();
             CineHint("Drag the dial or type degrees to aim Link. Best while he stands idle.");
@@ -7986,6 +8058,9 @@ void CinematicCamPathWindow::DrawElement() {
     ImGui::SameLine();
     if (ImGui::Button("Clear")) {
         ClearPath();
+    }
+    if (ImGui::IsItemHovered()) {
+        CineTooltip("Delete every keyframe and start from nothing. Ctrl+Z brings them back.");
     }
 
     // Copy / paste / insert at the playhead.
@@ -8030,18 +8105,29 @@ void CinematicCamPathWindow::DrawElement() {
             RecordKeyframe(0.0f); // first keyframe at t=0
         }
         ImGui::EndDisabled();
-        if (ImGui::IsItemHovered() && !enabled) {
-            CineTooltip("Enable the free camera first.");
+        if (ImGui::IsItemHovered()) {
+            CineTooltip(!enabled ? "Enable the free camera first."
+                                 : "Fly the move and have keyframes laid down for you at the interval "
+                                   "beside this button.\n\nThis REPLACES the path: every existing "
+                                   "keyframe is cleared when recording starts (Ctrl+Z undoes that). Expect a "
+                                   "lot of keyframes - Smooth path and Normalize speed are the cleanup.");
         }
     } else {
         if (ImGui::Button("Stop recording")) {
             sRecording = false;
             SelectOnly(sIds.empty() ? -1 : sIds[0]);
         }
+        if (ImGui::IsItemHovered()) {
+            CineTooltip("Finish the take. The keyframes stay exactly as recorded until you edit them.");
+        }
     }
     ImGui::SameLine();
     ImGui::SetNextItemWidth(150.0f);
     ImGui::SliderFloat("Rec interval", &sRecordInterval, 0.05f, 1.0f, "%.2fs");
+    if (ImGui::IsItemHovered()) {
+        CineTooltip("Seconds between recorded keyframes. Shorter follows your flying more faithfully and "
+                    "leaves more keyframes to tidy up; 0.2s is a reasonable middle.");
+    }
     if (sRecording) {
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "REC %.1fs (%d)", sRecordTime, (int)sKeyframes.size());
@@ -8130,9 +8216,19 @@ void CinematicCamPathWindow::DrawElement() {
             const char* centers[] = { "Link", "Actor", "Target", "Camera" };
             ImGui::SetNextItemWidth(110.0f);
             ImGui::Combo("Around", &oCenter, centers, 4);
+            if (ImGui::IsItemHovered()) {
+                CineTooltip(
+                    "What the orbit circles: Link, a chosen actor, the shared aim target, or the point the free "
+                    "camera is looking at right now.");
+            }
             ImGui::SameLine();
             ImGui::SetNextItemWidth(120.0f);
             ImGui::SliderInt("Points", &oCount, 3, 32);
+            if (ImGui::IsItemHovered()) {
+                CineTooltip(
+                    "How many keyframes the ring is built from. More follows a true circle more closely; fewer is "
+                    "easier to edit afterwards. Eight is plenty for a full turn.");
+            }
             if (oCenter == 1) { // actor: pick which one
                 ImGui::Text("Actor: %s (id %d)", oActorName[0] ? oActorName : "(none)", oActorId);
                 ImGui::SameLine();
@@ -8153,14 +8249,27 @@ void CinematicCamPathWindow::DrawElement() {
             }
             ImGui::SetNextItemWidth(110.0f);
             ImGui::DragFloat("Radius", &oRadius, 1.0f, 10.0f, 8000.0f, "%.2f", ImGuiSliderFlags_NoRoundToFormat);
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("Distance from the centre, in world units.");
+            }
             ImGui::SameLine();
             ImGui::SetNextItemWidth(110.0f);
             ImGui::DragFloat("Height", &oHeight, 1.0f, -1000.0f, 2000.0f, "%.2f", ImGuiSliderFlags_NoRoundToFormat);
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("How far above the centre the ring sits. Negative looks up at it from below.");
+            }
             ImGui::SetNextItemWidth(110.0f);
             ImGui::SliderFloat("Arc", &oArc, 30.0f, 360.0f, "%.2f deg", ImGuiSliderFlags_NoRoundToFormat);
+            if (ImGui::IsItemHovered()) {
+                CineTooltip(
+                    "How much of a circle to cover. A full 360 turns looping on, so the move repeats seamlessly.");
+            }
             ImGui::SameLine();
             ImGui::SetNextItemWidth(110.0f);
             ImGui::SliderFloat("Seconds", &oDur, 1.0f, 60.0f, "%.1f");
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("How long the whole orbit takes. You can retime it afterwards like any other path.");
+            }
             if (oCenter == 0 || oCenter == 1) {
                 ImGui::Checkbox("Follow it as it moves", &oFollow);
                 if (ImGui::IsItemHovered()) {
@@ -8293,6 +8402,10 @@ void CinematicCamPathWindow::DrawElement() {
                     sKeyframes[sel].tanWOut = 0.0f;
                     sKeyframes[sel].tanWIn = 0.0f;
                 }
+                if (ImGui::IsItemHovered()) {
+                    CineTooltip("Put this keyframe back on the automatic curve - clears its custom direction and "
+                                "both handle weights. The * beside it in the keyframe list goes away.");
+                }
             }
         } else {
             CineHint("Enable 'Show path in world' to use the move/rotate/bend gizmo.");
@@ -8300,6 +8413,11 @@ void CinematicCamPathWindow::DrawElement() {
 
         float t = sKeyframes[sel].time;
         bool changed = ImGui::InputFloat("Keyframe time (s)", &t, 0.1f, 1.0f, "%.2f");
+        if (ImGui::IsItemHovered()) {
+            CineTooltip("When the camera reaches this keyframe. Moving it in time never bends the path - the "
+                        "shape comes only from WHERE the keyframes are - it just redistributes how fast the "
+                        "camera travels either side of it.");
+        }
         if (ImGui::IsItemActivated()) {
             PushUndo(); // snapshot pre-edit state so the whole edit is one undo step
         }
@@ -8317,6 +8435,10 @@ void CinematicCamPathWindow::DrawElement() {
             sPreview = true;
             CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
         }
+        if (ImGui::IsItemHovered()) {
+            CineTooltip("Park the playhead on this keyframe and preview it, so the camera sits exactly "
+                        "where the shot passes through here.");
+        }
 
         // Per-keyframe interpolation (shapes the segment leaving this keyframe toward the next).
         const char* interpModes[] = { "Smooth (spline)", "Linear" };
@@ -8324,6 +8446,12 @@ void CinematicCamPathWindow::DrawElement() {
         if (ImGui::Combo("Interpolation", &mode, interpModes, 2)) {
             PushUndo();
             sKeyframes[sel].interp = mode;
+        }
+        if (ImGui::IsItemHovered()) {
+            CineTooltip("How the path leaves this keyframe toward the next one. Smooth is a curve through it "
+                        "with no corner; Linear is a straight line, which shows a visible kink at both ends "
+                        "unless a kink is what you want.\n\nShape a Smooth keyframe with the two weights "
+                        "below, or by dragging its handles with the Bend gizmo.");
         }
         if (sKeyframes[sel].interp == CINE_INTERP_SMOOTH) {
             TangentWeightUI(sel, "kf");
@@ -8389,6 +8517,10 @@ void CinematicCamPathWindow::DrawElement() {
                     sKeyframes[sel].at[1] = p[1];
                     sKeyframes[sel].at[2] = p[2];
                 }
+            }
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("Drop the look-at point on Link where he stands right now. A fixed point, not a live "
+                            "track - use the \"Look at Link\" aim mode if you want it to follow him.");
             }
             CineHint("Drag the orange crosshair in the world to place the target.");
         } else if (sKeyframes[sel].aimMode == CINE_AIM_PLAYER) {
@@ -8456,6 +8588,10 @@ void CinematicCamPathWindow::DrawElement() {
 
         // Numeric fields: type exact position/orientation values for the selected keyframe.
         ImGui::Checkbox("Numeric fields", &sShowFields);
+        if (ImGui::IsItemHovered()) {
+            CineTooltip("Type this keyframe's exact position, yaw, pitch, roll and FOV instead of dragging for "
+                        "them. What you reach for when matching two shots, or levelling a horizon.");
+        }
         if (sShowFields) {
             CineKeyframe& kf = sKeyframes[sel];
 
@@ -8551,11 +8687,19 @@ void CinematicCamPathWindow::DrawElement() {
     ImGui::EndDisabled();
     ImGui::SameLine();
     ImGui::Checkbox("Loop", &sLoop);
+    if (ImGui::IsItemHovered()) {
+        CineTooltip("Repeat the move instead of stopping at the last keyframe. Choose the style below - Forward glides "
+                    "back to the start over the Return time, Ping-pong plays it backwards.");
+    }
     ImGui::SameLine();
     if (ImGui::Checkbox("Preview", &sPreview)) {
         if (sPreview) {
             CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
         }
+    }
+    if (ImGui::IsItemHovered()) {
+        CineTooltip("Put the camera on the path at the playhead so scrubbing the timeline shows the shot. "
+                    "Turn it off to fly the free camera again without losing the path.");
     }
 
     bool controlLink = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.PlaybackControlsLink"), 0);
@@ -8603,6 +8747,10 @@ void CinematicCamPathWindow::DrawElement() {
             ImGui::SameLine();
             ImGui::SetNextItemWidth(140.0f);
             ImGui::SliderFloat("Return (s)", &sLoopReturnTime, 0.25f, 10.0f, "%.2fs");
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("How long the camera takes to glide from the last keyframe back to the first. It is a real "
+                            "segment of the timeline, not a cut - it shows on the ruler and the speed graph.");
+            }
             if (sLoopReturnTime < 0.0f) {
                 sLoopReturnTime = 0.0f;
             }
@@ -8665,13 +8813,29 @@ void CinematicCamPathWindow::DrawElement() {
     if (sShakeEnabled) {
         ImGui::SetNextItemWidth(130.0f);
         ImGui::SliderFloat("Position##shake", &sShakePosAmp, 0.0f, 30.0f, "%.1f");
+        if (ImGui::IsItemHovered()) {
+            CineTooltip("How far the camera is jostled, in world units. A few units reads as handheld; large values "
+                        "read as an earthquake.");
+        }
         ImGui::SameLine();
         ImGui::SetNextItemWidth(130.0f);
         ImGui::SliderFloat("Angle##shake", &sShakeRotAmp, 0.0f, 5.0f, "%.2f deg");
+        if (ImGui::IsItemHovered()) {
+            CineTooltip(
+                "How far the AIM is jostled. A fraction of a degree is plenty - the view is the part an audience "
+                "notices.");
+        }
         ImGui::SetNextItemWidth(130.0f);
         ImGui::SliderFloat("Frequency##shake", &sShakeFreq, 0.5f, 20.0f, "%.1f Hz");
+        if (ImGui::IsItemHovered()) {
+            CineTooltip("How fast the jitter moves. Low is a slow drifting float, high is a nervous rattle.");
+        }
         ImGui::SameLine();
         ImGui::Checkbox("In preview too", &sShakeOnPreview);
+        if (ImGui::IsItemHovered()) {
+            CineTooltip(
+                "Shake while scrubbing and previewing, not only during Play, so what you frame is what you get.");
+        }
     }
 
     // Hide HUD (keyframable): reveal or hide the HUD over a shot. Manual checkbox drives the CVar; with the track
@@ -8869,6 +9033,12 @@ void CinematicCamPathWindow::DrawElement() {
     DrawTimeline();
     ImGui::Separator();
     sCurveEditorOpen = ImGui::CollapsingHeader("Curve editor");
+    // How tall everything ABOVE the curve editor actually came out, measured. The budget above used to guess
+    // this with a magic 80px for "toolbar + hint row", and every time one of those hints gained a line the
+    // guess went stale and pushed the "Curve editor" header off the bottom edge - twice now. The graph's own
+    // height is deliberately NOT measured here: that one we choose, and feeding it back would make the region
+    // grow itself a little larger every frame.
+    sBottomPreCurveH = ImGui::GetCursorPosY() + ImGui::GetStyle().WindowPadding.y;
     if (sCurveEditorOpen) {
         DrawCurveEditor();
     }
