@@ -948,8 +948,7 @@ static void AutoAccel(float p0, float p1, float m0, float m1, float* c0, float* 
 // noPrev / noNext: p0 / p3 is a duplicated clamp point (no real neighbor on that side), so its zero-length
 // secant must not participate in the overshoot guard - otherwise every path would be forced to start/end at rest.
 static void NuKbTangents(const float* p0, const float* p1, const float* p2, const float* p3, float t01, float t12,
-                         float t23, float tB, float cB, float bB, float tC, float cC, float bC, float* mOut, float* mIn,
-                         bool noPrev, bool noNext) {
+                         float t23, float* mOut, float* mIn, bool noPrev, bool noNext) {
     if (t01 < 1e-5f) {
         t01 = 1e-5f;
     }
@@ -966,8 +965,8 @@ static void NuKbTangents(const float* p0, const float* p1, const float* p2, cons
         float sIn = (p1[k] - p0[k]) / t01; // one-sided secant velocities
         float sOut = (p2[k] - p1[k]) / t12;
         float sFar = (p3[k] - p2[k]) / t23;
-        float vOut = (1.0f - tB) * (wInO * (1.0f + cB) * (1.0f + bB) * sIn + wOutO * (1.0f - cB) * (1.0f - bB) * sOut);
-        float vIn = (1.0f - tC) * (wMidI * (1.0f - cC) * (1.0f + bC) * sOut + wFarI * (1.0f + cC) * (1.0f - bC) * sFar);
+        float vOut = wInO * sIn + wOutO * sOut; // the t=c=b=0 case of Kochanek-Bartels, i.e. Catmull-Rom
+        float vIn = wMidI * sOut + wFarI * sFar;
         mOut[k] = vOut * t12;
         mIn[k] = vIn * t12;
         lIn += sIn * sIn;
@@ -1004,8 +1003,8 @@ static void NuKbTangents(const float* p0, const float* p1, const float* p2, cons
 // The two Hermite endpoint slopes for a scalar segment p1->p2 (non-uniform Kochanek-Bartels), already scaled
 // to the [0,1] segment parameter. Split out from NuKbScalar so callers that need to OVERRIDE a slope (the aim
 // channels, which expose per-keyframe tangent modes) can start from the automatic value.
-static void NuKbScalarSlopes(float p0, float p1, float p2, float p3, float t01, float t12, float t23, float tB,
-                             float cB, float bB, float tC, float cC, float bC, bool monotone, float* mOut, float* mIn) {
+static void NuKbScalarSlopes(float p0, float p1, float p2, float p3, float t01, float t12, float t23, bool monotone,
+                             float* mOut, float* mIn) {
     if (t01 < 1e-5f) {
         t01 = 1e-5f;
     }
@@ -1018,8 +1017,8 @@ static void NuKbScalarSlopes(float p0, float p1, float p2, float p3, float t01, 
     float wInO = t12 / (t01 + t12), wOutO = t01 / (t01 + t12);
     float wMidI = t23 / (t12 + t23), wFarI = t12 / (t12 + t23);
     float sIn = (p1 - p0) / t01, sOut = (p2 - p1) / t12, sFar = (p3 - p2) / t23;
-    float vOut = (1.0f - tB) * (wInO * (1.0f + cB) * (1.0f + bB) * sIn + wOutO * (1.0f - cB) * (1.0f - bB) * sOut);
-    float vIn = (1.0f - tC) * (wMidI * (1.0f - cC) * (1.0f + bC) * sOut + wFarI * (1.0f + cC) * (1.0f - bC) * sFar);
+    float vOut = wInO * sIn + wOutO * sOut; // (this is the t=c=b=0 case of Kochanek-Bartels, i.e. Catmull-Rom)
+    float vIn = wMidI * sOut + wFarI * sFar;
 
     // Monotone limiting (Fritsch-Carlson): clamp each endpoint slope to the local secants so a 1D channel never
     // overshoots or bleeds past its adjacent keyframes - a big roll spike on one keyframe stays in its two
@@ -1045,10 +1044,10 @@ static void NuKbScalarSlopes(float p0, float p1, float p2, float p3, float t01, 
 
 // Scalar form of the non-uniform Kochanek-Bartels evaluation (for the 1D channels: roll and FOV), so they
 // interpolate as smoothly as the eye path - no stiff/quick swing when a turn and an aim change coincide.
-static float NuKbScalar(float p0, float p1, float p2, float p3, float t01, float t12, float t23, float tB, float cB,
-                        float bB, float tC, float cC, float bC, float s, bool monotone) {
+static float NuKbScalar(float p0, float p1, float p2, float p3, float t01, float t12, float t23, float s,
+                        bool monotone) {
     float mOut, mIn;
-    NuKbScalarSlopes(p0, p1, p2, p3, t01, t12, t23, tB, cB, bB, tC, cC, bC, monotone, &mOut, &mIn);
+    NuKbScalarSlopes(p0, p1, p2, p3, t01, t12, t23, monotone, &mOut, &mIn);
     return Hermite1(p1, p2, mOut, mIn, s);
 }
 
@@ -1081,8 +1080,7 @@ static void AimAngleSlopes(float p0, float p1, float p2, float p3, float t01, fl
     if (noNext) {
         p3 = p2 + (p2 - p1) * (t23 / std::max(t12, 1e-5f));
     }
-    NuKbScalarSlopes(p0, p1, p2, p3, t01, t12, t23, b.tension, b.continuity, b.bias, c.tension, c.continuity, c.bias,
-                     false, mOut, mIn);
+    NuKbScalarSlopes(p0, p1, p2, p3, t01, t12, t23, false, mOut, mIn);
     if (b.hasAimTanOut) {
         *mOut = exOut;
     }
@@ -1105,8 +1103,7 @@ static float InterpComp(float p0, float p1, float p2, float p3, const CineKeyfra
     if (kSrc.interp == CINE_INTERP_LINEAR) {
         return p1 + (p2 - p1) * s;
     }
-    return NuKbScalar(p0, p1, p2, p3, t01, t12, t23, kSrc.tension, kSrc.continuity, kSrc.bias, kDst.tension,
-                      kDst.continuity, kDst.bias, s, true);
+    return NuKbScalar(p0, p1, p2, p3, t01, t12, t23, s, true);
 }
 
 // Duration (seconds) of the path segment that starts at keyframe index j and runs to the next one cyclically.
@@ -1154,8 +1151,7 @@ static void EyeSegmentTangents(int i1, int i2, float td[3], float ts[3]) {
     float t12 = chordKnot(b.eye, c.eye);
     float t01 = (i0 != i1) ? chordKnot(a.eye, b.eye) : t12;
     float t23 = (i2 != i3) ? chordKnot(c.eye, d.eye) : t12;
-    NuKbTangents(a.eye, b.eye, c.eye, d.eye, t01, t12, t23, b.tension, b.continuity, b.bias, c.tension, c.continuity,
-                 c.bias, td, ts, i0 == i1, i2 == i3);
+    NuKbTangents(a.eye, b.eye, c.eye, d.eye, t01, t12, t23, td, ts, i0 == i1, i2 == i3);
     if (b.hasTangent) {
         float m = v3len(td);
         td[0] = b.tangent[0] * m;
@@ -2216,9 +2212,6 @@ static uint32_t PathShapeHash() {
         h = HashF32(h, k.roll);
         h = HashF32(h, k.fov);
         h = HashF32(h, (float)k.interp);
-        h = HashF32(h, k.tension);
-        h = HashF32(h, k.continuity);
-        h = HashF32(h, k.bias);
         h = HashF32(h, (float)k.hasTangent);
         h = HashF32(h, k.tangent[0]);
         h = HashF32(h, k.tangent[1]);
@@ -3071,7 +3064,7 @@ static void TrackFromJson(CineParamTrack& t, const nlohmann::json& j) {
 // either read the old form correctly or say plainly what was dropped. Version 0 (no field) means a file from
 // before this line existed - those carry per-keyframe ease and deg/s aim rates, both of which mean something
 // different now, so they load with those values left automatic rather than misinterpreted.
-static const int kPathFormatVersion = 1;
+static const int kPathFormatVersion = 2;
 
 // Write the whole path to cinematics/<base>.json. `bindEntrance` updates the path-bound location from the
 // current scene (manual saves only - the autosave must not silently rebind or unbind it).
@@ -3084,9 +3077,6 @@ static void SavePathTo(const char* base, bool bindEntrance) {
                         { "roll", k.roll },
                         { "fov", k.fov },
                         { "interp", k.interp },
-                        { "tension", k.tension },
-                        { "continuity", k.continuity },
-                        { "bias", k.bias },
                         { "hasTangent", k.hasTangent },
                         { "tangent", { k.tangent[0], k.tangent[1], k.tangent[2] } },
                         { "hasTangentIn", k.hasTangentIn },
@@ -3200,6 +3190,7 @@ static void LoadPath() {
             }
         }
     }
+    int droppedTcb = 0; // keyframes whose retired Tension/Continuity/Bias values were discarded
     for (auto& e : *arr) {
         CineKeyframe k{};
         k.time = e.value("time", 0.0f);
@@ -3212,9 +3203,14 @@ static void LoadPath() {
         k.roll = e.value("roll", 0.0f);
         k.fov = e.value("fov", 60.0f);
         k.interp = e.value("interp", 0);
-        k.tension = e.value("tension", 0.0f);
-        k.continuity = e.value("continuity", 0.0f);
-        k.bias = e.value("bias", 0.0f);
+        // Tension / Continuity / Bias are GONE (format 2). They are deliberately not read: they used to steer
+        // the eye path, the aim, the roll AND the FOV from one slider, and the per-side tangent weights below
+        // do the spatial half properly. A path that carried non-zero values will move differently - and the
+        // load message says so rather than letting it be a mystery.
+        if (std::fabs(e.value("tension", 0.0f)) > 1e-4f || std::fabs(e.value("continuity", 0.0f)) > 1e-4f ||
+            std::fabs(e.value("bias", 0.0f)) > 1e-4f) {
+            droppedTcb++;
+        }
         k.hasTangent = e.value("hasTangent", 0);
         if (e.contains("tangent")) {
             k.tangent[0] = e["tangent"][0];
@@ -3302,10 +3298,15 @@ static void LoadPath() {
                  "Loaded %s.json (%d keyframes) - saved by a NEWER build; "
                  "anything it added was ignored",
                  sFilename, (int)sKeyframes.size());
+    } else if (droppedTcb > 0) {
+        snprintf(sFileStatus, sizeof(sFileStatus),
+                 "Loaded %s.json (%d keyframes) - Tension/Continuity/Bias dropped on %d; use the per-side "
+                 "Out/In weight instead",
+                 sFilename, (int)sKeyframes.size(), droppedTcb);
     } else if (fileVer < kPathFormatVersion) {
         snprintf(sFileStatus, sizeof(sFileStatus),
-                 "Loaded %s.json (%d keyframes) - older format: per-keyframe ease and baked aim rates are "
-                 "automatic now",
+                 "Loaded %s.json (%d keyframes) - older format: per-keyframe ease, Tension/Continuity/Bias and "
+                 "baked aim rates are automatic now",
                  sFilename, (int)sKeyframes.size());
     } else {
         snprintf(sFileStatus, sizeof(sFileStatus), "Loaded %s.json (%d keyframes)", sFilename, (int)sKeyframes.size());
@@ -7387,6 +7388,59 @@ static void DrawShootingBar() {
     ImGui::TextColored(col, "%d kf", (int)sKeyframes.size());
 }
 
+// Per-side tangent WEIGHT: how far the curve bulges on each side of a keyframe - the handle length, stored
+// relative to the automatic one so moving the keyframe rescales it naturally instead of leaving a stale
+// absolute bulge behind. 1.0 = automatic, and it STORES as 0 at 1.0 so merely touching a slider does not pin
+// the keyframe.
+//
+// This replaced Tension, which scaled both sides together and, through Kochanek-Bartels, also steered the aim,
+// the roll and the FOV from the same number. Drawn from one function because it appears both here and in the
+// Bend gizmo's panel, and two copies of a control are two things to keep in step.
+static void TangentWeightUI(int sel, const char* idSuffix) {
+    CineKeyframe& k = sKeyframes[sel];
+    float wo = (k.tanWOut > 0.0f) ? k.tanWOut : 1.0f;
+    float wi = (k.tanWIn > 0.0f) ? k.tanWIn : 1.0f;
+    char lo[32], li[32];
+    snprintf(lo, sizeof(lo), "Out weight##%s", idSuffix);
+    snprintf(li, sizeof(li), "In weight##%s", idSuffix);
+    ImGui::SetNextItemWidth(110.0f);
+    ImGui::SliderFloat(lo, &wo, 0.2f, 3.0f, "%.2f");
+    if (ImGui::IsItemActivated()) {
+        PushUndo();
+    }
+    if (ImGui::IsItemActive() || ImGui::IsItemDeactivatedAfterEdit()) {
+        k.tanWOut = (std::fabs(wo - 1.0f) < 0.01f) ? 0.0f : wo;
+    }
+    bool hov = ImGui::IsItemHovered();
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(110.0f);
+    ImGui::SliderFloat(li, &wi, 0.2f, 3.0f, "%.2f");
+    if (ImGui::IsItemActivated()) {
+        PushUndo();
+    }
+    if (ImGui::IsItemActive() || ImGui::IsItemDeactivatedAfterEdit()) {
+        k.tanWIn = (std::fabs(wi - 1.0f) < 0.01f) ? 0.0f : wi;
+    }
+    if (hov || ImGui::IsItemHovered()) {
+        CineTooltip("How far the curve bulges on each side of this keyframe - the handle length. Out is the "
+                    "side leaving toward the next keyframe, In the side arriving from the previous one. Above "
+                    "1 rounds the corner wider, below 1 pulls it tighter; 1.00 is automatic.");
+    }
+    if ((k.tanWOut > 0.0f || k.tanWIn > 0.0f)) {
+        ImGui::SameLine();
+        char rb[32];
+        snprintf(rb, sizeof(rb), "Auto##w%s", idSuffix);
+        if (ImGui::SmallButton(rb)) {
+            PushUndo();
+            k.tanWOut = 0.0f;
+            k.tanWIn = 0.0f;
+        }
+        if (ImGui::IsItemHovered()) {
+            CineTooltip("Back to automatic handle lengths on both sides.");
+        }
+    }
+}
+
 void CinematicCamPathWindow::DrawElement() {
     double cinePerfT0 = sPerfOn ? CineNowMs() : 0.0; // perf probe: time the whole editor draw (see CinePerf notes)
     if (sPerfOn) {
@@ -8211,36 +8265,7 @@ void CinematicCamPathWindow::DrawElement() {
                              "curve arriving from the previous one (teal). Editing one side breaks the "
                              "handle so the path can turn a corner here; Both keeps/rotates them rigidly.");
                 }
-                // Side weights: how far the curve bulges on each side of this keyframe (a scalable Bezier
-                // handle, the "tension per side" control). 1.0 = the automatic length; relative, so it stays
-                // sensible when the keyframe moves. Drag the handle DOTS in the world to steer direction.
-                {
-                    CineKeyframe& kfb = sKeyframes[sel];
-                    float wo = (kfb.tanWOut > 0.0f) ? kfb.tanWOut : 1.0f;
-                    float wi = (kfb.tanWIn > 0.0f) ? kfb.tanWIn : 1.0f;
-                    // Neutral (1.0) stores as 0 = automatic, so merely touching a slider doesn't pin the key.
-                    ImGui::SetNextItemWidth(110.0f);
-                    ImGui::SliderFloat("Out weight", &wo, 0.2f, 3.0f, "%.2f");
-                    if (ImGui::IsItemActivated()) {
-                        PushUndo();
-                    }
-                    if (ImGui::IsItemActive() || ImGui::IsItemDeactivatedAfterEdit()) {
-                        kfb.tanWOut = (std::fabs(wo - 1.0f) < 0.01f) ? 0.0f : wo;
-                    }
-                    ImGui::SameLine();
-                    ImGui::SetNextItemWidth(110.0f);
-                    ImGui::SliderFloat("In weight", &wi, 0.2f, 3.0f, "%.2f");
-                    if (ImGui::IsItemActivated()) {
-                        PushUndo();
-                    }
-                    if (ImGui::IsItemActive() || ImGui::IsItemDeactivatedAfterEdit()) {
-                        kfb.tanWIn = (std::fabs(wi - 1.0f) < 0.01f) ? 0.0f : wi;
-                    }
-                    if (ImGui::IsItemHovered()) {
-                        CineTooltip("How strongly each side of this keyframe shapes the curve (handle length). "
-                                    "Works with or without a custom direction.");
-                    }
-                }
+                TangentWeightUI(sel, "bend");
                 bool pinned = sKeyframes[sel].hasTangent || sKeyframes[sel].hasTangentIn ||
                               sKeyframes[sel].tanWOut > 0.0f || sKeyframes[sel].tanWIn > 0.0f;
                 if (pinned && ImGui::SmallButton("Reset tangent")) {
@@ -8283,43 +8308,7 @@ void CinematicCamPathWindow::DrawElement() {
             sKeyframes[sel].interp = mode;
         }
         if (sKeyframes[sel].interp == CINE_INTERP_SMOOTH) {
-            float tens = sKeyframes[sel].tension;
-            ImGui::SliderFloat("Tension", &tens, -1.0f, 1.0f, "%.2f");
-            if (ImGui::IsItemActivated()) {
-                PushUndo();
-            }
-            if (ImGui::IsItemHovered()) {
-                CineTooltip("Higher = tighter/straighter through the keyframe; lower = rounder, wider arcs.");
-            }
-            sKeyframes[sel].tension = tens;
-
-            float cont = sKeyframes[sel].continuity;
-            ImGui::SliderFloat("Continuity", &cont, -1.0f, 1.0f, "%.2f");
-            if (ImGui::IsItemActivated()) {
-                PushUndo();
-            }
-            if (ImGui::IsItemHovered()) {
-                CineTooltip("0 = smooth pass-through; away from 0 sharpens the corner at the keyframe.");
-            }
-            sKeyframes[sel].continuity = cont;
-
-            float bias = sKeyframes[sel].bias;
-            ImGui::SliderFloat("Bias", &bias, -1.0f, 1.0f, "%.2f");
-            if (ImGui::IsItemActivated()) {
-                PushUndo();
-            }
-            if (ImGui::IsItemHovered()) {
-                CineTooltip("Lean the curve toward the previous (+) or the next (-) keyframe (overshoot/undershoot).");
-            }
-            sKeyframes[sel].bias = bias;
-
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Reset")) {
-                PushUndo();
-                sKeyframes[sel].tension = 0.0f;
-                sKeyframes[sel].continuity = 0.0f;
-                sKeyframes[sel].bias = 0.0f;
-            }
+            TangentWeightUI(sel, "kf");
         }
 
         CineHint("Ease: shape it on the Speed curve - tick 'Speed graph' at the top of the Curve editor, then "

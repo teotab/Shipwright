@@ -10,12 +10,12 @@ A **cinematic camera toolkit** for [Ship of Harkinian](https://github.com/Harbou
 Fly anywhere, frame the shot, drop keyframes, and play back a move that actually looks like it was shot on a
 crane rather than snapped between poses.
 
-> **Status — release candidate for 1.0.** The free camera, path editor, curve editor and presentation tools are
+> **Status : release candidate for 1.0.** The free camera, path editor, curve editor and presentation tools are
 > all in and stable. A scripted multi-path **cutscene system** (sequencing + triggers) is the next milestone.
 
-> **📷 Image slot — `docs/media/hero.gif`**
+> **📷 Image slot : `docs/media/hero.gif`**
 > A 10–15 s loop of a finished move: a slow push-in through a landmark scene, letterbox on, HUD hidden.
-> This is the "why you'd want this" shot — it should look like footage, not like a tool.
+> This is the "why you'd want this" shot : it should look like footage, not like a tool.
 
 ---
 
@@ -30,9 +30,9 @@ A fully detached, controller-driven camera that flies anywhere in the scene, ind
 - **Inertia** : full control over how precise/cinematic you want the camera to be.
 - **Time control**, Slider for the day/night cycle, time freeze.
 - **Boost** and **precision** modifiers to glyde through hyrule at light speed.
-- Fully rebindable; sticks remap in SoH's normal Controller Configuration.
+- Fully rebindable; sticks remap in SoH's normal Controller Configuration. I set my camera toggle to "select"
 
-> **📷 Image slot — `docs/media/freecam.gif`**
+> **📷 Image slot : `docs/media/freecam.gif`**
 > A few seconds of flying: boost across a field, then precision-crawl up to a detail.
 
 ### Keyframes and the path
@@ -46,7 +46,7 @@ Fly to a pose, press **Add Keyframe**, repeat. The camera plays a smooth spline 
   - **Move** : drag the X/Y/Z axes to reposition it.
   - **Rotate (aim)** : drag rings for yaw / pitch / roll.
   - **Bend (path)** : rotate the spline's tangent to bend the curve through the point, without touching the aim.
-- **Per-keyframe shape** : Tension / Continuity / Bias, or plain Linear.
+- **Per-keyframe shape** : per-side handle weights (how wide the curve bulges leaving vs arriving), or plain Linear.
 - **Numeric fields** for exact position, yaw, pitch, roll and FOV. (they're useful, you'll need 'em)
 - **Six aim modes per keyframe**: free orientation, look at a point, look at **Link**, look at **any actor**
   (searchable, distance-sorted picker), look at the **shared movable target**, or **follow the path** like a
@@ -57,11 +57,11 @@ Fly to a pose, press **Add Keyframe**, repeat. The camera plays a smooth spline 
 - **Auto-orbit** : generate a circle or arc of keyframes around Link, an actor, the target or the camera, each
   one already aimed at the centre. And if you wanna record a looped animation, you can even sync link's idle animation to the start of your timeline, to get a perfect loop every 8 seconds
 
-> **📷 Image slot — `docs/media/world-overlay.png`**
+> **📷 Image slot : `docs/media/world-overlay.png`**
 > A screenshot of the in-world overlay: the spline curve, numbered markers, and the move gizmo on a selected
 > keyframe. Ideally somewhere with depth so the curve reads in 3D.
 
-> **📷 Image slot — `docs/media/gizmos.gif`**
+> **📷 Image slot : `docs/media/gizmos.gif`**
 > Dragging the three gizmo modes in turn — move, rotate (aim), bend (path) — so the difference is obvious.
 
 ### The timeline
@@ -86,7 +86,7 @@ time of day, shake intensity, green screen.
 
 - **Step / Linear / Smooth / Bezier** per key, with draggable tangent handles on Bezier keys.
 - Every enabled channel is drawn at once, each scaled to its own range; the active one is bright and editable.
-- **Speed graph** overlay — what the camera actually *does* over the timeline. Drag a keyframe's point to set
+- **Speed graph** overlay : what the camera actually *does* over the timeline. Drag a keyframe's point to set
   the camera's speed there, and its handles to shape how it accelerates in and out.
 - **Precision aids**: hold **Q** while dragging to lock the drag to one axis, and turn on **Snap** to land every
   drag on a grid that refines as you zoom in.
@@ -99,11 +99,11 @@ time of day, shake intensity, green screen.
 
 ### Watching an actor
 
-- **Actor POV (spectate)** — see the world through any actor's eyes, riding its animated focus point so head bob
+- **Actor POV (spectate)** : see the world through any actor's eyes, riding its animated focus point so head bob
   and head turns come through. Tunable eye height; the world keeps running.
-- **Follow actor** — attach the free camera to a moving actor and keep your framing relative to it as it goes.
-- **Hands-off mode** — the controller plays Link normally while the camera rides the followed actor and keeps
-  Link in frame automatically. Good for gameplay-style coverage you don't have to fly.
+- **Follow actor** : attach the free camera to a moving actor and keep your framing relative to it as it goes.
+- **Hands-off mode** : the controller plays Link normally while the camera rides the followed actor and keeps
+  Link in frame automatically.
 
 > **📷 Image slot — `docs/media/spectate.gif`**
 > A few seconds of Actor POV on something with a distinctive gait or head movement.
@@ -111,11 +111,10 @@ time of day, shake intensity, green screen.
 ### Presentation
 
 - **Hide HUD** while filming.
-- **Letterbox bars**, adjustable — 0.12 of the screen each side gives roughly 2.35:1 from 16:9.
-- **Composition grid** — rule-of-thirds, 4×4 or 5×5.
-- **Green screen** — replace the sky with a solid chroma-key colour (green or blue) and hide the sun, moon and
-  sky glow, so you can key it out when compositing. Scene geometry still draws over it.
-- **Camera shake** — smooth handheld jitter, deterministic so it looks the same on every replay, with a
+- **Letterbox bars**, adjustable : 0.12 of the screen each side gives roughly 2.35:1 from 16:9.
+- **Composition grid** : rule-of-thirds, 4×4 or 5×5.
+- **Green screen** : wanna do a cool transition or simply insert something silly in the sky? you can replace manually or via keyframes the whole skybox by a solid green or blue color. 
+- **Camera shake** : smooth handheld jitter, deterministic so it looks the same on every replay, with a
   keyframable intensity you can ramp across a shot.
 
 > **📷 Image slot — `docs/media/presentation.png`**
@@ -128,26 +127,24 @@ time of day, shake intensity, green screen.
 
 ## 🧰 Quality of life
 
-The small things that stop a shoot from becoming an errand.
+Anything i've been used to in other editing softwares and felt the lack of in my workflow :
 
-- **Sky & time** — scrub the time of day directly (with Noon / Sunset / Night presets), or **freeze the sky and
+- **Sky & time** : scrub the time of day directly (with Noon / Sunset / Night presets), or **freeze the sky and
   clock** so clouds stop drifting and the lighting holds still. Essential for a loop that lines up.
-- **Teleport to area** — fade straight to any area from a dropdown instead of walking there.
-- **Pose Link** — a dial that turns Link to an exact heading, so he's facing the right way in frame.
-- **No idle fidgets** — stop Link stretching and looking around, so he holds a clean standing pose.
-- **Sync Link's idle to the loop** — restart his breathing animation each time the loop wraps, so a looping GIF
-  has no visible seam.
-- **Control Link during playback** — drive Link with the controller while the camera flies its path. Pairs
+- **Are teleport** : Warp to major locations from a built-in dropdown menu.
+- **Pose Link** : a dial that turns Link to an exact heading, so he's facing the right way in frame.
+- **No idle fidgets** : stop Link stretching and looking around, so he holds a clean standing pose. (not a T-pose, just default idle)
+- **Sync Link's idle to the loop** : restart his breathing animation each time the loop wraps, so a looping GIF
+  has no visible seam. (timing sensitive)
+- **Control Link during playback** : drive Link with the controller while the camera flies its path. Pairs
   naturally with a *Look at Link* aim.
-- **Loop styles** — forward with a smooth return leg, or ping-pong. An optional one-frame **loop-start marker**
+- **Loop styles** : forward with a smooth return leg, or ping-pong. An optional one-frame **loop-start marker**
   flashes in the corner so you can find the exact boundary in a recording and trim there.
-- **Save / Load** — paths are JSON in `cinematics/`, with an **autosave** every minute while you have unsaved
+- **Save / Load** : paths are JSON in `cinematics/`, with an **autosave** every minute while you have unsaved
   changes. A saved path can **remember where it was shot** and fade-warp you back there on load.
 - **Undo / redo** throughout, plus **copy / paste** and **insert a keyframe at the playhead**.
-- **Shooting bar** — collapse the whole editor to a slim transport strip so the game keeps the screen. The world
-  gizmos and every keyboard shortcut stay live. It can minimise itself while playing and expand again when you
-  stop.
-- **Window opacity** — fade the editor so the game reads through it.
+- **Shooting bar** : Minimized play bar at the top of the screen while the shot is playing, no UI clutter.
+- **Window opacity** : fade the editor so the game reads through it. (life changer on single monitor setups)
 
 > **📷 Image slot — `docs/media/shooting-bar.png`**
 > The shooting bar over gameplay, showing how little screen it takes.
@@ -157,21 +154,22 @@ The small things that stop a shoot from becoming an errand.
 ## 🚀 Getting started
 
 1. Open the menu → **Dev Tools** → **Cinematic Cam**.
-2. Turn on **Enable Cinematic Camera** (or bind it to a button — see Controls).
+2. Turn on **Enable Cinematic Camera** (or bind it to a button, see Controls).
 3. Click **Open Path Editor**.
+4. I highly recommend going to the enhancements > cheats tab and turning on infinite health and noclip on L, along with speed modifier
 
 > **📷 Image slot — `docs/media/menu.png`**
 > The Dev Tools → Cinematic Cam menu page, so people know what they're looking for.
 
-### A typical shot
+### My workflow
 
-1. **Enable** the free camera and fly to the opening frame.
-2. **Add Keyframe** — or hit **Record** and fly the whole move live.
+1. **Toggle** the free camera, fly to the opening shot.
+2. **Add Keyframe**, or hit **Record** and fly the whole move live.
 3. Build a few more. Adjust each with the **move / rotate / bend** gizmos or the numeric fields.
 4. Set the **aim** per keyframe, or point the whole path at one thing with the **aim override**.
 5. **Play.** Retime on the timeline, shape the acceleration on the **speed graph**, add **easing** and **loop**.
 6. Turn on **letterbox**, **hide HUD** and the **composition grid** for the final framing, then capture.
-7. **Save** it by name — it lands in `cinematics/<name>.json`.
+7. **Save** it by name, it lands in `cinematics/<name>.json`.
 
 ---
 
@@ -192,7 +190,7 @@ live in **Dev Tools → Cinematic Cam → Controls** and are all rebindable.
 | FOV in / out | D-pad ↑ / ↓ |
 | Roll left / right | D-pad ← / → |
 
-> **Modifier 1 and Modifier 2 do nothing until you assign them** — they are SoH's two spare buttons, not
+> **Modifier 1 and Modifier 2 do nothing until you assign them**, they are SoH's two spare buttons, not
 > real N64 ones. Map them once in **Settings → Controller Configuration → your port → Modifier
 > Buttons**: M1 to Select/Back, M2 to your right bumper. They're used here because the toggle has to be
 > safe to press during normal gameplay, and boost has to be holdable while both sticks are busy.
@@ -211,17 +209,17 @@ live in **Dev Tools → Cinematic Cam → Controls** and are all rebindable.
 
 ### Mouse, in the timeline and the curve editor
 
-| Input | Action |
-| --- | --- |
-| Drag | Move a keyframe |
-| `Ctrl` + click | Add / remove from the selection |
-| `Ctrl` + `Shift` + click | Select a range |
-| `Shift` + drag | Ripple — push this keyframe and everything after it |
-| `Alt` + drag a selection's end | Compress / expand the group |
-| Hold `Q` while dragging | Lock the drag to one axis |
-| Wheel / middle-drag | Zoom time / pan |
-| Double-click / right-click *(curve editor)* | Add / delete a key |
-| `Alt` + drag a handle | Break the handle pair and bend one side alone |
+| Input | Action                                              |
+| --- |-----------------------------------------------------|
+| Drag | Move a keyframe                                     |
+| `Ctrl` + click | Add / remove from the selection                     |
+| `Ctrl` + `Shift` + click | Select a range                                      |
+| `Shift` + drag | Ripple : push this keyframe and everything after it |
+| `Alt` + drag a selection's end | Compress / expand the group                         |
+| Hold `Q` while dragging | Lock the drag to one axis                           |
+| Wheel / middle-drag | Zoom time / pan                                     |
+| Double-click / right-click *(curve editor)* | Add / delete a key                                  |
+| `Alt` + drag a handle | Break the handle pair and bend one side alone       |
 
 ---
 
@@ -233,13 +231,13 @@ Everything lives under **Dev Tools → Cinematic Cam** (CVars: `gEnhancements.Ci
 - **Freeze World**, **Freeze Sky & Time**, **No Idle Fidgets**, **Sync Link Idle to Loop Start**
 - **Hide HUD**, **Letterbox bars** (+ size), **Composition grid**, **Show readout**
 - **Extend Draw Distance** (+ multiplier) and **Far Clip Plane**
-- **Controls** — per-action button bindings
+- **Controls** : per-action button bindings
 
 ---
 
 ## 🗺️ Roadmap
 
-- **Cutscene system** — a path library, **sequenced shots** (several paths back to back with cuts and fades),
+- **Cutscene system** : a path library, **sequenced shots** (several paths back to back with cuts and fades),
   and **triggers** that fire a cinematic on a game event: entering a room, a flag being set, talking to an
   actor, walking into a region. That's the step that turns this from a capture tool into something modders can
   ship inside a mod.
@@ -260,7 +258,7 @@ Everything lives under **Dev Tools → Cinematic Cam** (CVars: `gEnhancements.Ci
 
 ## 🧱 Building
 
-This ships as part of the SoH fork — build SoH normally (see [`docs/BUILDING.md`](../../../docs/BUILDING.md))
+This ships as part of the SoH fork : build SoH normally (see [`docs/BUILDING.md`](../../../docs/BUILDING.md))
 and the cinematic camera is compiled in automatically.
 
 *Built for the Ship of Harkinian community. 🚢*

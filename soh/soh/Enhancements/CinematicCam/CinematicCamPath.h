@@ -27,11 +27,14 @@ struct CineKeyframe {
     float roll;   // degrees
     float fov;    // degrees
 
-    // Per-keyframe curve shaping. Defaults (Smooth, all 0) reproduce a standard Catmull-Rom spline.
-    int interp;       // CineInterp
-    float tension;    // -1..1: -1 rounder/looser, +1 tighter/straighter
-    float continuity; // -1..1: sharpness of the corner through the keyframe
-    float bias;       // -1..1: lean the curve toward the previous (+) or next (-) keyframe
+    // Per-keyframe curve shaping. The spline is a centripetal Catmull-Rom; its shape at a keyframe is set by
+    // the tangent DIRECTION (below, from the Bend gizmo) and the per-side tangent WEIGHTS (tanWOut/tanWIn).
+    //
+    // Tension / Continuity / Bias lived here and were retired in format 2. They scaled both sides of a knot
+    // together, they were silently overridden by any baked tangent (so Smooth path switched two of the three
+    // off), and through Kochanek-Bartels the same three numbers also steered the aim, the roll and the FOV -
+    // from a control that only ever described the path.
+    int interp; // CineInterp
 
     // Optional custom spline tangent (the direction the spatial curve passes through this point), edited
     // with the Bend gizmo. Like a Bezier handle; bends the curve on both sides. Independent of camera aim.
