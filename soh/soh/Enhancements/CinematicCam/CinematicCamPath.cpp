@@ -4588,6 +4588,95 @@ static void GizmoContinue() {
     }
 }
 
+// --- Shot presets -------------------------------------------------------------------------------------
+// Each of these is pure geometry against one anchor point, which is the whole reason they can exist: the
+// generator never needs to know what the scene looks like, only where the subject is and where the camera is
+// standing now. Same bargain Auto-orbit already makes.
+enum CineShot { kShotPushIn = 0, kShotDollyZoom = 1, kShotCrane = 2, kShotSpiral = 3 };
+
+// Build a shot around `center`. d0/d1 are the start/end distances from it, h0/h1 the start/end heights above
+// it. `fovStart` is the camera's current FOV, which the dolly zoom needs as its reference framing.
+static void GenerateShot(int shot, const float* center, float d0, float d1, float h0, float h1, float arcDeg, int count,
+                         float duration, float fovStart, char* status, size_t statusLen) {
+    if (count < 2) {
+        count = 2;
+    }
+    const float kPi = 3.14159265f;
+    // The ray the camera currently sits on, flattened to the horizontal plane so height is ours to set. If the
+    // camera is directly above the subject there is no horizontal direction to keep, so fall back to +X.
+    float eye[3], at[3], roll, fov;
+    CinematicCam_GetPose(eye, at, &roll, &fov);
+    float u[3] = { eye[0] - center[0], 0.0f, eye[2] - center[2] };
+    float ul = std::sqrt(u[0] * u[0] + u[2] * u[2]);
+    if (ul < 1e-3f) {
+        u[0] = 1.0f;
+        u[2] = 0.0f;
+    } else {
+        u[0] /= ul;
+        u[2] /= ul;
+    }
+    float startAng = std::atan2(u[2], u[0]);
+    // Dolly zoom: hold the subject the same size on screen while the camera moves, so the BACKGROUND changes
+    // scale and nothing else does. Screen size is proportional to 1 / (distance * tan(fov/2)), so keeping
+    // d * tan(fov/2) constant is the whole trick - the rest is sampling it.
+    float k = d0 * std::tan(fovStart * 0.5f * kPi / 180.0f);
+    float fovLo = 1e9f, fovHi = -1e9f;
+
+    PushUndo();
+    sKeyframes.clear();
+    sIds.clear();
+    SelectOnly(-1);
+    for (int i = 0; i < count; i++) {
+        float f = (float)i / (float)(count - 1);
+        float d = d0 + (d1 - d0) * f;
+        float h = h0 + (h1 - h0) * f;
+        float ang = startAng;
+        if (shot == kShotSpiral) {
+            ang += arcDeg * f * kPi / 180.0f;
+        }
+        CineKeyframe kf{};
+        kf.eye[0] = center[0] + std::cos(ang) * d;
+        kf.eye[1] = center[1] + h;
+        kf.eye[2] = center[2] + std::sin(ang) * d;
+        kf.aimMode = CINE_AIM_POINT;
+        kf.at[0] = center[0];
+        kf.at[1] = center[1];
+        kf.at[2] = center[2];
+        if (shot == kShotDollyZoom) {
+            // The true distance includes the height offset, or the framing drifts on a shot that is not level.
+            float dx = kf.eye[0] - center[0], dy = kf.eye[1] - center[1], dz = kf.eye[2] - center[2];
+            float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+            float want = 2.0f * std::atan(k / std::max(dist, 1e-3f)) * 180.0f / kPi;
+            fovLo = std::min(fovLo, want);
+            fovHi = std::max(fovHi, want);
+            kf.fov = std::min(std::max(want, 1.0f), 120.0f);
+        } else {
+            kf.fov = fovStart;
+        }
+        kf.time = duration * f;
+        sKeyframes.push_back(kf);
+        sIds.push_back(sNextId++);
+    }
+    SortByTime();
+    SelectOnly(sIds.empty() ? -1 : sIds[0]);
+    sFollowMode = 0;
+    if (count >= 3) {
+        SmoothPath(); // a generated shot should be a continuous curve from the moment it appears
+    }
+    if (status && statusLen) {
+        if (shot == kShotDollyZoom && (fovLo < 1.0f || fovHi > 120.0f)) {
+            snprintf(status, statusLen,
+                     "Dolly zoom built, but it wanted %.0f-%.0f deg of FOV and the engine allows 1-120. The "
+                     "framing will drift at the clamped end - try a smaller distance change.",
+                     fovLo, fovHi);
+        } else if (shot == kShotDollyZoom) {
+            snprintf(status, statusLen, "Dolly zoom: %.0f -> %.0f units, FOV %.0f -> %.0f deg.", d0, d1, fovHi, fovLo);
+        } else {
+            snprintf(status, statusLen, "Shot built: %d keyframes over %.1fs.", count, duration);
+        }
+    }
+}
+
 // Draw a 3-axis move gizmo at the look-at-point target.
 static void DrawTargetGizmo(ImDrawList* dl, int idx) {
     if (sKeyframes[idx].aimMode != CINE_AIM_POINT) {
@@ -8452,6 +8541,144 @@ void CinematicCamPathWindow::DrawElement() {
                             "aimed at it. A full 360 arc turns on looping. Great for establishing shots.");
             }
         } // Auto-orbit collapsible
+
+        // --- Shot presets: one anchor plus a couple of distances is enough to build a real camera move ---
+        if (ImGui::CollapsingHeader("Shots")) {
+            static int shCenter = 0;
+            static float shD0 = 300.0f, shD1 = 120.0f, shH0 = 40.0f, shH1 = 40.0f, shDur = 6.0f, shArc = 180.0f;
+            static int shActorId = 0;
+            static void* shActorPtr = nullptr;
+            static char shActorName[64] = "";
+            const char* centers2[] = { "Link", "Actor", "Target", "Camera" };
+            ImGui::SetNextItemWidth(110.0f);
+            ImGui::Combo("Subject##shot", &shCenter, centers2, 4);
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("What the shot is ABOUT - all of these keep it framed while the camera moves. "
+                            "Camera means the point you are looking at right now, at the start distance.");
+            }
+            if (shCenter == 1) {
+                ImGui::SameLine();
+                ImGui::Text("%s (id %d)", shActorName[0] ? shActorName : "(none)", shActorId);
+                ImGui::SameLine();
+                if (ImGui::Button("Pick##shotactor")) {
+                    ImGui::OpenPopup("Pick shot actor");
+                }
+                if (ImGui::BeginPopup("Pick shot actor")) {
+                    CineActorInfo pick;
+                    if (DrawActorPicker(&pick)) {
+                        shActorId = pick.id;
+                        shActorPtr = pick.ptr;
+                        strncpy(shActorName, pick.name ? pick.name : "?", sizeof(shActorName) - 1);
+                        shActorName[sizeof(shActorName) - 1] = 0;
+                        ImGui::CloseCurrentPopup();
+                    }
+                    ImGui::EndPopup();
+                }
+            }
+            ImGui::SetNextItemWidth(100.0f);
+            ImGui::DragFloat("From##shot", &shD0, 1.0f, 10.0f, 8000.0f, "%.0f");
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("Distance from the subject where the shot STARTS, in world units.");
+            }
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(100.0f);
+            ImGui::DragFloat("To##shot", &shD1, 1.0f, 10.0f, 8000.0f, "%.0f");
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("Distance where it ENDS. Smaller than From moves in; larger pulls out.");
+            }
+            ImGui::SetNextItemWidth(100.0f);
+            ImGui::DragFloat("Height from##shot", &shH0, 1.0f, -500.0f, 2000.0f, "%.0f");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(100.0f);
+            ImGui::DragFloat("to##shot", &shH1, 1.0f, -500.0f, 2000.0f, "%.0f");
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("Camera height above the subject at the start and end. A crane wants these to "
+                            "differ a lot; a level push wants them equal.");
+            }
+            ImGui::SetNextItemWidth(100.0f);
+            ImGui::SliderFloat("Seconds##shot", &shDur, 1.0f, 60.0f, "%.1f");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(100.0f);
+            ImGui::SliderFloat("Spin##shot", &shArc, 0.0f, 720.0f, "%.0f deg");
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("How far around the subject the Spiral travels. The other shots ignore it.");
+            }
+
+            // Resolve the subject the same way the orbit does.
+            auto shotSubject = [&](float* c) -> bool {
+                if (shCenter == 0) {
+                    return CinematicCam_GetPlayerPos(c) != 0;
+                }
+                if (shCenter == 1) {
+                    return CinematicCam_ResolveActor(&shActorPtr, (short)shActorId, nullptr, c) != 0;
+                }
+                if (shCenter == 2) {
+                    c[0] = sAimOverridePoint[0];
+                    c[1] = sAimOverridePoint[1];
+                    c[2] = sAimOverridePoint[2];
+                    return true;
+                }
+                float eye[3], at[3], roll, fov;
+                CinematicCam_GetPose(eye, at, &roll, &fov);
+                float f[3] = { at[0] - eye[0], at[1] - eye[1], at[2] - eye[2] };
+                float l = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+                float sc = (l > 1e-3f) ? shD0 / l : 0.0f;
+                c[0] = eye[0] + f[0] * sc;
+                c[1] = eye[1] + f[1] * sc;
+                c[2] = eye[2] + f[2] * sc;
+                return true;
+            };
+            auto shotBuild = [&](int kind, int count) {
+                float c[3];
+                if (!shotSubject(c)) {
+                    snprintf(sFileStatus, sizeof(sFileStatus), "No subject to build a shot around.");
+                    return;
+                }
+                float eye[3], at[3], roll, fov;
+                CinematicCam_GetPose(eye, at, &roll, &fov);
+                GenerateShot(kind, c, shD0, shD1, shH0, shH1, shArc, count, shDur, fov, sFileStatus,
+                             sizeof(sFileStatus));
+            };
+
+            if (ImGui::Button("Push in")) {
+                shotBuild(kShotPushIn, 3);
+            }
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("The workhorse: a straight move toward the subject at a fixed lens, easing in and "
+                            "out. Set To smaller than From; reverse them for a pull-back.");
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Dolly zoom")) {
+                shotBuild(kShotDollyZoom, 9);
+            }
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("The Vertigo shot. The camera moves while the FOV changes to hold the subject at "
+                            "EXACTLY the same size, so the background appears to rush toward or away from it "
+                            "while the subject sits still.\n\n"
+                            "It works by keeping distance x tan(FOV/2) constant. Large distance changes need "
+                            "large FOV changes and the engine only allows 1-120 degrees - the status line "
+                            "says so if your settings ran past that.");
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Crane")) {
+                shotBuild(kShotCrane, 5);
+            }
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("A jib move: set Height from low to high (and usually To further than From) and "
+                            "the camera rises and pulls back while staying on the subject - the shot that "
+                            "ends a scene.");
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Spiral")) {
+                shotBuild(kShotSpiral, 12);
+            }
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("An orbit that also climbs and closes in - Spin sets how far around it goes. For "
+                            "reveals where a flat circle feels too static.");
+            }
+            CineHint("Each of these REPLACES the current path. They are starting points - build one, then "
+                     "move the keyframes and shape the speed like any other.");
+        }
     }
 
     // Keyframe list
