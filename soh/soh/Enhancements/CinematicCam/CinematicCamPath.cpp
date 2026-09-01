@@ -514,7 +514,9 @@ static float sRecordTime = 0.0f;
 static float sRecordLast = 0.0f;
 static float sRecordInterval = 0.2f; // seconds between recorded keyframes
 
-static CineKeyframe sClipboard; // copied keyframe
+// Copied keyframes, in time order, with their times stored RELATIVE to the first - so a paste puts the group
+// down at the playhead with its internal spacing intact, wherever that is.
+static std::vector<CineKeyframe> sClipboard;
 static bool sClipboardValid = false;
 static bool sShowPath = true;    // draw the spline + markers in the world while the editor is open
 static bool sShowFields = false; // show numeric position/rotation fields for the selected keyframe
@@ -2590,15 +2592,23 @@ static void UpdateSelected() {
     sKeyframes[idx].time = time;
 }
 
+// Delete every SELECTED keyframe, not just the primary. Walking backwards keeps the indices ahead of the
+// cursor valid as entries disappear.
 static void DeleteSelected() {
-    int idx = SelectedIndex();
-    if (idx < 0) {
+    int primary = SelectedIndex();
+    if (primary < 0) {
         return;
     }
     PushUndo();
-    sKeyframes.erase(sKeyframes.begin() + idx);
-    sIds.erase(sIds.begin() + idx);
-    SelectOnly(sIds.empty() ? -1 : sIds[std::min((size_t)idx, sIds.size() - 1)]);
+    for (int i = (int)sIds.size() - 1; i >= 0; i--) {
+        if (i == primary || IsSelected(sIds[i])) {
+            sKeyframes.erase(sKeyframes.begin() + i);
+            sIds.erase(sIds.begin() + i);
+        }
+    }
+    // Land the selection on whatever now occupies the primary's old slot, so repeated Delete keeps working
+    // from the same spot instead of leaving nothing selected.
+    SelectOnly(sIds.empty() ? -1 : sIds[std::min((size_t)primary, sIds.size() - 1)]);
 }
 
 static void ClearPath() {
@@ -2618,11 +2628,24 @@ static void ClearPath() {
 }
 
 static void CopySelected() {
-    int idx = SelectedIndex();
-    if (idx < 0) {
+    int primary = SelectedIndex();
+    if (primary < 0) {
         return;
     }
-    sClipboard = sKeyframes[idx];
+    sClipboard.clear();
+    for (size_t i = 0; i < sIds.size(); i++) {
+        if ((int)i == primary || IsSelected(sIds[i])) {
+            sClipboard.push_back(sKeyframes[i]);
+        }
+    }
+    if (sClipboard.empty()) {
+        return;
+    }
+    float t0 = sClipboard.front().time; // sKeyframes is time-sorted, so the first one IS the earliest
+    for (CineKeyframe& k : sClipboard) {
+        k.time -= t0;
+        k.aimActorPtr = nullptr; // runtime pointer is not copied
+    }
     sClipboardValid = true;
 }
 
@@ -2642,11 +2665,26 @@ static void AddKeyframeAtPlayhead(const CineKeyframe& kf, bool pushUndo = true) 
     SortByTime();
 }
 
+// Drop the whole copied group at the playhead, keeping the spacing it was copied with, and leave it selected
+// so it can be dragged or deleted as a unit straight away.
 static void PasteAtPlayhead() {
-    if (!sClipboardValid) {
+    if (!sClipboardValid || sClipboard.empty()) {
         return;
     }
-    AddKeyframeAtPlayhead(sClipboard);
+    PushUndo();
+    std::vector<int> pasted;
+    for (const CineKeyframe& src : sClipboard) {
+        CineKeyframe k = src;
+        k.time = sPlayhead + src.time; // src.time is the offset from the first copied keyframe
+        k.aimActorPtr = nullptr;
+        sKeyframes.push_back(k);
+        sIds.push_back(sNextId);
+        pasted.push_back(sNextId);
+        sNextId++;
+    }
+    SortByTime();
+    sSelection = pasted;
+    sSelectedId = pasted.front();
 }
 
 static void InsertAtPlayhead() {
@@ -4362,6 +4400,22 @@ static void GizmoContinue() {
         k.eye[sDragAxis] += worldDelta;
         if (k.aimMode == CINE_AIM_FREE) {
             k.at[sDragAxis] += worldDelta; // free aim: carry the look-at rigidly with the eye
+        }
+        // Everything else selected rides the SAME world delta, so the group keeps its shape exactly and the
+        // whole path can be relocated by grabbing any one of its handles. The delta is measured from the
+        // grabbed keyframe's own gizmo (its axis length depends on its distance from the camera), which is
+        // why one keyframe drives and the rest follow rather than each solving for itself.
+        if (SelectionCount() > 1) {
+            for (size_t i = 0; i < sIds.size(); i++) {
+                if ((int)i == idx || !IsSelected(sIds[i])) {
+                    continue;
+                }
+                CineKeyframe& o = sKeyframes[i];
+                o.eye[sDragAxis] += worldDelta;
+                if (o.aimMode == CINE_AIM_FREE) {
+                    o.at[sDragAxis] += worldDelta;
+                }
+            }
         }
     } else if (sDragKind == 3) {
         // Bend handle dot: steer that side's direction so the dot follows the mouse. The screen response of a
@@ -8055,6 +8109,9 @@ void CinematicCamPathWindow::DrawElement() {
         DeleteSelected();
     }
     ImGui::EndDisabled();
+    if (ImGui::IsItemHovered()) {
+        CineTooltip("Delete every selected keyframe (Del does the same). Ctrl+Z brings them back.");
+    }
     ImGui::SameLine();
     if (ImGui::Button("Clear")) {
         ClearPath();
@@ -8069,14 +8126,24 @@ void CinematicCamPathWindow::DrawElement() {
         CopySelected();
     }
     ImGui::EndDisabled();
+    if (ImGui::IsItemHovered()) {
+        CineTooltip("Copy every selected keyframe. Their spacing in time is remembered, so pasting puts the "
+                    "group back down exactly as it was.");
+    }
     ImGui::SameLine();
     ImGui::BeginDisabled(!sClipboardValid);
     if (ImGui::Button("Paste @ playhead")) {
         PasteAtPlayhead();
     }
     ImGui::EndDisabled();
-    if (ImGui::IsItemHovered() && !sClipboardValid) {
-        CineTooltip("Copy a keyframe first.");
+    if (ImGui::IsItemHovered()) {
+        if (!sClipboardValid) {
+            CineTooltip("Copy one or more keyframes first.");
+        } else {
+            CineTooltip("Drop the %d copied keyframe%s at the playhead, keeping their spacing. They land "
+                        "selected, so you can drag or delete them as a group straight away.",
+                        (int)sClipboard.size(), sClipboard.size() == 1 ? "" : "s");
+        }
     }
     ImGui::SameLine();
     if (ImGui::Button("Insert @ playhead")) {
@@ -8356,9 +8423,34 @@ void CinematicCamPathWindow::DrawElement() {
     int sel = SelectedIndex();
     if (SelectionCount() > 1) {
         ImGui::SeparatorText("Selected keyframes");
-        CineHint("%d keyframes selected. Per-keyframe fields are hidden while multiple are selected - "
-                 "drag on the timeline to move them together, or Ctrl+click to narrow the selection.",
+        CineHint("%d keyframes selected. The per-keyframe fields are hidden - they only make sense for one - "
+                 "but the whole group moves together:",
                  SelectionCount());
+        // The Move gizmo works on a multi-selection, so its mode switch has to be reachable here. Rotate and
+        // Bend stay single-keyframe: rotating a group about each member's own centre is not a thing anyone
+        // means, so offering it here would only mislead.
+        if (sShowPath) {
+            ImGui::TextUnformatted("Gizmo:");
+            ImGui::SameLine();
+            ImGui::RadioButton("Move##multi", &sGizmoMode, GIZMO_MOVE);
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("Drag any selected keyframe's red/green/blue axis in the world and the whole "
+                            "selection moves with it, keeping its shape. This is how you relocate a finished "
+                            "path: Ctrl+A, then drag.");
+            }
+            ImGui::SameLine();
+            ImGui::BeginDisabled(true);
+            ImGui::RadioButton("Rotate (aim)##multi", &sGizmoMode, GIZMO_ROTATE);
+            ImGui::RadioButton("Bend (path)##multi", &sGizmoMode, GIZMO_BEND);
+            ImGui::EndDisabled();
+            if (sGizmoMode != GIZMO_MOVE) {
+                CineHint("Rotate and Bend are one keyframe at a time - Ctrl+click to narrow the selection.");
+            }
+        } else {
+            CineHint("Turn on 'Show path in world' to drag the selection with the Move gizmo.");
+        }
+        CineHint("Timeline: drag any marker to slide them all in time, Alt-drag an end to compress or expand "
+                 "the group. Copy, Paste and Delete all act on the whole selection.");
     } else if (sel >= 0) {
         ImGui::SeparatorText("Selected keyframe");
 

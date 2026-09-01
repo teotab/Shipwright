@@ -2,7 +2,7 @@
 
 Welcome ! I've been working on this mod for a while now with the help of Claude. We've been though many iterations and now it finally feels complete enough to release as a beta. All feedback is more than welcome !
 
-This is a full **cinematic camera toolkit** for [Ship of Harkinian](https://github.com/HarbourMasters/Shipwright) with everything you could need to make cool cinematics in this timeless game. At your disposal, you've got :
+This is a full **cinematic camera toolkit** for [Ship of Harkinian](https://github.com/HarbourMasters/Shipwright) with everything you could need to make cool cinematics in this timeless game. At your disposal, you've got : 
 
 - An easy to use, proper freecam mode
 - A full-fledged keyframe and path system, editable in 3D or via the UI
@@ -90,11 +90,9 @@ time of day, shake intensity, green screen.
 - **Precision aids**: hold **Q** while dragging to lock the drag to one axis, and turn on **Snap** to land every
   drag on a grid that refines as you zoom in.
 
-> **📷 Image slot — `docs/media/curve-editor.png`**
-> The curve editor with two or three channels enabled and a Bezier key selected so its handles show.
+> ![speedcurve](docs/media/speedCurve.gif)
+> ![curve](docs/media/curve.png)
 
-> **📷 Image slot — `docs/media/speed-graph.gif`**
-> Dragging a speed point and its acceleration handle, with the resulting change visible in the curve.
 
 ### Watching an actor
 
@@ -104,8 +102,7 @@ time of day, shake intensity, green screen.
 - **Hands-off mode** : the controller plays Link normally while the camera rides the followed actor and keeps
   Link in frame automatically.
 
-> **📷 Image slot — `docs/media/spectate.gif`**
-> A few seconds of Actor POV on something with a distinctive gait or head movement.
+> ![follow](docs/media/ActorfollowCheap.mp4)
 
 ### Presentation
 
@@ -124,7 +121,7 @@ time of day, shake intensity, green screen.
 
 ---
 
-## 🧰 Quality of life
+## Quality of life
 
 Anything i've been used to in other editing softwares and felt the lack of in my workflow :
 
@@ -150,8 +147,8 @@ Anything i've been used to in other editing softwares and felt the lack of in my
 
 ---
 
-## 🚀 Getting started
-
+## Getting started 
+![frog](docs/media/FROG3.gif)
 1. Open the menu → **Dev Tools** → **Cinematic Cam**.
 2. Turn on **Enable Cinematic Camera** (or bind it to a button, see Controls).
 3. Click **Open Path Editor**.
