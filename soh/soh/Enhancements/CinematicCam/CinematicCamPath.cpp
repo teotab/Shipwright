@@ -3229,100 +3229,112 @@ static void LoadPath() {
         }
     }
     int droppedTcb = 0; // keyframes whose retired Tension/Continuity/Bias values were discarded
-    for (auto& e : *arr) {
-        CineKeyframe k{};
-        k.time = e.value("time", 0.0f);
-        k.eye[0] = e["eye"][0];
-        k.eye[1] = e["eye"][1];
-        k.eye[2] = e["eye"][2];
-        k.at[0] = e["at"][0];
-        k.at[1] = e["at"][1];
-        k.at[2] = e["at"][2];
-        k.roll = e.value("roll", 0.0f);
-        k.fov = e.value("fov", 60.0f);
-        k.interp = e.value("interp", 0);
-        // Tension / Continuity / Bias are GONE (format 2). They are deliberately not read: they used to steer
-        // the eye path, the aim, the roll AND the FOV from one slider, and the per-side tangent weights below
-        // do the spatial half properly. A path that carried non-zero values will move differently - and the
-        // load message says so rather than letting it be a mystery.
-        if (std::fabs(e.value("tension", 0.0f)) > 1e-4f || std::fabs(e.value("continuity", 0.0f)) > 1e-4f ||
-            std::fabs(e.value("bias", 0.0f)) > 1e-4f) {
-            droppedTcb++;
+    int skipped = 0;    // keyframes whose JSON did not have the shape we expected
+    // A file written by an older build can be missing anything, and nlohmann throws rather than returning a
+    // default when an expected key or type is absent. One bad keyframe must cost you that keyframe, not the
+    // whole session - so the parse is caught per keyframe and the count is reported below.
+    try {
+        for (auto& e : *arr) {
+            CineKeyframe k{};
+            k.time = e.value("time", 0.0f);
+            k.eye[0] = e["eye"][0];
+            k.eye[1] = e["eye"][1];
+            k.eye[2] = e["eye"][2];
+            k.at[0] = e["at"][0];
+            k.at[1] = e["at"][1];
+            k.at[2] = e["at"][2];
+            k.roll = e.value("roll", 0.0f);
+            k.fov = e.value("fov", 60.0f);
+            k.interp = e.value("interp", 0);
+            // Tension / Continuity / Bias are GONE (format 2). They are deliberately not read: they used to steer
+            // the eye path, the aim, the roll AND the FOV from one slider, and the per-side tangent weights below
+            // do the spatial half properly. A path that carried non-zero values will move differently - and the
+            // load message says so rather than letting it be a mystery.
+            if (std::fabs(e.value("tension", 0.0f)) > 1e-4f || std::fabs(e.value("continuity", 0.0f)) > 1e-4f ||
+                std::fabs(e.value("bias", 0.0f)) > 1e-4f) {
+                droppedTcb++;
+            }
+            k.hasTangent = e.value("hasTangent", 0);
+            if (e.contains("tangent")) {
+                k.tangent[0] = e["tangent"][0];
+                k.tangent[1] = e["tangent"][1];
+                k.tangent[2] = e["tangent"][2];
+            } else {
+                k.tangent[0] = 0.0f;
+                k.tangent[1] = 0.0f;
+                k.tangent[2] = 1.0f;
+            }
+            k.hasTangentIn = e.value("hasTangentIn", 0);
+            if (e.contains("tangentIn")) {
+                k.tangentIn[0] = e["tangentIn"][0];
+                k.tangentIn[1] = e["tangentIn"][1];
+                k.tangentIn[2] = e["tangentIn"][2];
+            } else { // older files: the in side mirrors the out tangent
+                k.tangentIn[0] = k.tangent[0];
+                k.tangentIn[1] = k.tangent[1];
+                k.tangentIn[2] = k.tangent[2];
+            }
+            k.tanWOut = e.value("tanWOut", 0.0f);
+            k.tanWIn = e.value("tanWIn", 0.0f);
+            k.aimMode = e.value("aimMode", 0);
+            // "Flat" on either side of the short-lived Aim in/out controls becomes the hold flag.
+            k.aimHold = e.value("aimHold", (e.value("aimTanIn", 0) == 1 || e.value("aimTanOut", 0) == 1) ? 1 : 0);
+            // Only the progress-relative form is read. Files written while these were deg/s carry the old
+            // "aimTan" key, which is deliberately ignored: the numbers mean something different now, and falling
+            // back to automatic rates gives those paths a correct curve rather than a plausible wrong one.
+            if (e.contains("hasAimTanP") && e["hasAimTanP"].is_array() && e["hasAimTanP"].size() >= 2) {
+                k.hasAimTanIn = e["hasAimTanP"][0];
+                k.hasAimTanOut = e["hasAimTanP"][1];
+            }
+            if (e.contains("aimTanP") && e["aimTanP"].size() >= 4) {
+                k.aimTanYawIn = e["aimTanP"][0];
+                k.aimTanYawOut = e["aimTanP"][1];
+                k.aimTanPitchIn = e["aimTanP"][2];
+                k.aimTanPitchOut = e["aimTanP"][3];
+            }
+            if (e.contains("hasAimAcc") && e["hasAimAcc"].is_array() && e["hasAimAcc"].size() >= 2) {
+                k.hasAimAccIn = e["hasAimAcc"][0];
+                k.hasAimAccOut = e["hasAimAcc"][1];
+            }
+            if (e.contains("aimAcc") && e["aimAcc"].size() >= 4) {
+                k.aimAccYawIn = e["aimAcc"][0];
+                k.aimAccYawOut = e["aimAcc"][1];
+                k.aimAccPitchIn = e["aimAcc"][2];
+                k.aimAccPitchOut = e["aimAcc"][3];
+            }
+            if (e.contains("speed") && e["speed"].is_array() && e["speed"].size() >= 6) {
+                k.speedRate = e["speed"][0];
+                k.speedAccelIn = e["speed"][1];
+                k.speedAccelOut = e["speed"][2];
+                k.hasAccelIn = (int)(float)e["speed"][3];
+                k.hasAccelOut = (int)(float)e["speed"][4];
+                k.speedBroken = (int)(float)e["speed"][5];
+            } else if (e.contains("speedRate") && e["speedRate"].is_array() && e["speedRate"].size() >= 3) {
+                // Paths saved while speed was per-side: take whichever side was set. The two can no longer differ,
+                // so a file that had them apart collapses onto the leaving speed.
+                float in = e["speedRate"][0], out = e["speedRate"][1];
+                k.speedRate = (out >= 0.0f) ? out : in;
+            }
+            k.aimActorId = e.value("aimActorId", 0);
+            k.aimActorPtr = nullptr;
+            if (e.contains("aimActorPos") && e["aimActorPos"].size() >= 3) {
+                k.aimActorPos[0] = e["aimActorPos"][0];
+                k.aimActorPos[1] = e["aimActorPos"][1];
+                k.aimActorPos[2] = e["aimActorPos"][2];
+            } else {
+                k.aimActorPos[0] = k.aimActorPos[1] = k.aimActorPos[2] = 0.0f;
+            }
+            // "easeIn"/"easeOut" in older files are deliberately not read - per-keyframe ease is gone, replaced by
+            // the speed curve's acceleration handles.
+            sKeyframes.push_back(k);
+            sIds.push_back(sNextId++);
         }
-        k.hasTangent = e.value("hasTangent", 0);
-        if (e.contains("tangent")) {
-            k.tangent[0] = e["tangent"][0];
-            k.tangent[1] = e["tangent"][1];
-            k.tangent[2] = e["tangent"][2];
-        } else {
-            k.tangent[0] = 0.0f;
-            k.tangent[1] = 0.0f;
-            k.tangent[2] = 1.0f;
-        }
-        k.hasTangentIn = e.value("hasTangentIn", 0);
-        if (e.contains("tangentIn")) {
-            k.tangentIn[0] = e["tangentIn"][0];
-            k.tangentIn[1] = e["tangentIn"][1];
-            k.tangentIn[2] = e["tangentIn"][2];
-        } else { // older files: the in side mirrors the out tangent
-            k.tangentIn[0] = k.tangent[0];
-            k.tangentIn[1] = k.tangent[1];
-            k.tangentIn[2] = k.tangent[2];
-        }
-        k.tanWOut = e.value("tanWOut", 0.0f);
-        k.tanWIn = e.value("tanWIn", 0.0f);
-        k.aimMode = e.value("aimMode", 0);
-        // "Flat" on either side of the short-lived Aim in/out controls becomes the hold flag.
-        k.aimHold = e.value("aimHold", (e.value("aimTanIn", 0) == 1 || e.value("aimTanOut", 0) == 1) ? 1 : 0);
-        // Only the progress-relative form is read. Files written while these were deg/s carry the old
-        // "aimTan" key, which is deliberately ignored: the numbers mean something different now, and falling
-        // back to automatic rates gives those paths a correct curve rather than a plausible wrong one.
-        if (e.contains("hasAimTanP") && e["hasAimTanP"].is_array() && e["hasAimTanP"].size() >= 2) {
-            k.hasAimTanIn = e["hasAimTanP"][0];
-            k.hasAimTanOut = e["hasAimTanP"][1];
-        }
-        if (e.contains("aimTanP") && e["aimTanP"].size() >= 4) {
-            k.aimTanYawIn = e["aimTanP"][0];
-            k.aimTanYawOut = e["aimTanP"][1];
-            k.aimTanPitchIn = e["aimTanP"][2];
-            k.aimTanPitchOut = e["aimTanP"][3];
-        }
-        if (e.contains("hasAimAcc") && e["hasAimAcc"].is_array() && e["hasAimAcc"].size() >= 2) {
-            k.hasAimAccIn = e["hasAimAcc"][0];
-            k.hasAimAccOut = e["hasAimAcc"][1];
-        }
-        if (e.contains("aimAcc") && e["aimAcc"].size() >= 4) {
-            k.aimAccYawIn = e["aimAcc"][0];
-            k.aimAccYawOut = e["aimAcc"][1];
-            k.aimAccPitchIn = e["aimAcc"][2];
-            k.aimAccPitchOut = e["aimAcc"][3];
-        }
-        if (e.contains("speed") && e["speed"].is_array() && e["speed"].size() >= 6) {
-            k.speedRate = e["speed"][0];
-            k.speedAccelIn = e["speed"][1];
-            k.speedAccelOut = e["speed"][2];
-            k.hasAccelIn = (int)(float)e["speed"][3];
-            k.hasAccelOut = (int)(float)e["speed"][4];
-            k.speedBroken = (int)(float)e["speed"][5];
-        } else if (e.contains("speedRate") && e["speedRate"].is_array() && e["speedRate"].size() >= 3) {
-            // Paths saved while speed was per-side: take whichever side was set. The two can no longer differ,
-            // so a file that had them apart collapses onto the leaving speed.
-            float in = e["speedRate"][0], out = e["speedRate"][1];
-            k.speedRate = (out >= 0.0f) ? out : in;
-        }
-        k.aimActorId = e.value("aimActorId", 0);
-        k.aimActorPtr = nullptr;
-        if (e.contains("aimActorPos") && e["aimActorPos"].size() >= 3) {
-            k.aimActorPos[0] = e["aimActorPos"][0];
-            k.aimActorPos[1] = e["aimActorPos"][1];
-            k.aimActorPos[2] = e["aimActorPos"][2];
-        } else {
-            k.aimActorPos[0] = k.aimActorPos[1] = k.aimActorPos[2] = 0.0f;
-        }
-        // "easeIn"/"easeOut" in older files are deliberately not read - per-keyframe ease is gone, replaced by
-        // the speed curve's acceleration handles.
-        sKeyframes.push_back(k);
-        sIds.push_back(sNextId++);
+    } catch (const std::exception& ex) {
+        skipped++;
+        SPDLOG_WARN("[Cine] {}.json: stopped parsing keyframes - {}", sFilename, ex.what());
+    } catch (...) {
+        skipped++;
+        SPDLOG_WARN("[Cine] {}.json: stopped parsing keyframes (unknown error)", sFilename);
     }
     SortByTime();
     SelectOnly(sIds.empty() ? -1 : sIds[0]);
@@ -3330,12 +3342,19 @@ static void LoadPath() {
     sDirtyForAutosave = false;
     // Say what happened, including what was dropped - a file that loads "fine" while silently discarding
     // shaping the author set is worse than one that admits it.
-    int fileVer = j.value("formatVersion", 0);
+    // is_object() guard: the oldest files are a bare keyframe ARRAY, and nlohmann's value() THROWS on a
+    // non-object. That threw out of LoadPath with nothing to catch it and took the process down - so the
+    // commit that added versioning "to stop breaking saved paths" broke every file written before it.
+    int fileVer = j.is_object() ? j.value("formatVersion", 0) : 0;
     if (fileVer > kPathFormatVersion) {
         snprintf(sFileStatus, sizeof(sFileStatus),
                  "Loaded %s.json (%d keyframes) - saved by a NEWER build; "
                  "anything it added was ignored",
                  sFilename, (int)sKeyframes.size());
+    } else if (skipped > 0) {
+        snprintf(sFileStatus, sizeof(sFileStatus),
+                 "Loaded %s.json (%d keyframes) - the rest of the file could not be read; see soh.log", sFilename,
+                 (int)sKeyframes.size());
     } else if (droppedTcb > 0) {
         snprintf(sFileStatus, sizeof(sFileStatus),
                  "Loaded %s.json (%d keyframes) - Tension/Continuity/Bias dropped on %d; use the per-side "
@@ -4485,6 +4504,57 @@ static void GizmoContinue() {
             axis[2] = sDragPitchAxis[2];
         }
 
+        // With more than one keyframe selected, the rotate rings turn the WHOLE PATH about the group's
+        // centre instead of aiming one camera - which is the only reading that makes sense for a group, and
+        // is what you reach for when a move is right but pointing the wrong way. Everything that has a
+        // direction turns with it: the eyes, their look-at points, and any baked tangents. Roll is left
+        // alone - banking is relative to the camera's own travel, so spinning the path must not change it.
+        if (SelectionCount() > 1 && sDragKind != 3) {
+            float c[3] = { 0.0f, 0.0f, 0.0f };
+            int n = 0;
+            for (size_t i = 0; i < sIds.size(); i++) {
+                if (IsSelected(sIds[i])) {
+                    c[0] += sKeyframes[i].eye[0];
+                    c[1] += sKeyframes[i].eye[1];
+                    c[2] += sKeyframes[i].eye[2];
+                    n++;
+                }
+            }
+            if (n == 0) {
+                return;
+            }
+            c[0] /= (float)n;
+            c[1] /= (float)n;
+            c[2] /= (float)n;
+            auto spin = [&](float* pt) { // rotate a world point about the centroid
+                float rel[3] = { pt[0] - c[0], pt[1] - c[1], pt[2] - c[2] };
+                float out[3];
+                v3rot(rel, axis, d, out);
+                pt[0] = c[0] + out[0];
+                pt[1] = c[1] + out[1];
+                pt[2] = c[2] + out[2];
+            };
+            for (size_t i = 0; i < sIds.size(); i++) {
+                if (!IsSelected(sIds[i])) {
+                    continue;
+                }
+                CineKeyframe& o = sKeyframes[i];
+                spin(o.eye);
+                spin(o.at); // a look-at POINT is a place in the world, so it orbits the centre too
+                float rot[3];
+                if (o.hasTangent) {
+                    v3rot(o.tangent, axis, d, rot);
+                    v3norm(rot);
+                    std::memcpy(o.tangent, rot, sizeof(o.tangent));
+                }
+                if (o.hasTangentIn) {
+                    v3rot(o.tangentIn, axis, d, rot);
+                    v3norm(rot);
+                    std::memcpy(o.tangentIn, rot, sizeof(o.tangentIn));
+                }
+            }
+            return;
+        }
         if (sDragKind == 2) {
             // Bend: rotate the spatial tangent(s) (reshapes the curve; no effect on aim). "Both" rotates the
             // pair rigidly (a broken corner keeps its angle); a single side leaves the other frozen.
@@ -8424,11 +8494,10 @@ void CinematicCamPathWindow::DrawElement() {
     if (SelectionCount() > 1) {
         ImGui::SeparatorText("Selected keyframes");
         CineHint("%d keyframes selected. The per-keyframe fields are hidden - they only make sense for one - "
-                 "but the whole group moves together:",
+                 "but the whole group moves and turns together:",
                  SelectionCount());
-        // The Move gizmo works on a multi-selection, so its mode switch has to be reachable here. Rotate and
-        // Bend stay single-keyframe: rotating a group about each member's own centre is not a thing anyone
-        // means, so offering it here would only mislead.
+        // Move and Rotate both work on a multi-selection, so their mode switch has to be reachable here.
+        // Bend stays single-keyframe: it reshapes the curve THROUGH one point, which has no group meaning.
         if (sShowPath) {
             ImGui::TextUnformatted("Gizmo:");
             ImGui::SameLine();
@@ -8439,12 +8508,19 @@ void CinematicCamPathWindow::DrawElement() {
                             "path: Ctrl+A, then drag.");
             }
             ImGui::SameLine();
+            ImGui::RadioButton("Rotate path##multi", &sGizmoMode, GIZMO_ROTATE);
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("Drag a ring to turn the whole selection about its own centre - green yaws it, "
+                            "red tilts it. The eyes, their look-at points and any baked tangents all turn "
+                            "together, so the move keeps its shape and just faces somewhere else. Each "
+                            "keyframe's roll is left alone.");
+            }
+            ImGui::SameLine();
             ImGui::BeginDisabled(true);
-            ImGui::RadioButton("Rotate (aim)##multi", &sGizmoMode, GIZMO_ROTATE);
-            ImGui::RadioButton("Bend (path)##multi", &sGizmoMode, GIZMO_BEND);
+            ImGui::RadioButton("Bend##multi", &sGizmoMode, GIZMO_BEND);
             ImGui::EndDisabled();
-            if (sGizmoMode != GIZMO_MOVE) {
-                CineHint("Rotate and Bend are one keyframe at a time - Ctrl+click to narrow the selection.");
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("Bending is one keyframe at a time - Ctrl+click to narrow the selection.");
             }
         } else {
             CineHint("Turn on 'Show path in world' to drag the selection with the Move gizmo.");
