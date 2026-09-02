@@ -2687,7 +2687,12 @@ static void PasteAtPlayhead() {
     sSelectedId = pasted.front();
 }
 
-static void InsertAtPlayhead() {
+// `preserveShape` decides who pays for the new knot. On (the default), the two neighbours get the current
+// curve's tangents, aim rates and speeds BAKED into them, so the move is bit-for-bit what it was and the
+// insert is invisible - at the cost of pinning three keyframes that were previously automatic. Off, the
+// keyframe is simply dropped onto the curve and everyone stays automatic: the shape shifts slightly as the
+// tangents re-space, which is exactly what you want when the point of inserting was to move it anyway.
+static void InsertAtPlayhead(bool preserveShape = true) {
     CineKeyframe kf{};
     if (sKeyframes.size() < 2) {
         CinematicCam_GetPose(kf.eye, kf.at, &kf.roll, &kf.fov);
@@ -2695,7 +2700,11 @@ static void InsertAtPlayhead() {
         return;
     }
     kf = SampleAt(sPlayhead); // a control point on the existing curve
-    PushUndo();               // one undo step covers BOTH the insert and the tangent baking on the neighbors below
+    if (!preserveShape) {
+        AddKeyframeAtPlayhead(kf); // pushes its own undo step
+        return;
+    }
+    PushUndo(); // one undo step covers BOTH the insert and the tangent baking on the neighbors below
 
     // Shape-preserving split, in two phases. Adding a knot re-spaces the neighbors' automatic (centripetal)
     // tangents, so a plain insert would nudge the curve near it. Phase 1 (before the insert): read the current
@@ -4510,23 +4519,12 @@ static void GizmoContinue() {
         // direction turns with it: the eyes, their look-at points, and any baked tangents. Roll is left
         // alone - banking is relative to the camera's own travel, so spinning the path must not change it.
         if (SelectionCount() > 1 && sDragKind != 3) {
-            float c[3] = { 0.0f, 0.0f, 0.0f };
-            int n = 0;
-            for (size_t i = 0; i < sIds.size(); i++) {
-                if (IsSelected(sIds[i])) {
-                    c[0] += sKeyframes[i].eye[0];
-                    c[1] += sKeyframes[i].eye[1];
-                    c[2] += sKeyframes[i].eye[2];
-                    n++;
-                }
-            }
-            if (n == 0) {
-                return;
-            }
-            c[0] /= (float)n;
-            c[1] /= (float)n;
-            c[2] /= (float)n;
-            auto spin = [&](float* pt) { // rotate a world point about the centroid
+            // Pivot on the keyframe whose ring you GRABBED, not the group's centroid. The ring is drawn at
+            // that keyframe, so that is where the rotation visibly happens - a pivot somewhere off in the
+            // middle of the path makes the whole thing swing away from under the cursor. It also gives you
+            // the control you actually want: pick the end you are anchoring, turn the rest around it.
+            const float c[3] = { k.eye[0], k.eye[1], k.eye[2] };
+            auto spin = [&](float* pt) { // rotate a world point about the grabbed keyframe
                 float rel[3] = { pt[0] - c[0], pt[1] - c[1], pt[2] - c[2] };
                 float out[3];
                 v3rot(rel, axis, d, out);
@@ -8216,12 +8214,30 @@ void CinematicCamPathWindow::DrawElement() {
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button("Insert @ playhead")) {
-        InsertAtPlayhead();
-    }
-    if (ImGui::IsItemHovered()) {
-        CineTooltip("Add a keyframe at the current playhead time (on the existing curve, or the live "
-                    "freecam pose if there's no path yet).");
+    {
+        bool keepShape = CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.InsertKeepsShape"), 1) != 0;
+        if (ImGui::Button("Insert @ playhead")) {
+            InsertAtPlayhead(keepShape);
+        }
+        if (ImGui::IsItemHovered()) {
+            CineTooltip("Add a keyframe at the playhead, sitting on the curve the path already has (or the "
+                        "live freecam pose if there is no path yet).");
+        }
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Keep shape", &keepShape)) {
+            CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.InsertKeepsShape"), keepShape ? 1 : 0);
+            CVarSave();
+        }
+        if (ImGui::IsItemHovered()) {
+            CineTooltip("Who pays for the new keyframe.\n\n"
+                        "ON: the move stays bit-for-bit identical. Adding a knot would otherwise re-space the "
+                        "neighbours' automatic tangents and nudge the curve, so their tangents, aim rates and "
+                        "speeds are frozen at their current values - which pins three keyframes that used to "
+                        "be automatic. They show a * in the list, and Reset tangent frees them.\n\n"
+                        "OFF: the keyframe just lands on the curve and everything stays automatic. The shape "
+                        "shifts a little as the tangents re-space - which is fine, and usually what you want, "
+                        "when you inserted it in order to move it anyway.");
+        }
     }
 
     // Record the live freecam motion into keyframes.

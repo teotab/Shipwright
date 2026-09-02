@@ -1,6 +1,8 @@
 # 🎥 Cinematic Camera for Ship of Harkinian
 
-Welcome ! I've been working on this mod for a while now with the help of Claude. We've been though many iterations and now it finally feels complete enough to release as a beta. All feedback is more than welcome !
+Welcome ! I've been working on this mod for a while now with the help of Claude Fable and Opus. We've been though many iterations and now it finally feels complete enough to release as a beta. All feedback is more than welcome !
+Disclaimer : this PR was first written by claude then edited and re-written by me. All replies will always be written by **me only**
+
 
 This is a full **cinematic camera toolkit** for [Ship of Harkinian](https://github.com/HarbourMasters/Shipwright) with everything you could need to make cool cinematics in this timeless game. At your disposal, you've got : 
 
@@ -34,7 +36,8 @@ A fully detached, controller-driven camera that flies anywhere in the scene, ind
 - **Boost** and **precision** modifiers to glide through hyrule at light speed.
 - Fully rebindable; sticks remap in SoH's normal Controller Configuration. I set my camera toggle to "select"
 
-![Orbit+DayNight cycle](docs/media/DayNight.gif)
+![dolly](docs/media/scarecrow03.gif) ![statue](docs/media/Statue.gif)
+
 
 
 ### Keyframes and the path
@@ -142,8 +145,7 @@ Anything i've been used to in other editing softwares and felt the lack of in my
 - **Shooting bar** : Minimized play bar at the top of the screen while the shot is playing, no UI clutter.
 - **Window opacity** : fade the editor so the game reads through it. (life changer on single monitor setups)
 
-> **📷 Image slot — `docs/media/shooting-bar.png`**
-> The shooting bar over gameplay, showing how little screen it takes.
+![Orbit+DayNight cycle](docs/media/DayNight.gif)
 
 ---
 
@@ -154,8 +156,8 @@ Anything i've been used to in other editing softwares and felt the lack of in my
 3. Click **Open Path Editor**.
 4. I highly recommend going to the enhancements > cheats tab and turning on infinite health and noclip on L, along with speed modifier
 
-> **📷 Image slot — `docs/media/menu.png`**
-> The Dev Tools → Cinematic Cam menu page, so people know what they're looking for.
+![tools](docs/media/dev_tools.png)
+![cheats](docs/media/cheats.png)
 
 ### My workflow
 
