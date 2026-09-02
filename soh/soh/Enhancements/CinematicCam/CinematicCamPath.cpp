@@ -3111,6 +3111,126 @@ static void TrackFromJson(CineParamTrack& t, const nlohmann::json& j) {
 // either read the old form correctly or say plainly what was dropped. Version 0 (no field) means a file from
 // before this line existed - those carry per-keyframe ease and deg/s aim rates, both of which mean something
 // different now, so they load with those values left automatic rather than misinterpreted.
+// --- Fusion / DaVinci Resolve export -----------------------------------------------------------------
+// Writes the move as a Camera3D .setting file: drop it in Resolve's Fusion Settings folder and it appears
+// under the Settings menu, or just paste the text into the node graph.
+//
+// It BAKES one keyframe per frame rather than converting our splines into Fusion's. Our timing is an
+// arc-length schedule with its own acceleration curves - there is no Bezier handle that reproduces it - so
+// mapping spline to spline would be a second implementation of the motion, drifting from the first. Sampling
+// the real evaluator means everything already solved here (the speed curve, the easing, the aim modes,
+// look-at-Link) arrives in Fusion exactly as it plays in game.
+//
+// Coordinates: OOT is Y-up LEFT-handed (yaw measured from +Z toward +X); Fusion is Y-up right-handed with the
+// camera looking down its own -Z. So Z is negated on the way out, and the forward vector with it.
+static bool ExportFusion(const char* name, float fps, float scale, bool mirrorZ, char* status, size_t statusLen) {
+    if (sKeyframes.size() < 2) {
+        snprintf(status, statusLen, "Need at least two keyframes to export.");
+        return false;
+    }
+    if (fps < 1.0f) {
+        fps = 24.0f;
+    }
+    if (scale < 1e-3f) {
+        scale = 100.0f;
+    }
+    const float kPi = 3.14159265f;
+    const float zf = mirrorZ ? -1.0f : 1.0f;
+    // The film gate in the user's own Camera3D: 0.831496 x 0.467717, i.e. 16:9. Fusion's AoV is measured
+    // across the APERTURE WIDTH, while ours (view->fovy) is vertical - so it has to be widened by the aspect.
+    const float kApertureW = 0.831496062992126f, kApertureH = 0.467716535433071f;
+    const float aspect = kApertureW / kApertureH;
+
+    float total = EffectiveTotal();
+    int frames = (int)std::floor(total * fps + 0.5f);
+    if (frames < 1) {
+        frames = 1;
+    }
+    if (frames > 20000) { // a sane ceiling; 20000 frames is ~14 minutes at 24fps
+        frames = 20000;
+    }
+
+    struct Chan {
+        const char* op;
+        const char* colour;
+        std::vector<float> v;
+    };
+    Chan ch[7] = {
+        { "XOffset", "{ Red = 250, Green = 59, Blue = 49 }", {} },
+        { "YOffset", "{ Red = 252, Green = 206, Blue = 47 }", {} },
+        { "ZOffset", "{ Red = 254, Green = 131, Blue = 46 }", {} },
+        { "XRotation", "{ Red = 255, Green = 128, Blue = 128 }", {} },
+        { "YRotation", "{ Red = 128, Green = 255, Blue = 128 }", {} },
+        { "ZRotation", "{ Red = 128, Green = 128, Blue = 255 }", {} },
+        { "AoV", "{ Red = 200, Green = 200, Blue = 200 }", {} },
+    };
+    for (int i = 0; i <= frames; i++) {
+        float t = (float)i / fps;
+        CineKeyframe k = SampleAt(std::min(t, total));
+        float fwd[3] = { k.at[0] - k.eye[0], k.at[1] - k.eye[1], (k.at[2] - k.eye[2]) };
+        float l = std::sqrt(fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]);
+        if (l < 1e-5f) {
+            fwd[0] = 0.0f;
+            fwd[1] = 0.0f;
+            fwd[2] = 1.0f;
+            l = 1.0f;
+        }
+        float f[3] = { fwd[0] / l, fwd[1] / l, zf * fwd[2] / l }; // into Fusion's handedness
+        // Camera looks down -Z, rotation order XYZ: forward = (-sin(ry)cos(rx), sin(rx), -cos(ry)cos(rx)).
+        float rx = std::asin(std::min(std::max(f[1], -1.0f), 1.0f)) * 180.0f / kPi;
+        float ry = std::atan2(-f[0], -f[2]) * 180.0f / kPi;
+        ch[0].v.push_back(k.eye[0] / scale);
+        ch[1].v.push_back(k.eye[1] / scale);
+        ch[2].v.push_back(zf * k.eye[2] / scale);
+        ch[3].v.push_back(rx);
+        ch[4].v.push_back(ry);
+        ch[5].v.push_back(-k.roll); // our roll is clockwise-positive about the view axis; Fusion's Z is the other way
+        ch[6].v.push_back(2.0f * std::atan(std::tan(k.fov * 0.5f * kPi / 180.0f) * aspect) * 180.0f / kPi);
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories("cinematics", ec);
+    std::string path = std::string("cinematics/") + name + ".setting";
+    std::ofstream o(path);
+    if (!o.good()) {
+        snprintf(status, statusLen, "Could not write %s", path.c_str());
+        return false;
+    }
+    o << "{\n\tTools = ordered() {\n\t\tCamera3D1 = Camera3D {\n\t\t\tCtrlWZoom = false,\n\t\t\tInputs = {\n";
+    const char* inputs[7] = { "Transform3DOp.Translate.X",
+                              "Transform3DOp.Translate.Y",
+                              "Transform3DOp.Translate.Z",
+                              "Transform3DOp.Rotate.X",
+                              "Transform3DOp.Rotate.Y",
+                              "Transform3DOp.Rotate.Z",
+                              "AoV" };
+    for (int c = 0; c < 7; c++) {
+        o << "\t\t\t\t[\"" << inputs[c] << "\"] = Input {\n\t\t\t\t\tSourceOp = \"Camera3D1" << ch[c].op
+          << "\",\n\t\t\t\t\tSource = \"Value\",\n\t\t\t\t},\n";
+    }
+    o << "\t\t\t\t[\"Transform3DOp.Rotate.RotOrder\"] = Input { Value = FuID { \"XYZ\" }, },\n";
+    o << "\t\t\t\tFilmGate = Input { Value = FuID { \"BMD_URSA_4K_16x9\" }, },\n";
+    o << "\t\t\t\tApertureW = Input { Value = " << kApertureW << ", },\n";
+    o << "\t\t\t\tApertureH = Input { Value = " << kApertureH << ", },\n";
+    o << "\t\t\t},\n\t\t\tViewInfo = OperatorInfo { Pos = { 200, 10 } },\n\t\t},\n";
+    o.setf(std::ios::fixed);
+    o.precision(6);
+    for (int c = 0; c < 7; c++) {
+        o << "\t\tCamera3D1" << ch[c].op << " = BezierSpline {\n\t\t\tSplineColor = " << ch[c].colour
+          << ",\n\t\t\tCtrlWZoom = false,\n\t\t\tNameSet = true,\n\t\t\tKeyFrames = {\n";
+        for (size_t i = 0; i < ch[c].v.size(); i++) {
+            o << "\t\t\t\t[" << i << "] = { " << ch[c].v[i] << ", Flags = { Linear = true } }"
+              << (i + 1 < ch[c].v.size() ? ",\n" : "\n");
+        }
+        o << "\t\t\t}\n\t\t}" << (c < 6 ? ",\n" : "\n");
+    }
+    o << "\t}\n}\n";
+    o.close();
+    snprintf(status, statusLen, "Exported %s (%d frames @ %.4g fps). Copy it to Resolve's Fusion Settings folder.",
+             path.c_str(), frames + 1, fps);
+    return true;
+}
+
 static const int kPathFormatVersion = 2;
 
 // Write the whole path to cinematics/<base>.json. `bindEntrance` updates the path-bound location from the
@@ -9131,6 +9251,49 @@ void CinematicCamPathWindow::DrawElement() {
         }
         ImGui::SameLine();
         ImGui::Checkbox("Teleport on load", &sTeleportOnLoad);
+        // --- Fusion / Resolve export -------------------------------------------------------------------
+        ImGui::Separator();
+        {
+            static float exFps = 30.0f, exScale = 100.0f;
+            static bool exMirrorZ = true;
+            if (ImGui::Button("Export to Fusion")) {
+                ExportFusion(sFilename, exFps, exScale, exMirrorZ, sFileStatus, sizeof(sFileStatus));
+            }
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("Write this move as a Fusion Camera3D, to cinematics/<name>.setting.\n\n"
+                            "It bakes ONE KEYFRAME PER FRAME by sampling the real playback, so the speed "
+                            "curve, the easing and every aim mode arrive in Fusion exactly as they play here "
+                            "- rather than trying to redraw our curves as Bezier splines, which could not "
+                            "match them.\n\n"
+                            "Copy the file into Resolve's Fusion Settings folder and it appears in the "
+                            "Settings menu, or paste its text straight into the node graph.");
+            }
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(80.0f);
+            ImGui::InputFloat("fps##ex", &exFps, 0.0f, 0.0f, "%.3f");
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("Your COMP's frame rate - the camera is baked onto that grid. It has to match the "
+                            "timeline you drop the footage on, or the camera drifts out of sync with the "
+                            "picture over a long move. 23.976 and 29.97 are typed as-is.");
+            }
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(80.0f);
+            ImGui::InputFloat("units##ex", &exScale, 0.0f, 0.0f, "%.0f");
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("Game units per Fusion unit. Link is about 60 units tall, and Fusion's 3D space "
+                            "likes numbers near 1, so 100 puts a room at a comfortable size. Only the scale "
+                            "changes - the move is identical.");
+            }
+            ImGui::SameLine();
+            ImGui::Checkbox("Mirror Z", &exMirrorZ);
+            if (ImGui::IsItemHovered()) {
+                CineTooltip("OOT measures its world left-handed and Fusion is right-handed, so Z is negated "
+                            "on the way out. Leave this on. If the exported move comes out MIRRORED - turning "
+                            "left where the game turns right - this is the switch to try.");
+            }
+            CineHint("There is no depth pass, so anything you place behind geometry will not be occluded by "
+                     "it. Text in front of the world lines up; text going behind a pillar still needs roto.");
+        }
         if (ImGui::IsItemHovered()) {
             CineTooltip("When loading a path with a bound location, fade-warp to it (skipped if already there).");
         }
