@@ -16,6 +16,14 @@
 #include <array>
 #include <ctime>
 #include <cstdarg>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#define STB_IMAGE_WRITE_STATIC // keep the writer private to this file; torch links its own copy
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
@@ -488,6 +496,10 @@ static const std::vector<TrackDef>& AllTrackDefs() {
 static int sEaseMode = 1;        // playback timing easing: 0 none, 1 in/out, 2 in, 3 out
 static float sEaseAmount = 0.5f; // 0 = linear, 1 = full ease
 static float sPlayU = 0.0f;      // linear play progress 0..1, eased into the playhead
+// Set when the offline render has handed over its last frame. The teardown then happens on the next game
+// frame rather than inside the frame grab, which at that moment is still holding a mapped GPU texture.
+static bool sRenderFinished = false;
+static void RenderStop(bool finished);
 
 // Camera shake / handheld: smooth pseudo-noise applied to the played-back pose for organic motion.
 static bool sShakeEnabled = false;
@@ -2393,6 +2405,10 @@ static void RecordKeyframe(float t) {
 // Runs every game frame (OnCameraState hook), just before Camera_Update.
 static void PlaybackTick() {
     static bool wasActive = false;
+    if (sRenderFinished) { // the render ran out of frames during the last grab; close it down here instead
+        sRenderFinished = false;
+        RenderStop(true);
+    }
     sLoopMarkerFrame = false; // only true for the single frame a loop restarts (set below)
 
     // Perf probe: this hook fires once per frame, so the gap to the previous call is the whole frame period
@@ -3111,6 +3127,8 @@ static void TrackFromJson(CineParamTrack& t, const nlohmann::json& j) {
 // either read the old form correctly or say plainly what was dropped. Version 0 (no field) means a file from
 // before this line existed - those carry per-keyframe ease and deg/s aim rates, both of which mean something
 // different now, so they load with those values left automatic rather than misinterpreted.
+extern "C" float CinematicCam_GetRenderAspect(void);
+
 // --- Fusion / DaVinci Resolve export -----------------------------------------------------------------
 // Writes the move as a Camera3D .setting file: drop it in Resolve's Fusion Settings folder and it appears
 // under the Settings menu, or just paste the text into the node graph.
@@ -3123,7 +3141,8 @@ static void TrackFromJson(CineParamTrack& t, const nlohmann::json& j) {
 //
 // Coordinates: OOT is Y-up LEFT-handed (yaw measured from +Z toward +X); Fusion is Y-up right-handed with the
 // camera looking down its own -Z. So Z is negated on the way out, and the forward vector with it.
-static bool ExportFusion(const char* name, float fps, float scale, bool mirrorZ, char* status, size_t statusLen) {
+static bool ExportFusion(const char* name, float fps, float scale, bool mirrorZ, char* status, size_t statusLen,
+                         const char* dir = nullptr, float aspectOverride = 0.0f) {
     if (sKeyframes.size() < 2) {
         snprintf(status, statusLen, "Need at least two keyframes to export.");
         return false;
@@ -3136,10 +3155,23 @@ static bool ExportFusion(const char* name, float fps, float scale, bool mirrorZ,
     }
     const float kPi = 3.14159265f;
     const float zf = mirrorZ ? -1.0f : 1.0f;
-    // The film gate in the user's own Camera3D: 0.831496 x 0.467717, i.e. 16:9. Fusion's AoV is measured
-    // across the APERTURE WIDTH, while ours (view->fovy) is vertical - so it has to be widened by the aspect.
-    const float kApertureW = 0.831496062992126f, kApertureH = 0.467716535433071f;
-    const float aspect = kApertureW / kApertureH;
+    // FUSION'S AoV IS VERTICAL, not horizontal. Proof, from a Camera3D authored in Resolve: it carried
+    // AoV = 19.2642683 with the BMD_URSA_4K_16x9 gate (0.831496 x 0.467717). Solve that angle against the
+    // aperture HEIGHT and the focal length is 1.37789 in = 35.00 mm exactly; against the WIDTH it is 62.22 mm,
+    // which is not a lens. So AoV pairs with the height, and our fov - view->fovy, also vertical (z_view.c) -
+    // goes out unchanged. It used to be widened by the gate aspect, which made every export ~91 degrees.
+    //
+    // The gate is then shaped to match the FOOTAGE: keep the URSA aperture width and derive the height from
+    // what the game is actually rendering, so a non-16:9 window still lines up horizontally.
+    const float kApertureW = 0.831496062992126f;
+    // The gate must match the FOOTAGE, which during an offline render is the size the render is forced to,
+    // not whatever the window happens to be right now.
+    float aspect = (aspectOverride > 0.01f) ? aspectOverride : CinematicCam_GetRenderAspect();
+    if (!(aspect > 0.1f) || !(aspect < 10.0f)) {
+        aspect = 16.0f / 9.0f;
+    }
+    const float kApertureH = kApertureW / aspect;
+    const bool gate16x9 = std::fabs(aspect - 16.0f / 9.0f) < 0.005f;
 
     float total = EffectiveTotal();
     // Bake against the WALL CLOCK of playback, not the authored timeline. Playback advances a linear progress
@@ -3215,13 +3247,14 @@ static bool ExportFusion(const char* name, float fps, float scale, bool mirrorZ,
         ch[3].v.push_back(rx);
         ch[4].v.push_back(ry);
         ch[5].v.push_back(-k.roll); // our roll is clockwise-positive about the view axis; Fusion's Z is the other way
-        ch[6].v.push_back(2.0f * std::atan(std::tan(k.fov * 0.5f * kPi / 180.0f) * aspect) * 180.0f / kPi);
+        ch[6].v.push_back(k.fov);   // vertical, both sides - see the AoV note above
     }
     sShakeIntensity = shakeSave; // it is live playback state; the export must not leave it moved
 
     std::error_code ec;
-    std::filesystem::create_directories("cinematics", ec);
-    std::string path = std::string("cinematics/") + name + ".setting";
+    std::string outDir = (dir != nullptr && dir[0] != '\0') ? dir : "cinematics";
+    std::filesystem::create_directories(outDir, ec);
+    std::string path = outDir + "/" + name + ".setting";
     std::ofstream o(path);
     if (!o.good()) {
         snprintf(status, statusLen, "Could not write %s", path.c_str());
@@ -3240,7 +3273,9 @@ static bool ExportFusion(const char* name, float fps, float scale, bool mirrorZ,
           << "\",\n\t\t\t\t\tSource = \"Value\",\n\t\t\t\t},\n";
     }
     o << "\t\t\t\t[\"Transform3DOp.Rotate.RotOrder\"] = Input { Value = FuID { \"ZXY\" }, },\n";
-    o << "\t\t\t\tFilmGate = Input { Value = FuID { \"BMD_URSA_4K_16x9\" }, },\n";
+    if (gate16x9) { // naming a preset gate is only honest when the numbers below really are that gate
+        o << "\t\t\t\tFilmGate = Input { Value = FuID { \"BMD_URSA_4K_16x9\" }, },\n";
+    }
     o << "\t\t\t\tApertureW = Input { Value = " << kApertureW << ", },\n";
     o << "\t\t\t\tApertureH = Input { Value = " << kApertureH << ", },\n";
     o << "\t\t\t},\n\t\t\tViewInfo = OperatorInfo { Pos = { 200, 10 } },\n\t\t},\n";
@@ -3260,6 +3295,305 @@ static bool ExportFusion(const char* name, float fps, float scale, bool mirrorZ,
     snprintf(status, statusLen, "Exported %s (%d frames @ %.4g fps). Copy it to Resolve's Fusion Settings folder.",
              path.c_str(), frames + 1, fps);
     return true;
+}
+
+// --- Offline frame-stepped render --------------------------------------------------------------------
+// Screen capture samples on a WALL CLOCK: when the game hitches, the recorder writes a doubled frame and the
+// take stretches. Nothing in playback is on a wall clock - the playhead advances kTickSeconds per LOGIC TICK,
+// and the renderer emits a fixed number of interpolated frames per tick - so saving every frame the game draws
+// gives a sequence whose timing is exact however slowly it renders. A 4K take running at three frames a second
+// comes out as clean as one that ran live, which is the whole point: quality stops costing timing.
+//
+// The pixels come from the GAME's framebuffer rather than the window (see CinematicCam_GrabFrame in
+// OTRGlobals.cpp), so the editor can stay open while it renders - the UI is composited onto the window
+// afterwards and never touches the buffer being read.
+struct CineRenderJob {
+    int index;
+    uint32_t w, h;
+    std::vector<uint8_t> px; // empty = a frame the renderer refused to draw; the last one is copied instead
+};
+
+static std::deque<CineRenderJob> sRenderQ;
+static std::mutex sRenderMx;
+static std::condition_variable sRenderCvJob, sRenderCvSpace;
+static std::thread sRenderWriter;
+static bool sRenderWriterStop = false;
+static bool sRendering = false;
+static int sRenderIdx = 0;                  // next frame number to hand to the writer
+static int sRenderTotal = 0;                // frames this take is worth - the same count the .setting carries
+static int sRenderDropped = 0;              // frames the renderer would not draw (duplicated to hold the clock)
+static std::atomic<int> sRenderFailed{ 0 }; // frames that would not write to disk
+static std::string sRenderDir, sRenderBase, sRenderLastPath;
+static float sExFps = 30.0f, sExScale = 100.0f;
+static bool sExMirrorZ = true;
+static int sRenderHeight = 1080, sRenderArX = 16, sRenderArY = 9;
+// The frame is rendered LARGER than it is saved and averaged down. Two reasons, and both matter:
+//   - the game only draws into its own framebuffer when the render size differs from the window; at equal
+//     sizes it draws to the window instead, where the editor is composited on top and the clean frame is
+//     gone. Rendering bigger guarantees the difference.
+//   - averaging a 2x2 block per pixel is supersampling, which is the anti-aliasing this game never had.
+static int sRenderW = 1920, sRenderH = 1080, sRenderSS = 2;
+// Settings borrowed for the length of a render and put back afterwards.
+static int sRenderSavedEnabled = 0, sRenderSavedVertToggle = 0, sRenderSavedPixels = 480;
+static int sRenderSavedIfps = 20, sRenderSavedMatch = 0;
+static float sRenderSavedArX = 16.0f, sRenderSavedArY = 9.0f;
+
+extern "C" void CinematicCam_ReleaseFrameGrab(void);
+extern "C" const char* CinematicCam_GrabFailReason(void);
+extern "C" void CinematicCam_GetViewportSize(int* w, int* h);
+extern "C" void CinematicCam_ResetGrabDiag(void);
+
+// PNG compression is slow enough to halve the render rate, so it happens on its own thread. The queue is
+// bounded: when the writer falls behind, the game thread waits instead of growing a gigabyte of frames.
+static void RenderWriterMain() {
+    for (;;) {
+        CineRenderJob job;
+        {
+            std::unique_lock<std::mutex> lk(sRenderMx);
+            sRenderCvJob.wait(lk, [] { return sRenderWriterStop || !sRenderQ.empty(); });
+            if (sRenderQ.empty()) {
+                return; // stopping, and everything queued is on disk
+            }
+            job = std::move(sRenderQ.front());
+            sRenderQ.pop_front();
+        }
+        sRenderCvSpace.notify_all();
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s.%06d.png", sRenderDir.c_str(), sRenderBase.c_str(), job.index);
+        if (job.px.empty()) {
+            // Duplicating the previous frame keeps every LATER frame on its own number, which matters far
+            // more than the duplicate does: a missing file would slide the whole take against the camera.
+            std::error_code ec;
+            if (!sRenderLastPath.empty()) {
+                std::filesystem::copy_file(sRenderLastPath, path, std::filesystem::copy_options::overwrite_existing,
+                                           ec);
+            }
+            continue;
+        }
+        if (stbi_write_png(path, (int)job.w, (int)job.h, 4, job.px.data(), (int)job.w * 4) == 0) {
+            sRenderFailed++;
+        } else {
+            sRenderLastPath = path;
+        }
+    }
+}
+
+static void RenderStop(bool finished) {
+    if (!sRendering) {
+        return;
+    }
+    sRendering = false;
+    sPlaying = false;
+    {
+        std::unique_lock<std::mutex> lk(sRenderMx);
+        sRenderWriterStop = true;
+    }
+    sRenderCvJob.notify_all();
+    sRenderCvSpace.notify_all();
+    if (sRenderWriter.joinable()) {
+        sRenderWriter.join();
+    }
+    CinematicCam_ReleaseFrameGrab();
+    CVarSetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".Enabled", sRenderSavedEnabled);
+    CVarSetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".VerticalResolutionToggle", sRenderSavedVertToggle);
+    CVarSetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".VerticalPixelCount", sRenderSavedPixels);
+    CVarSetFloat(CVAR_PREFIX_ADVANCED_RESOLUTION ".AspectRatioX", sRenderSavedArX);
+    CVarSetFloat(CVAR_PREFIX_ADVANCED_RESOLUTION ".AspectRatioY", sRenderSavedArY);
+    CVarSetInteger(CVAR_SETTING("InterpolationFPS"), sRenderSavedIfps);
+    CVarSetInteger(CVAR_SETTING("MatchRefreshRate"), sRenderSavedMatch);
+    int failed = sRenderFailed.load();
+    if (finished) {
+        const char* why = CinematicCam_GrabFailReason();
+        if (sRenderDropped >= sRenderIdx && sRenderIdx > 0) {
+            snprintf(sFileStatus, sizeof(sFileStatus), "Rendered NOTHING: %s", (why[0] != '\0') ? why : "unknown");
+        } else {
+            snprintf(sFileStatus, sizeof(sFileStatus), "Rendered %d frames to %s%s%s", sRenderIdx, sRenderDir.c_str(),
+                     sRenderDropped > 0 ? " - some frames were duplicated" : "",
+                     failed > 0 ? " - SOME FRAMES FAILED TO WRITE" : "");
+        }
+    } else {
+        snprintf(sFileStatus, sizeof(sFileStatus), "Render stopped at frame %d of %d (%s kept)", sRenderIdx,
+                 sRenderTotal, sRenderDir.c_str());
+    }
+}
+
+static void RenderStart() {
+    if (sRendering) {
+        return;
+    }
+    if (sKeyframes.size() < 2) {
+        snprintf(sFileStatus, sizeof(sFileStatus), "Need at least two keyframes to render.");
+        return;
+    }
+    float fps = sExFps;
+    if (!(fps >= 1.0f)) {
+        fps = 30.0f;
+    }
+    if (sRenderHeight < 240) {
+        sRenderHeight = 240;
+    }
+    if (sRenderHeight > 4320) {
+        sRenderHeight = 4320;
+    }
+    if (sRenderArX < 1) {
+        sRenderArX = 16;
+    }
+    if (sRenderArY < 1) {
+        sRenderArY = 9;
+    }
+    sRenderH = sRenderHeight;
+    sRenderW = (int)((float)sRenderHeight / (float)sRenderArY * (float)sRenderArX + 0.5f);
+    // Pick the smallest supersample factor whose rendered size is not exactly the window's - see above.
+    int vw = 0, vh = 0;
+    CinematicCam_GetViewportSize(&vw, &vh);
+    sRenderSS = 2;
+    while (sRenderSS < 4 && sRenderW * sRenderSS == vw && sRenderH * sRenderSS == vh) {
+        sRenderSS++;
+    }
+    while (sRenderSS > 1 && (sRenderH * sRenderSS > 4320 || sRenderW * sRenderSS > 8096)) {
+        sRenderSS--;
+    }
+    if (sRenderW * sRenderSS == vw && sRenderH * sRenderSS == vh) {
+        snprintf(sFileStatus, sizeof(sFileStatus),
+                 "Cannot render at exactly the window size (%dx%d) - pick another height.", vw, vh);
+        return;
+    }
+    float total = EffectiveTotal();
+    float pspeed = (sPlaySpeed > 1e-3f) ? sPlaySpeed : 1.0f;
+    sRenderTotal = (int)std::floor((total / pspeed) * fps + 0.5f) + 1; // same grid the exporter bakes onto
+    if (sRenderTotal < 2) {
+        snprintf(sFileStatus, sizeof(sFileStatus), "This take is too short to render.");
+        return;
+    }
+    sRenderBase = sFilename;
+    sRenderDir = std::string("cinematics/renders/") + sRenderBase;
+    std::error_code ec;
+    std::filesystem::create_directories(sRenderDir, ec);
+    // The camera that belongs to these frames goes in the same folder, on the same clock and the same gate -
+    // a sequence and a .setting that were made apart are exactly how a match drifts.
+    ExportFusion(sFilename, fps, sExScale, sExMirrorZ, sFileStatus, sizeof(sFileStatus), sRenderDir.c_str(),
+                 (float)sRenderArX / (float)sRenderArY);
+
+    sRenderSavedEnabled = CVarGetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".Enabled", 0);
+    sRenderSavedVertToggle = CVarGetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".VerticalResolutionToggle", 0);
+    sRenderSavedPixels = CVarGetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".VerticalPixelCount", 480);
+    sRenderSavedArX = CVarGetFloat(CVAR_PREFIX_ADVANCED_RESOLUTION ".AspectRatioX", 16.0f);
+    sRenderSavedArY = CVarGetFloat(CVAR_PREFIX_ADVANCED_RESOLUTION ".AspectRatioY", 9.0f);
+    sRenderSavedIfps = CVarGetInteger(CVAR_SETTING("InterpolationFPS"), 20);
+    sRenderSavedMatch = CVarGetInteger(CVAR_SETTING("MatchRefreshRate"), 0);
+
+    // Pin the render size. This also guarantees the game draws into its OWN framebuffer rather than straight
+    // to the window, which is what keeps the editor out of the picture.
+    CVarSetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".Enabled", 1);
+    CVarSetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".VerticalResolutionToggle", 1);
+    CVarSetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".VerticalPixelCount", sRenderH * sRenderSS);
+    CVarSetFloat(CVAR_PREFIX_ADVANCED_RESOLUTION ".AspectRatioX", (float)sRenderArX);
+    CVarSetFloat(CVAR_PREFIX_ADVANCED_RESOLUTION ".AspectRatioY", (float)sRenderArY);
+    // One rendered frame per output frame: the interpolation rate IS the output rate.
+    CVarSetInteger(CVAR_SETTING("MatchRefreshRate"), 0);
+    CVarSetInteger(CVAR_SETTING("InterpolationFPS"), (int)std::lround(fps));
+
+    sPlayhead = 0.0f;
+    sPlayU = 0.0f;
+    sPlayDir = 1;
+    sPreview = false;
+    CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
+    if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.SyncIdleAnim"), 0)) {
+        CinematicCam_SyncLinkIdleAnim();
+    }
+    sPlaying = true;
+
+    sRenderIdx = 0;
+    sRenderDropped = 0;
+    sRenderFailed = 0;
+    sRenderLastPath.clear();
+    sRenderFinished = false;
+    CinematicCam_ResetGrabDiag();
+    sRenderWriterStop = false;
+    sRenderWriter = std::thread(RenderWriterMain);
+    sRendering = true;
+    snprintf(sFileStatus, sizeof(sFileStatus), "Rendering %d frames at %dx%d (drawn at %dx)...", sRenderTotal, sRenderW,
+             sRenderH, sRenderSS);
+}
+
+static void RenderQueue(CineRenderJob&& job) {
+    {
+        std::unique_lock<std::mutex> lk(sRenderMx);
+        sRenderCvSpace.wait(lk, [] { return !sRendering || sRenderQ.size() < 8; });
+        sRenderQ.push_back(std::move(job));
+    }
+    sRenderCvJob.notify_one();
+}
+
+extern "C" bool CinematicCam_IsRendering(void) {
+    return sRendering;
+}
+
+extern "C" void CinematicCam_SubmitRenderedFrame(const void* pixels, uint32_t w, uint32_t h, uint32_t rowPitch,
+                                                 int bgra) {
+    if (!sRendering || pixels == nullptr || w == 0 || h == 0) {
+        return;
+    }
+    if (sRenderIdx >= sRenderTotal) {
+        sRenderFinished = true;
+        return;
+    }
+    // The renderer must be drawing exactly what was asked for. Anything else means the resolution settings
+    // did not take, and half a sequence at the wrong size is worse than none.
+    if (w != (uint32_t)(sRenderW * sRenderSS) || h != (uint32_t)(sRenderH * sRenderSS)) {
+        snprintf(sFileStatus, sizeof(sFileStatus), "Render stopped: the game is drawing %ux%u, not %dx%d.", w, h,
+                 sRenderW * sRenderSS, sRenderH * sRenderSS);
+        sRenderIdx = sRenderTotal; // stop asking for frames; the teardown happens on the next game frame
+        sRenderFinished = true;
+        return;
+    }
+    CineRenderJob job;
+    job.index = sRenderIdx++;
+    job.w = (uint32_t)sRenderW;
+    job.h = (uint32_t)sRenderH;
+    job.px.resize((size_t)sRenderW * (size_t)sRenderH * 4);
+    const uint8_t* src = (const uint8_t*)pixels;
+    const int ss = sRenderSS;
+    const int n = ss * ss;
+    const int ri = bgra ? 2 : 0, bi = bgra ? 0 : 2;
+    for (int y = 0; y < sRenderH; y++) {
+        uint8_t* d = &job.px[(size_t)y * (size_t)sRenderW * 4];
+        for (int x = 0; x < sRenderW; x++) {
+            int r = 0, g = 0, b = 0;
+            for (int j = 0; j < ss; j++) {
+                const uint8_t* sr = src + (size_t)(y * ss + j) * (size_t)rowPitch + (size_t)(x * ss) * 4;
+                for (int i = 0; i < ss; i++) {
+                    r += sr[i * 4 + ri];
+                    g += sr[i * 4 + 1];
+                    b += sr[i * 4 + bi];
+                }
+            }
+            d[x * 4 + 0] = (uint8_t)(r / n);
+            d[x * 4 + 1] = (uint8_t)(g / n);
+            d[x * 4 + 2] = (uint8_t)(b / n);
+            d[x * 4 + 3] = 255; // the game's alpha channel is not a matte - a see-through PNG helps nobody
+        }
+    }
+    RenderQueue(std::move(job));
+    if (sRenderIdx >= sRenderTotal) {
+        sRenderFinished = true;
+    }
+}
+
+extern "C" void CinematicCam_NoteDroppedFrame(void) {
+    if (!sRendering) {
+        return;
+    }
+    if (sRenderIdx >= sRenderTotal) {
+        sRenderFinished = true;
+        return;
+    }
+    CineRenderJob job;
+    job.index = sRenderIdx++;
+    job.w = 0;
+    job.h = 0; // no pixels: the writer copies the frame before it
+    sRenderDropped++;
+    RenderQueue(std::move(job));
 }
 
 static const int kPathFormatVersion = 2;
@@ -9298,13 +9632,14 @@ void CinematicCamPathWindow::DrawElement() {
         }
         ImGui::SameLine();
         ImGui::Checkbox("Teleport on load", &sTeleportOnLoad);
+        if (ImGui::IsItemHovered()) {
+            CineTooltip("When loading a path with a bound location, fade-warp to it (skipped if already there).");
+        }
         // --- Fusion / Resolve export -------------------------------------------------------------------
         ImGui::Separator();
         {
-            static float exFps = 30.0f, exScale = 100.0f;
-            static bool exMirrorZ = true;
             if (ImGui::Button("Export to Fusion")) {
-                ExportFusion(sFilename, exFps, exScale, exMirrorZ, sFileStatus, sizeof(sFileStatus));
+                ExportFusion(sFilename, sExFps, sExScale, sExMirrorZ, sFileStatus, sizeof(sFileStatus));
             }
             if (ImGui::IsItemHovered()) {
                 CineTooltip("Write this move as a Fusion Camera3D, to cinematics/<name>.setting.\n\n"
@@ -9317,7 +9652,7 @@ void CinematicCamPathWindow::DrawElement() {
             }
             ImGui::SameLine();
             ImGui::SetNextItemWidth(80.0f);
-            ImGui::InputFloat("fps##ex", &exFps, 0.0f, 0.0f, "%.3f");
+            ImGui::InputFloat("fps##ex", &sExFps, 0.0f, 0.0f, "%.3f");
             if (ImGui::IsItemHovered()) {
                 CineTooltip("Your COMP's frame rate - the camera is baked onto that grid. It has to match the "
                             "timeline you drop the footage on, or the camera drifts out of sync with the "
@@ -9325,24 +9660,87 @@ void CinematicCamPathWindow::DrawElement() {
             }
             ImGui::SameLine();
             ImGui::SetNextItemWidth(80.0f);
-            ImGui::InputFloat("units##ex", &exScale, 0.0f, 0.0f, "%.0f");
+            ImGui::InputFloat("units##ex", &sExScale, 0.0f, 0.0f, "%.0f");
             if (ImGui::IsItemHovered()) {
                 CineTooltip("Game units per Fusion unit. Link is about 60 units tall, and Fusion's 3D space "
                             "likes numbers near 1, so 100 puts a room at a comfortable size. Only the scale "
                             "changes - the move is identical.");
             }
             ImGui::SameLine();
-            ImGui::Checkbox("Mirror Z", &exMirrorZ);
+            ImGui::Checkbox("Mirror Z", &sExMirrorZ);
             if (ImGui::IsItemHovered()) {
                 CineTooltip("OOT measures its world left-handed and Fusion is right-handed, so Z is negated "
                             "on the way out. Leave this on. If the exported move comes out MIRRORED - turning "
                             "left where the game turns right - this is the switch to try.");
             }
-            CineHint("There is no depth pass, so anything you place behind geometry will not be occluded by "
-                     "it. Text in front of the world lines up; text going behind a pillar still needs roto.");
+            CineHint("No depth pass yet, so anything placed behind geometry is not occluded by it: text in "
+                     "front of the world lines up, text going behind a pillar still needs roto.");
         }
-        if (ImGui::IsItemHovered()) {
-            CineTooltip("When loading a path with a bound location, fade-warp to it (skipped if already there).");
+
+        // --- Offline render -----------------------------------------------------------------------------
+        ImGui::Separator();
+        {
+            if (!sRendering) {
+                if (ImGui::Button("Render frames")) {
+                    RenderStart();
+                }
+                if (ImGui::IsItemHovered()) {
+                    CineTooltip(
+                        "Play the take and save every frame as a PNG, to cinematics/renders/<name>/.\n\n"
+                        "This is NOT screen capture. A recorder samples the screen on a wall clock, so a hitch "
+                        "costs you a doubled frame and a stretched take. Here the playhead advances per frame "
+                        "DRAWN, so the timing is exact however slowly it renders - which means you can render 4K "
+                        "at three frames a second and it is still perfectly in time.\n\n"
+                        "The matching Fusion camera is written into the same folder, on the same clock and the "
+                        "same gate, so the two cannot drift apart.\n\n"
+                        "It reads the game's own buffer, so this editor is not in the shot. Each frame is drawn "
+                        "at twice this size and averaged down, which is the anti-aliasing the N64 never had. "
+                        "Letterbox bars are drawn by the game, so they BAKE IN - turn them off if you would "
+                        "rather add them in the edit. There is no sound.");
+                }
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(70.0f);
+                ImGui::InputInt("high##rn", &sRenderHeight, 0, 0);
+                if (ImGui::IsItemHovered()) {
+                    CineTooltip("Output height in pixels - the render is pinned to this size and no longer "
+                                "depends on the window. 1080, or 2160 for 4K. The width follows the ratio.");
+                }
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(45.0f);
+                ImGui::InputInt("##rnarx", &sRenderArX, 0, 0);
+                ImGui::SameLine(0.0f, 4.0f);
+                ImGui::TextUnformatted(":");
+                ImGui::SameLine(0.0f, 4.0f);
+                ImGui::SetNextItemWidth(45.0f);
+                ImGui::InputInt("ratio##rnary", &sRenderArY, 0, 0);
+                if (ImGui::IsItemHovered()) {
+                    CineTooltip("Frame shape. 16:9 for normal delivery, 21:9 for scope. The game keeps its "
+                                "vertical view and widens - so a wider ratio shows MORE at the sides, it does "
+                                "not crop the top and bottom.");
+                }
+                CineHint("%d x %d at %.4g fps, about %d frames - drawn larger and averaged down.",
+                         (int)((float)sRenderHeight / (float)(sRenderArY > 0 ? sRenderArY : 9) *
+                               (float)(sRenderArX > 0 ? sRenderArX : 16)),
+                         sRenderHeight, sExFps,
+                         (int)std::floor((EffectiveTotal() / ((sPlaySpeed > 1e-3f) ? sPlaySpeed : 1.0f)) *
+                                             ((sExFps >= 1.0f) ? sExFps : 30.0f) +
+                                         0.5f) +
+                             1);
+            } else {
+                if (ImGui::Button("Stop render")) {
+                    RenderStop(false);
+                }
+                ImGui::SameLine();
+                ImGui::ProgressBar(sRenderTotal > 0 ? (float)sRenderIdx / (float)sRenderTotal : 0.0f,
+                                   ImVec2(160.0f, 0.0f));
+                ImGui::SameLine();
+                ImGui::Text("%d / %d", sRenderIdx, sRenderTotal);
+                if (sRenderDropped > 0) {
+                    CineHint("%d frame(s) the renderer would not draw were filled with the frame before, so "
+                             "everything after them stays on its own number.",
+                             sRenderDropped);
+                }
+            }
         }
         if (sPathEntrance >= 0) {
             bool here = (CinematicCam_GetCurrentEntrance() == sPathEntrance);

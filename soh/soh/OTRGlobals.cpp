@@ -12,6 +12,10 @@
 
 #include "ResourceManagerHelpers.h"
 #include <fast/Fast3dWindow.h>
+#include <fast/backends/gfx_rendering_api.h>
+#if defined(_WIN32)
+#include <d3d11.h>
+#endif
 #include <libultraship/bridge/audiobridge.h>
 #include <libultraship/bridge/gfxdebuggerbridge.h>
 #include <libultraship/bridge/windowbridge.h>
@@ -1728,7 +1732,8 @@ extern "C" void Graph_StartFrame() {
                 case SaveStateReturn::FAIL_WRONG_GAMESTATE:
                     SPDLOG_ERROR("[SOH] Can not save a state outside of \"GamePlay\"");
                     break;
-                    [[unlikely]] default : break;
+                [[unlikely]] default:
+                    break;
             }
             break;
         }
@@ -1768,7 +1773,8 @@ extern "C" void Graph_StartFrame() {
                 case SaveStateReturn::FAIL_WRONG_GAMESTATE:
                     SPDLOG_ERROR("[SOH] Can not load a state outside of \"GamePlay\"");
                     break;
-                    [[unlikely]] default : break;
+                [[unlikely]] default:
+                    break;
             }
 
             break;
@@ -1789,6 +1795,162 @@ extern "C" void Graph_StartFrame() {
     }
 #endif
 }
+
+// --- Offline render frame grab -----------------------------------------------------------------------
+// Hand the cinematic renderer the frame the game just drew. It reads the GAME's framebuffer, never the window:
+// the editor UI is composited onto the window afterwards, so the game's own buffer stays clean with every
+// panel open. DirectX 11 only for now - the other backends want the same dozen calls against their own API.
+extern "C" bool CinematicCam_IsRendering(void);
+extern "C" void CinematicCam_SubmitRenderedFrame(const void* pixels, uint32_t w, uint32_t h, uint32_t rowPitch,
+                                                 int bgra);
+extern "C" void CinematicCam_NoteDroppedFrame(void);
+
+// Why the last grab gave up, so a render that writes nothing can say what stopped it instead of just
+// reporting a pile of duplicated frames.
+static const char* sGrabFail = "";
+static bool sGrabLogged = false;
+
+extern "C" void CinematicCam_ResetGrabDiag(void) {
+    sGrabFail = "";
+    sGrabLogged = false;
+}
+extern "C" const char* CinematicCam_GrabFailReason(void) {
+    return sGrabFail;
+}
+
+#if defined(_WIN32)
+static ID3D11Texture2D* sGrabStaging = nullptr;
+static uint32_t sGrabStagingW = 0, sGrabStagingH = 0;
+
+extern "C" void CinematicCam_ReleaseFrameGrab(void) {
+    if (sGrabStaging != nullptr) {
+        sGrabStaging->Release();
+        sGrabStaging = nullptr;
+    }
+    sGrabStagingW = 0;
+    sGrabStagingH = 0;
+}
+
+static void CinematicCam_GrabFrame(Fast::Interpreter* intp) {
+    if (intp == nullptr || intp->mRapi == nullptr) {
+        sGrabFail = "no interpreter";
+        CinematicCam_NoteDroppedFrame();
+        return;
+    }
+    if (!intp->mRendersToFb) {
+        sGrabFail = "game draws straight to the window";
+        if (!sGrabLogged) {
+            sGrabLogged = true;
+            uint32_t cw = 0, chh = 0;
+            intp->GetCurDimensions(&cw, &chh);
+            SPDLOG_WARN("CineRender: no game framebuffer. render {}x{}, viewport {}x{}, msaa {}", cw, chh,
+                        (int)intp->mGameWindowViewport.width, (int)intp->mGameWindowViewport.height, intp->mMsaaLevel);
+        }
+        CinematicCam_NoteDroppedFrame();
+        return;
+    }
+    if (strcmp(intp->mRapi->GetName(), "DirectX 11") != 0) {
+        sGrabFail = intp->mRapi->GetName();
+        CinematicCam_NoteDroppedFrame();
+        return;
+    }
+    // Mirror Interpreter::Run's own choice of where the finished frame ended up.
+    int fbId = intp->mGameFb;
+    if (intp->mMsaaLevel > 1) {
+        if (intp->ViewportMatchesRendererResolution()) {
+            sGrabFail = "MSAA resolved into the window";
+            CinematicCam_NoteDroppedFrame();
+            return;
+        }
+        fbId = intp->mGameFbMsaaResolved;
+    }
+    ID3D11ShaderResourceView* srv =
+        reinterpret_cast<ID3D11ShaderResourceView*>(intp->mRapi->GetFramebufferTextureId(fbId));
+    if (srv == nullptr) {
+        sGrabFail = "framebuffer has no texture";
+        CinematicCam_NoteDroppedFrame();
+        return;
+    }
+    ID3D11Resource* res = nullptr;
+    srv->GetResource(&res);
+    if (res == nullptr) {
+        sGrabFail = "texture view has no resource";
+        CinematicCam_NoteDroppedFrame();
+        return;
+    }
+    ID3D11Texture2D* src = static_cast<ID3D11Texture2D*>(res);
+    D3D11_TEXTURE2D_DESC desc;
+    src->GetDesc(&desc);
+    ID3D11Device* dev = nullptr;
+    ID3D11DeviceContext* ctx = nullptr;
+    src->GetDevice(&dev);
+    if (dev != nullptr) {
+        dev->GetImmediateContext(&ctx);
+    }
+    bool ok = false;
+    if (ctx != nullptr) {
+        if (sGrabStaging == nullptr || sGrabStagingW != desc.Width || sGrabStagingH != desc.Height) {
+            CinematicCam_ReleaseFrameGrab();
+            D3D11_TEXTURE2D_DESC sd = {};
+            sd.Width = desc.Width;
+            sd.Height = desc.Height;
+            sd.MipLevels = 1;
+            sd.ArraySize = 1;
+            sd.Format = desc.Format;
+            sd.SampleDesc.Count = 1;
+            sd.Usage = D3D11_USAGE_STAGING;
+            sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            if (SUCCEEDED(dev->CreateTexture2D(&sd, nullptr, &sGrabStaging))) {
+                sGrabStagingW = desc.Width;
+                sGrabStagingH = desc.Height;
+            }
+        }
+        if (sGrabStaging != nullptr) {
+            // Hold our own reference across the map. Submitting the LAST frame ends the render, and ending a
+            // render frees this texture - which used to leave the Unmap below pointing at nothing.
+            ID3D11Texture2D* staging = sGrabStaging;
+            staging->AddRef();
+            ctx->CopyResource(staging, src);
+            D3D11_MAPPED_SUBRESOURCE m = {};
+            if (SUCCEEDED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m)) && m.pData != nullptr) {
+                const bool bgra =
+                    (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM || desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+                CinematicCam_SubmitRenderedFrame(m.pData, desc.Width, desc.Height, m.RowPitch, bgra ? 1 : 0);
+                ctx->Unmap(staging, 0);
+                ok = true;
+            }
+            staging->Release();
+        }
+        ctx->Release();
+    }
+    if (dev != nullptr) {
+        dev->Release();
+    }
+    res->Release();
+    if (!ok) {
+        if (!sGrabLogged) {
+            sGrabLogged = true;
+            SPDLOG_WARN("CineRender: readback failed. fb {}, {}x{}, fmt {}, staging {}, ctx {}", fbId, desc.Width,
+                        desc.Height, (int)desc.Format, (void*)sGrabStaging, (void*)ctx);
+        }
+        if (sGrabStaging == nullptr) {
+            sGrabFail = "could not create the readback texture";
+        } else if (ctx == nullptr) {
+            sGrabFail = "no device context";
+        } else {
+            sGrabFail = "could not map the readback texture";
+        }
+        CinematicCam_NoteDroppedFrame();
+    }
+}
+#else
+extern "C" void CinematicCam_ReleaseFrameGrab(void) {
+}
+static void CinematicCam_GrabFrame(Fast::Interpreter* intp) {
+    sGrabFail = "frame capture is Windows-only for now";
+    CinematicCam_NoteDroppedFrame();
+}
+#endif
 
 // Interpolated frames of a tick are evenly spaced numerators time+step, time+2*step, ... over denom.
 void RunCommands(Gfx* Commands, int time, int step, int denom, int count) {
@@ -1812,7 +1974,21 @@ void RunCommands(Gfx* Commands, int time, int step, int denom, int count) {
         std::unordered_map<Mtx*, MtxF> mtx_replacements =
             (time == denom) ? std::unordered_map<Mtx*, MtxF>() : FrameInterpolation_Interpolate((float)time / denom);
         intp->mInterpolationT = (float)time / denom;
-        wnd->DrawAndRunGraphicsCommands(Commands, mtx_replacements);
+        bool drawn = wnd->DrawAndRunGraphicsCommands(Commands, mtx_replacements);
+        if (CinematicCam_IsRendering()) {
+            // The DXGI backend drops a frame whenever it is late for vsync, which an offline render writing
+            // PNGs to disk always is. A dropped frame is a MISSING frame in the sequence, so ask again until
+            // it really draws - each call advances the backend's own frame clock, so this converges instead
+            // of spinning.
+            for (int retry = 0; !drawn && retry < 240; retry++) {
+                drawn = wnd->DrawAndRunGraphicsCommands(Commands, mtx_replacements);
+            }
+            if (drawn) {
+                CinematicCam_GrabFrame(intp);
+            } else {
+                CinematicCam_NoteDroppedFrame();
+            }
+        }
         intp->mInterpolationIndex++;
     }
     ImGui::PopStyleColor();
@@ -1883,6 +2059,43 @@ extern "C" void Graph_ProcessGfxCommands(Gfx* commands) {
     // OTRTODO: FIGURE OUT END FRAME POINT
     /* if (OTRGlobals::Instance->context->lastScancode != -1)
          OTRGlobals::Instance->context->lastScancode = -1;*/
+}
+
+// The size of the window area the game is drawn into. The cinematic renderer needs it because a render
+// whose size EQUALS the viewport makes the game skip its own framebuffer and draw straight to the window -
+// where the editor UI is composited on top, and the clean frame no longer exists anywhere.
+extern "C" void CinematicCam_GetViewportSize(int* w, int* h) {
+    *w = 0;
+    *h = 0;
+    auto wnd = std::dynamic_pointer_cast<Fast::Fast3dWindow>(Ship::Context::GetRawInstance()->GetWindow());
+    if (wnd == nullptr) {
+        return;
+    }
+    auto intp = wnd->GetInterpreterWeak().lock();
+    if (intp == nullptr) {
+        return;
+    }
+    *w = (int)intp->mGameWindowViewport.width;
+    *h = (int)intp->mGameWindowViewport.height;
+}
+
+// The aspect ratio of what the game is actually RENDERING (not the window - the menu bar can make those
+// differ). The cinematic exporter needs it to give Fusion a film gate shaped like the footage.
+extern "C" float CinematicCam_GetRenderAspect(void) {
+    auto wnd = std::dynamic_pointer_cast<Fast::Fast3dWindow>(Ship::Context::GetRawInstance()->GetWindow());
+    if (wnd == nullptr) {
+        return 16.0f / 9.0f;
+    }
+    auto intp = wnd->GetInterpreterWeak().lock();
+    if (intp == nullptr) {
+        return 16.0f / 9.0f;
+    }
+    uint32_t w = 0, h = 0;
+    intp->GetCurDimensions(&w, &h);
+    if (w == 0 || h == 0) {
+        return 16.0f / 9.0f;
+    }
+    return (float)w / (float)h;
 }
 
 extern "C" void OTRGetPixelDepthPrepare(float x, float y) {

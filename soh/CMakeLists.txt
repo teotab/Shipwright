@@ -328,6 +328,20 @@ target_include_directories(${PROJECT_NAME} SYSTEM PRIVATE
     ${dr_libs_SOURCE_DIR}
 )
 
+# The cinematic renderer writes its frames as PNG. libultraship's dependency step already fetches stb_image.h
+# into this folder; this is the writing half of the same library, pinned to the same commit. Torch vendors a
+# copy too, so a machine with no network still builds.
+set(STB_WRITE_DIR ${CMAKE_BINARY_DIR}/_deps/stb)
+if(NOT EXISTS "${STB_WRITE_DIR}/stb_image_write.h")
+    file(DOWNLOAD
+        "https://github.com/nothings/stb/raw/0bc88af4de5fb022db643c2d8e549a0927749354/stb_image_write.h"
+        "${STB_WRITE_DIR}/stb_image_write.h")
+endif()
+if(NOT EXISTS "${STB_WRITE_DIR}/stb_image_write.h")
+    file(COPY "${CMAKE_SOURCE_DIR}/torch/lib/n64graphics/stb_image_write.h" DESTINATION "${STB_WRITE_DIR}")
+endif()
+target_include_directories(${PROJECT_NAME} SYSTEM PRIVATE ${STB_WRITE_DIR})
+
 if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
     if(SOH_WINDOWS_64BIT)
         target_compile_definitions(${PROJECT_NAME} PRIVATE
