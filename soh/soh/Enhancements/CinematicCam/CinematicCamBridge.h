@@ -62,6 +62,7 @@ const char* CinematicCam_ActorName(int id);
 // Hard-restart Link's standing idle animation from frame 0 (no morph), to anchor his breathing/head-bob cycle
 // to the start of a cinematic loop. No-op unless Link is currently idle. Pairs with NoIdleFidget for clean loops.
 void CinematicCam_SyncLinkIdleAnim(void);
+void CinematicCam_GetDepthRange(float* zNear, float* zFar);
 
 // Snap Link's facing direction for posed shots. GetLinkYaw returns the current heading in degrees (0..359, or
 // -1 if unavailable); SetLinkYaw points him at an absolute heading; FaceLinkToCamera aims him at (or, with

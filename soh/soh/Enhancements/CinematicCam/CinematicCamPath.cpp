@@ -3310,7 +3310,9 @@ static bool ExportFusion(const char* name, float fps, float scale, bool mirrorZ,
 struct CineRenderJob {
     int index;
     uint32_t w, h;
-    std::vector<uint8_t> px; // empty = a frame the renderer refused to draw; the last one is copied instead
+    std::vector<uint8_t> px;   // colour, RGBA8
+    std::vector<uint16_t> d16; // depth, 16-bit grey; a job carries one or the other
+    bool isDepth;              // both vectors empty = a frame the renderer refused to draw, so copy the last
 };
 
 static std::deque<CineRenderJob> sRenderQ;
@@ -3327,6 +3329,10 @@ static std::string sRenderDir, sRenderBase, sRenderLastPath;
 static float sExFps = 30.0f, sExScale = 100.0f;
 static bool sExMirrorZ = true;
 static int sRenderHeight = 1080, sRenderArX = 16, sRenderArY = 9;
+static bool sRenderDepth = true;
+static float sRenderDepthMax = 12800.0f; // game units the 16-bit depth range is stretched over, fixed per take
+static int sRenderSavedMsaa = 1;
+static std::string sRenderLastDepthPath;
 // The frame is rendered LARGER than it is saved and averaged down. Two reasons, and both matter:
 //   - the game only draws into its own framebuffer when the render size differs from the window; at equal
 //     sizes it draws to the window instead, where the editor is composited on top and the clean frame is
@@ -3342,6 +3348,82 @@ extern "C" void CinematicCam_ReleaseFrameGrab(void);
 extern "C" const char* CinematicCam_GrabFailReason(void);
 extern "C" void CinematicCam_GetViewportSize(int* w, int* h);
 extern "C" void CinematicCam_ResetGrabDiag(void);
+extern "C" void CinematicCam_SetMsaa(int level);
+
+// A depth pass has to be 16-bit - 256 steps of distance would band every surface - and stb only writes 8.
+// PNG itself is simple enough to emit directly: a header, one zlib stream of filtered rows, an end marker.
+// stb's deflate does the compression, so this is just framing and a CRC.
+static uint32_t PngCrc(const uint8_t* p, size_t n, uint32_t crc) {
+    for (size_t i = 0; i < n; i++) {
+        crc ^= p[i];
+        for (int k = 0; k < 8; k++) {
+            crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1)));
+        }
+    }
+    return crc;
+}
+
+static void PngPut32(std::vector<uint8_t>& out, uint32_t v) {
+    out.push_back((uint8_t)(v >> 24));
+    out.push_back((uint8_t)(v >> 16));
+    out.push_back((uint8_t)(v >> 8));
+    out.push_back((uint8_t)v);
+}
+
+static void PngChunk(std::vector<uint8_t>& out, const char* type, const uint8_t* data, size_t len) {
+    PngPut32(out, (uint32_t)len);
+    size_t start = out.size();
+    out.insert(out.end(), type, type + 4);
+    if (len > 0) {
+        out.insert(out.end(), data, data + len);
+    }
+    PngPut32(out, PngCrc(&out[start], out.size() - start, 0xFFFFFFFFu) ^ 0xFFFFFFFFu);
+}
+
+// 16-bit greyscale PNG. Rows are filtered with Up (type 2), which costs nothing to write and compresses a
+// depth pass well, since neighbouring scanlines of a surface differ only slightly.
+static bool WriteGray16Png(const char* path, const uint16_t* px, int w, int h) {
+    std::vector<uint8_t> raw;
+    raw.reserve((size_t)h * ((size_t)w * 2 + 1));
+    std::vector<uint8_t> prev((size_t)w * 2, 0), cur((size_t)w * 2, 0);
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            cur[(size_t)x * 2 + 0] = (uint8_t)(px[(size_t)y * w + x] >> 8);
+            cur[(size_t)x * 2 + 1] = (uint8_t)(px[(size_t)y * w + x] & 0xFF);
+        }
+        raw.push_back(y == 0 ? 0 : 2);
+        for (size_t i = 0; i < cur.size(); i++) {
+            raw.push_back(y == 0 ? cur[i] : (uint8_t)(cur[i] - prev[i]));
+        }
+        prev.swap(cur);
+    }
+    int zlen = 0;
+    unsigned char* z = stbi_zlib_compress(raw.data(), (int)raw.size(), &zlen, 8);
+    if (z == nullptr) {
+        return false;
+    }
+    std::vector<uint8_t> out;
+    const uint8_t sig[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+    out.insert(out.end(), sig, sig + 8);
+    std::vector<uint8_t> ihdr;
+    PngPut32(ihdr, (uint32_t)w);
+    PngPut32(ihdr, (uint32_t)h);
+    ihdr.push_back(16); // bit depth
+    ihdr.push_back(0);  // colour type: greyscale
+    ihdr.push_back(0);
+    ihdr.push_back(0);
+    ihdr.push_back(0);
+    PngChunk(out, "IHDR", ihdr.data(), ihdr.size());
+    PngChunk(out, "IDAT", z, (size_t)zlen);
+    PngChunk(out, "IEND", nullptr, 0);
+    free(z);
+    std::ofstream f(path, std::ios::binary);
+    if (!f.good()) {
+        return false;
+    }
+    f.write((const char*)out.data(), (std::streamsize)out.size());
+    return f.good();
+}
 
 // PNG compression is slow enough to halve the render rate, so it happens on its own thread. The queue is
 // bounded: when the writer falls behind, the game thread waits instead of growing a gigabyte of frames.
@@ -3359,6 +3441,15 @@ static void RenderWriterMain() {
         }
         sRenderCvSpace.notify_all();
         char path[1024];
+        if (job.isDepth) {
+            snprintf(path, sizeof(path), "%s/depth/%s.%06d.png", sRenderDir.c_str(), sRenderBase.c_str(), job.index);
+            if (WriteGray16Png(path, job.d16.data(), (int)job.w, (int)job.h)) {
+                sRenderLastDepthPath = path;
+            } else {
+                sRenderFailed++;
+            }
+            continue;
+        }
         snprintf(path, sizeof(path), "%s/%s.%06d.png", sRenderDir.c_str(), sRenderBase.c_str(), job.index);
         if (job.px.empty()) {
             // Duplicating the previous frame keeps every LATER frame on its own number, which matters far
@@ -3367,6 +3458,13 @@ static void RenderWriterMain() {
             if (!sRenderLastPath.empty()) {
                 std::filesystem::copy_file(sRenderLastPath, path, std::filesystem::copy_options::overwrite_existing,
                                            ec);
+            }
+            if (!sRenderLastDepthPath.empty()) {
+                char dpath[1024];
+                snprintf(dpath, sizeof(dpath), "%s/depth/%s.%06d.png", sRenderDir.c_str(), sRenderBase.c_str(),
+                         job.index);
+                std::filesystem::copy_file(sRenderLastDepthPath, dpath,
+                                           std::filesystem::copy_options::overwrite_existing, ec);
             }
             continue;
         }
@@ -3401,6 +3499,7 @@ static void RenderStop(bool finished) {
     CVarSetFloat(CVAR_PREFIX_ADVANCED_RESOLUTION ".AspectRatioY", sRenderSavedArY);
     CVarSetInteger(CVAR_SETTING("InterpolationFPS"), sRenderSavedIfps);
     CVarSetInteger(CVAR_SETTING("MatchRefreshRate"), sRenderSavedMatch);
+    CinematicCam_SetMsaa(sRenderSavedMsaa);
     int failed = sRenderFailed.load();
     if (finished) {
         const char* why = CinematicCam_GrabFailReason();
@@ -3469,6 +3568,27 @@ static void RenderStart() {
     sRenderDir = std::string("cinematics/renders/") + sRenderBase;
     std::error_code ec;
     std::filesystem::create_directories(sRenderDir, ec);
+    if (sRenderDepth) {
+        std::filesystem::create_directories(sRenderDir + "/depth", ec);
+        // One scale for the whole take, so a value means the same distance in every frame of the sequence.
+        float zNear = 10.0f, zFar = 12800.0f;
+        CinematicCam_GetDepthRange(&zNear, &zFar);
+        sRenderDepthMax = (zFar > 1.0f) ? zFar : 12800.0f;
+        std::ofstream note(sRenderDir + "/" + sRenderBase + ".depth.txt");
+        if (note.good()) {
+            note << "Depth pass for " << sRenderBase << "\n\n"
+                 << "depth/" << sRenderBase << ".NNNNNN.png - 16-bit greyscale, one per colour frame.\n"
+                 << "White is far, black is at the camera. Each pixel holds the distance from the camera\n"
+                 << "ALONG THE VIEW AXIS, scaled so that full white = " << sRenderDepthMax << " game units.\n\n"
+                 << "  distance in game units  = value * " << sRenderDepthMax << "\n"
+                 << "  distance in Fusion units = value * "
+                 << (sRenderDepthMax / ((sExScale > 1e-3f) ? sExScale : 100.0f)) << "\n\n"
+                 << "(value being 0..1 as Fusion reads the image; " << sExScale
+                 << " game units per Fusion unit, matching the camera in this folder.)\n\n"
+                 << "Where nothing was drawn - sky, and anything the game draws without writing depth - the\n"
+                 << "value is full white.\n";
+        }
+    }
     // The camera that belongs to these frames goes in the same folder, on the same clock and the same gate -
     // a sequence and a .setting that were made apart are exactly how a match drifts.
     ExportFusion(sFilename, fps, sExScale, sExMirrorZ, sFileStatus, sizeof(sFileStatus), sRenderDir.c_str(),
@@ -3481,6 +3601,10 @@ static void RenderStart() {
     sRenderSavedArY = CVarGetFloat(CVAR_PREFIX_ADVANCED_RESOLUTION ".AspectRatioY", 9.0f);
     sRenderSavedIfps = CVarGetInteger(CVAR_SETTING("InterpolationFPS"), 20);
     sRenderSavedMatch = CVarGetInteger(CVAR_SETTING("MatchRefreshRate"), 0);
+    // Multisampling off: a multisampled depth buffer cannot be read back, and rendering at 2x already
+    // anti-aliases better than MSAA does.
+    sRenderSavedMsaa = CVarGetInteger(CVAR_MSAA_VALUE, 1);
+    CinematicCam_SetMsaa(1);
 
     // Pin the render size. This also guarantees the game draws into its OWN framebuffer rather than straight
     // to the window, which is what keeps the editor out of the picture.
@@ -3507,6 +3631,7 @@ static void RenderStart() {
     sRenderDropped = 0;
     sRenderFailed = 0;
     sRenderLastPath.clear();
+    sRenderLastDepthPath.clear();
     sRenderFinished = false;
     CinematicCam_ResetGrabDiag();
     sRenderWriterStop = false;
@@ -3519,7 +3644,7 @@ static void RenderStart() {
 static void RenderQueue(CineRenderJob&& job) {
     {
         std::unique_lock<std::mutex> lk(sRenderMx);
-        sRenderCvSpace.wait(lk, [] { return !sRendering || sRenderQ.size() < 8; });
+        sRenderCvSpace.wait(lk, [] { return !sRendering || sRenderQ.size() < 12; });
         sRenderQ.push_back(std::move(job));
     }
     sRenderCvJob.notify_one();
@@ -3549,6 +3674,7 @@ extern "C" void CinematicCam_SubmitRenderedFrame(const void* pixels, uint32_t w,
     }
     CineRenderJob job;
     job.index = sRenderIdx++;
+    job.isDepth = false;
     job.w = (uint32_t)sRenderW;
     job.h = (uint32_t)sRenderH;
     job.px.resize((size_t)sRenderW * (size_t)sRenderH * 4);
@@ -3580,6 +3706,81 @@ extern "C" void CinematicCam_SubmitRenderedFrame(const void* pixels, uint32_t w,
     }
 }
 
+extern "C" bool CinematicCam_WantsDepth(void) {
+    return sRendering && sRenderDepth;
+}
+
+// Turn the depth buffer into distance from the camera, in game units.
+//
+// The N64 projection is the OpenGL one, and libultraship remaps its clip z into Direct3D's 0..1 range with
+// z' = (z + w) / 2 before the divide - so the buffer holds (ndc + 1) / 2. Undo both and solve guPerspective
+// for the eye distance d:  d = 2nf / (G(n - f) + n + f), with G = 2z - 1. Checks out at both ends: G = -1
+// gives the near plane, G = +1 gives the far plane.
+//
+// The frame arrives supersampled, and a depth pass must NOT be averaged down - the mean of a near and a far
+// surface is a distance where nothing exists, which is exactly the wrong answer along every silhouette. Each
+// output pixel takes the NEAREST sample in its block instead, so thin geometry survives and still occludes.
+extern "C" void CinematicCam_SubmitDepthFrame(const void* pixels, uint32_t w, uint32_t h, uint32_t rowPitch,
+                                              int isFloat) {
+    if (!sRendering || !sRenderDepth || pixels == nullptr || sRenderIdx < 1) {
+        return;
+    }
+    if (w != (uint32_t)(sRenderW * sRenderSS) || h != (uint32_t)(sRenderH * sRenderSS)) {
+        return; // colour and depth must describe the same picture
+    }
+    float zNear = 10.0f, zFar = 12800.0f;
+    CinematicCam_GetDepthRange(&zNear, &zFar);
+    if (!(zFar > zNear) || !(zNear > 0.0f)) {
+        zNear = 10.0f;
+        zFar = 12800.0f;
+    }
+    const float scale = (sRenderDepthMax > 1.0f) ? sRenderDepthMax : zFar;
+    CineRenderJob job;
+    job.index = sRenderIdx - 1; // the colour frame this belongs to
+    job.isDepth = true;
+    job.w = (uint32_t)sRenderW;
+    job.h = (uint32_t)sRenderH;
+    job.d16.resize((size_t)sRenderW * (size_t)sRenderH);
+    const uint8_t* src = (const uint8_t*)pixels;
+    const int ss = sRenderSS;
+    for (int y = 0; y < sRenderH; y++) {
+        for (int x = 0; x < sRenderW; x++) {
+            float z = 1.0f;
+            for (int j = 0; j < ss; j++) {
+                const uint8_t* sr = src + (size_t)(y * ss + j) * (size_t)rowPitch + (size_t)(x * ss) * 4;
+                for (int i = 0; i < ss; i++) {
+                    float zi;
+                    if (isFloat) {
+                        zi = ((const float*)sr)[i];
+                    } else { // 24-bit unorm depth packed with 8 bits of stencil
+                        zi = (float)(((const uint32_t*)sr)[i] & 0x00FFFFFFu) / 16777215.0f;
+                    }
+                    if (zi < z) {
+                        z = zi; // nearest surface in the block
+                    }
+                }
+            }
+            float d;
+            if (z >= 1.0f) {
+                d = zFar; // nothing was drawn here: as far away as the world goes
+            } else {
+                float G = 2.0f * z - 1.0f;
+                float den = G * (zNear - zFar) + zNear + zFar;
+                d = (den > 1e-6f) ? (2.0f * zNear * zFar / den) : zFar;
+            }
+            float u = d / scale;
+            if (u < 0.0f) {
+                u = 0.0f;
+            }
+            if (u > 1.0f) {
+                u = 1.0f;
+            }
+            job.d16[(size_t)y * sRenderW + x] = (uint16_t)(u * 65535.0f + 0.5f);
+        }
+    }
+    RenderQueue(std::move(job));
+}
+
 extern "C" void CinematicCam_NoteDroppedFrame(void) {
     if (!sRendering) {
         return;
@@ -3590,6 +3791,7 @@ extern "C" void CinematicCam_NoteDroppedFrame(void) {
     }
     CineRenderJob job;
     job.index = sRenderIdx++;
+    job.isDepth = false;
     job.w = 0;
     job.h = 0; // no pixels: the writer copies the frame before it
     sRenderDropped++;
@@ -9673,8 +9875,8 @@ void CinematicCamPathWindow::DrawElement() {
                             "on the way out. Leave this on. If the exported move comes out MIRRORED - turning "
                             "left where the game turns right - this is the switch to try.");
             }
-            CineHint("No depth pass yet, so anything placed behind geometry is not occluded by it: text in "
-                     "front of the world lines up, text going behind a pillar still needs roto.");
+            CineHint("The camera alone puts your 3D elements in the right PLACE, but in front of everything. "
+                     "To have the world occlude them, render the take with the depth pass ticked below.");
         }
 
         // --- Offline render -----------------------------------------------------------------------------
@@ -9695,8 +9897,8 @@ void CinematicCamPathWindow::DrawElement() {
                         "same gate, so the two cannot drift apart.\n\n"
                         "It reads the game's own buffer, so this editor is not in the shot. Each frame is drawn "
                         "at twice this size and averaged down, which is the anti-aliasing the N64 never had. "
-                        "Letterbox bars are drawn by the game, so they BAKE IN - turn them off if you would "
-                        "rather add them in the edit. There is no sound.");
+                        "No letterbox is baked in - the bars are a framing guide here, and a plate you are "
+                        "going to composite on should arrive without them. There is no sound.");
                 }
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(70.0f);
@@ -9717,6 +9919,17 @@ void CinematicCamPathWindow::DrawElement() {
                     CineTooltip("Frame shape. 16:9 for normal delivery, 21:9 for scope. The game keeps its "
                                 "vertical view and widens - so a wider ratio shows MORE at the sides, it does "
                                 "not crop the top and bottom.");
+                }
+                ImGui::SameLine();
+                ImGui::Checkbox("Depth", &sRenderDepth);
+                if (ImGui::IsItemHovered()) {
+                    CineTooltip("Also write a depth pass, to a depth/ folder beside the frames: 16-bit greyscale, one "
+                                "per frame, holding each pixel's distance from the camera.\n\n"
+                                "That is what lets 3D elements sit BEHIND the world instead of always on top - compare "
+                                "your element's Z against this and cut it where the world is nearer. It also drives "
+                                "depth-of-field and distance fog for free.\n\n"
+                                "A .depth.txt beside the frames gives the exact number to multiply by. Roughly doubles "
+                                "the time and the disk space.");
                 }
                 CineHint("%d x %d at %.4g fps, about %d frames - drawn larger and averaged down.",
                          (int)((float)sRenderHeight / (float)(sRenderArY > 0 ? sRenderArY : 9) *

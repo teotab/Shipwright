@@ -1804,6 +1804,9 @@ extern "C" bool CinematicCam_IsRendering(void);
 extern "C" void CinematicCam_SubmitRenderedFrame(const void* pixels, uint32_t w, uint32_t h, uint32_t rowPitch,
                                                  int bgra);
 extern "C" void CinematicCam_NoteDroppedFrame(void);
+extern "C" bool CinematicCam_WantsDepth(void);
+extern "C" void CinematicCam_SubmitDepthFrame(const void* pixels, uint32_t w, uint32_t h, uint32_t rowPitch,
+                                              int isFloat);
 
 // Why the last grab gave up, so a render that writes nothing can say what stopped it instead of just
 // reporting a pile of duplicated frames.
@@ -1821,6 +1824,8 @@ extern "C" const char* CinematicCam_GrabFailReason(void) {
 #if defined(_WIN32)
 static ID3D11Texture2D* sGrabStaging = nullptr;
 static uint32_t sGrabStagingW = 0, sGrabStagingH = 0;
+static ID3D11Texture2D* sDepthStaging = nullptr;
+static uint32_t sDepthStagingW = 0, sDepthStagingH = 0;
 
 extern "C" void CinematicCam_ReleaseFrameGrab(void) {
     if (sGrabStaging != nullptr) {
@@ -1829,6 +1834,74 @@ extern "C" void CinematicCam_ReleaseFrameGrab(void) {
     }
     sGrabStagingW = 0;
     sGrabStagingH = 0;
+    if (sDepthStaging != nullptr) {
+        sDepthStaging->Release();
+        sDepthStaging = nullptr;
+    }
+    sDepthStagingW = 0;
+    sDepthStagingH = 0;
+}
+
+// Copy out the DEPTH buffer of the framebuffer the game just drew.
+//
+// libultraship keeps its framebuffers private, so there is no way to ask it for the depth texture. But
+// StartDrawToFramebuffer IS public, and binding a framebuffer sets its depth-stencil view on the pipeline -
+// so binding it and then asking the device context what is bound hands the texture over through public API
+// alone, with no changes to the submodule. Nothing has been drawn since the frame was presented, so the
+// buffer still holds this frame's depth; it is not cleared until the next frame starts.
+static void CinematicCam_GrabDepth(Fast::Interpreter* intp, int fbId, ID3D11Device* dev, ID3D11DeviceContext* ctx) {
+    intp->mRapi->StartDrawToFramebuffer(fbId, 1.0f);
+    ID3D11RenderTargetView* rtv = nullptr;
+    ID3D11DepthStencilView* dsv = nullptr;
+    ctx->OMGetRenderTargets(1, &rtv, &dsv);
+    if (dsv != nullptr) {
+        ID3D11Resource* dres = nullptr;
+        dsv->GetResource(&dres);
+        if (dres != nullptr) {
+            ID3D11Texture2D* dtex = static_cast<ID3D11Texture2D*>(dres);
+            D3D11_TEXTURE2D_DESC dd;
+            dtex->GetDesc(&dd);
+            if (dd.SampleDesc.Count == 1) { // a multisampled depth buffer cannot be copied out directly
+                if (sDepthStaging == nullptr || sDepthStagingW != dd.Width || sDepthStagingH != dd.Height) {
+                    if (sDepthStaging != nullptr) {
+                        sDepthStaging->Release();
+                        sDepthStaging = nullptr;
+                    }
+                    D3D11_TEXTURE2D_DESC sd = {};
+                    sd.Width = dd.Width;
+                    sd.Height = dd.Height;
+                    sd.MipLevels = 1;
+                    sd.ArraySize = 1;
+                    sd.Format = dd.Format; // R32_TYPELESS, or R24G8_TYPELESS on older feature levels
+                    sd.SampleDesc.Count = 1;
+                    sd.Usage = D3D11_USAGE_STAGING;
+                    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                    if (SUCCEEDED(dev->CreateTexture2D(&sd, nullptr, &sDepthStaging))) {
+                        sDepthStagingW = dd.Width;
+                        sDepthStagingH = dd.Height;
+                    }
+                }
+                if (sDepthStaging != nullptr) {
+                    ID3D11Texture2D* staging = sDepthStaging;
+                    staging->AddRef();
+                    ctx->CopyResource(staging, dtex);
+                    D3D11_MAPPED_SUBRESOURCE dm = {};
+                    if (SUCCEEDED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &dm)) && dm.pData != nullptr) {
+                        CinematicCam_SubmitDepthFrame(dm.pData, dd.Width, dd.Height, dm.RowPitch,
+                                                      dd.Format == DXGI_FORMAT_R32_TYPELESS ? 1 : 0);
+                        ctx->Unmap(staging, 0);
+                    }
+                    staging->Release();
+                }
+            }
+            dres->Release();
+        }
+        dsv->Release();
+    }
+    if (rtv != nullptr) {
+        rtv->Release();
+    }
+    intp->mRapi->StartDrawToFramebuffer(0, 1.0f); // put the target back where the frame left it
 }
 
 static void CinematicCam_GrabFrame(Fast::Interpreter* intp) {
@@ -1920,6 +1993,9 @@ static void CinematicCam_GrabFrame(Fast::Interpreter* intp) {
                 ok = true;
             }
             staging->Release();
+        }
+        if (ok && CinematicCam_WantsDepth()) {
+            CinematicCam_GrabDepth(intp, fbId, dev, ctx);
         }
         ctx->Release();
     }
@@ -2059,6 +2135,15 @@ extern "C" void Graph_ProcessGfxCommands(Gfx* commands) {
     // OTRTODO: FIGURE OUT END FRAME POINT
     /* if (OTRGlobals::Instance->context->lastScancode != -1)
          OTRGlobals::Instance->context->lastScancode = -1;*/
+}
+
+// Multisampling has to be off while rendering: a multisampled depth buffer cannot be copied out, and the
+// render supersamples anyway, which is the better anti-aliasing of the two.
+extern "C" void CinematicCam_SetMsaa(int level) {
+    auto wnd = Ship::Context::GetRawInstance()->GetWindow();
+    if (wnd != nullptr) {
+        wnd->SetMsaaLevel((uint32_t)(level < 1 ? 1 : level));
+    }
 }
 
 // The size of the window area the game is drawn into. The cinematic renderer needs it because a render

@@ -7658,6 +7658,21 @@ void CinematicCam_SetPlayback(s32 active, f32* eye, f32* at, f32 roll, f32 fov) 
     }
 }
 
+// The near and far clip planes the world is currently drawn with. The offline renderer needs them to turn
+// the depth buffer's z back into a distance in game units.
+void CinematicCam_GetDepthRange(f32* zNear, f32* zFar) {
+    *zNear = 10.0f;
+    *zFar = 12800.0f;
+    if (gPlayState != NULL) {
+        if (gPlayState->view.zNear > 0.0f) {
+            *zNear = gPlayState->view.zNear;
+        }
+        if (gPlayState->view.zFar > 0.0f) {
+            *zFar = gPlayState->view.zFar;
+        }
+    }
+}
+
 // Enumerate live actors for the "look at actor" picker.
 s32 CinematicCam_EnumActors(CineActorInfo* out, s32 maxCount) {
     s32 count = 0;
@@ -8057,6 +8072,13 @@ static void CinematicCam_Update(Camera* camera) {
         smoothing = 0.95f;
     }
     response = 1.0f - smoothing;
+
+    // Camera_Update returns early while we drive, so Camera_UpdateInterface never runs and whatever letterbox
+    // the game last asked for just stays up - Camera_InitPlayerSettings leaves it at 0x20, which is where the
+    // black bars in recordings came from. Nobody asked for those: the tool has its own letterbox setting, and
+    // a plate you are going to composite on should never arrive with bars burned into it.
+    Letterbox_SetSizeTarget(0);
+    ShrinkWindow_SetCurrentVal(0);
 
     // Path playback (Phase 4): a path is driving the camera — apply its interpolated pose and skip input.
     if (gCineCamPlaybackActive) {
