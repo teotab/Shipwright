@@ -16,6 +16,11 @@
 #include <array>
 #include <ctime>
 #include <cstdarg>
+#if defined(_WIN32)
+#include <windows.h>
+#include <shellapi.h>
+#pragma comment(lib, "Shell32.lib") // ShellExecuteA, to show a folder in Explorer
+#endif
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -3128,6 +3133,22 @@ static void TrackFromJson(CineParamTrack& t, const nlohmann::json& j) {
 // before this line existed - those carry per-keyframe ease and deg/s aim rates, both of which mean something
 // different now, so they load with those values left automatic rather than misinterpreted.
 extern "C" float CinematicCam_GetRenderAspect(void);
+
+// Show a folder in the system's file browser. The paths here are relative to the game's working directory,
+// which is not where anyone's file manager starts, so hand it an absolute one. Created first: offering to
+// open a folder that does not exist yet is worse than useless.
+static void OpenFolder(const std::string& rel) {
+    std::error_code ec;
+    std::filesystem::create_directories(rel, ec);
+    std::string abs = std::filesystem::absolute(rel, ec).lexically_normal().string();
+#if defined(_WIN32)
+    ShellExecuteA(nullptr, "open", abs.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#elif defined(__APPLE__)
+    system(("open \"" + abs + "\"").c_str());
+#else
+    system(("xdg-open \"" + abs + "\"").c_str());
+#endif
+}
 
 // --- Fusion / DaVinci Resolve export -----------------------------------------------------------------
 // Writes the move as a Camera3D .setting file: drop it in Resolve's Fusion Settings folder and it appears
@@ -9815,6 +9836,14 @@ void CinematicCamPathWindow::DrawElement() {
             CineTooltip("Browse, load, or delete saved cinematics in the cinematics/ folder.");
         }
         ImGui::SameLine();
+        if (ImGui::Button("Folder##paths")) {
+            OpenFolder("cinematics");
+        }
+        if (ImGui::IsItemHovered()) {
+            CineTooltip("Open the cinematics/ folder, where the .json paths live - for backing them up, "
+                        "copying one to another machine, or handing one to someone else.");
+        }
+        ImGui::SameLine();
         CineHint("(cinematics/<name>.json)");
         if (sDirty) {
             ImGui::SameLine();
@@ -9922,6 +9951,17 @@ void CinematicCamPathWindow::DrawElement() {
                 }
                 ImGui::SameLine();
                 ImGui::Checkbox("Depth", &sRenderDepth);
+                ImGui::SameLine();
+                if (ImGui::Button("Folder##renders")) {
+                    // This take's own folder if it has one, otherwise wherever renders go.
+                    std::string own = std::string("cinematics/renders/") + sFilename;
+                    OpenFolder(std::filesystem::exists(own) ? own : std::string("cinematics/renders"));
+                }
+                if (ImGui::IsItemHovered()) {
+                    CineTooltip("Open this take's render folder - the frames, the depth/ folder and the Fusion "
+                                "camera that goes with them. Opens the renders folder itself if this take has "
+                                "not been rendered yet.");
+                }
                 if (ImGui::IsItemHovered()) {
                     CineTooltip("Also write a depth pass, to a depth/ folder beside the frames: 16-bit greyscale, one "
                                 "per frame, holding each pixel's distance from the camera.\n\n"
