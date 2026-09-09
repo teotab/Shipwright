@@ -3142,7 +3142,14 @@ static bool ExportFusion(const char* name, float fps, float scale, bool mirrorZ,
     const float aspect = kApertureW / kApertureH;
 
     float total = EffectiveTotal();
-    int frames = (int)std::floor(total * fps + 0.5f);
+    // Bake against the WALL CLOCK of playback, not the authored timeline. Playback advances a linear progress
+    // u at sPlaySpeed and puts the playhead at EasedProgress(u) * total, so with the global ease on, a take
+    // spends its first and last seconds moving slowly. Sampling authored time uniformly would export the same
+    // path at a constant rate - identical shape, wrong timing against footage already recorded. Frame i here
+    // is the pose playback shows i/fps seconds after Play, which is what the capture recorded.
+    float pspeed = (sPlaySpeed > 1e-3f) ? sPlaySpeed : 1.0f;
+    float tdenom = (total > 0.0f) ? total : 1.0f;
+    int frames = (int)std::floor((total / pspeed) * fps + 0.5f);
     if (frames < 1) {
         frames = 1;
     }
@@ -3164,9 +3171,29 @@ static bool ExportFusion(const char* name, float fps, float scale, bool mirrorZ,
         { "ZRotation", "{ Red = 128, Green = 128, Blue = 255 }", {} },
         { "AoV", "{ Red = 200, Green = 200, Blue = 200 }", {} },
     };
+    float shakeSave = sShakeIntensity;
     for (int i = 0; i <= frames; i++) {
-        float t = (float)i / fps;
-        CineKeyframe k = SampleAt(std::min(t, total));
+        float u = std::min(((float)i / fps) * pspeed / tdenom, 1.0f); // linear play progress
+        float t = EasedProgress(u) * total;                           // ... where the playhead actually is
+        CineKeyframe k = SampleAt(t);
+        // Everything playback layers on top of the sampled pose, in the order Update() applies it: the roll /
+        // FOV automation tracks override the keyframes, then shake jitters what is left. Path follow is
+        // deliberately NOT applied - it shifts the rig by how far a live actor has moved, which only exists
+        // inside a running take.
+        float tv;
+        if (sRollTrack.enabled && EvalParamTrack(sRollTrack, t, tv)) {
+            k.roll = tv;
+        }
+        if (sFovTrack.enabled && EvalParamTrack(sFovTrack, t, tv)) {
+            k.fov = std::min(std::max(tv, 1.0f), 170.0f);
+        }
+        sShakeIntensity = 1.0f;
+        if (sShakeTrack.enabled && EvalParamTrack(sShakeTrack, t, tv)) {
+            sShakeIntensity = tv;
+        }
+        if (sShakeEnabled || sShakeTrack.enabled) {
+            ApplyShake(t, k.eye, k.at, &k.roll);
+        }
         float fwd[3] = { k.at[0] - k.eye[0], k.at[1] - k.eye[1], (k.at[2] - k.eye[2]) };
         float l = std::sqrt(fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]);
         if (l < 1e-5f) {
@@ -3176,7 +3203,10 @@ static bool ExportFusion(const char* name, float fps, float scale, bool mirrorZ,
             l = 1.0f;
         }
         float f[3] = { fwd[0] / l, fwd[1] / l, zf * fwd[2] / l }; // into Fusion's handedness
-        // Camera looks down -Z, rotation order XYZ: forward = (-sin(ry)cos(rx), sin(rx), -cos(ry)cos(rx)).
+        // Camera looks down -Z. The order written below is ZXY, i.e. Z is applied FIRST, in the camera's own
+        // frame - that is what makes it a roll rather than a swing about the world axis. Z leaves the view
+        // direction alone (Rz maps (0,0,-1) to itself), so pitch and pan still solve from the forward vector
+        // alone: forward = (-sin(ry)cos(rx), sin(rx), -cos(ry)cos(rx)).
         float rx = std::asin(std::min(std::max(f[1], -1.0f), 1.0f)) * 180.0f / kPi;
         float ry = std::atan2(-f[0], -f[2]) * 180.0f / kPi;
         ch[0].v.push_back(k.eye[0] / scale);
@@ -3187,6 +3217,7 @@ static bool ExportFusion(const char* name, float fps, float scale, bool mirrorZ,
         ch[5].v.push_back(-k.roll); // our roll is clockwise-positive about the view axis; Fusion's Z is the other way
         ch[6].v.push_back(2.0f * std::atan(std::tan(k.fov * 0.5f * kPi / 180.0f) * aspect) * 180.0f / kPi);
     }
+    sShakeIntensity = shakeSave; // it is live playback state; the export must not leave it moved
 
     std::error_code ec;
     std::filesystem::create_directories("cinematics", ec);
@@ -3208,7 +3239,7 @@ static bool ExportFusion(const char* name, float fps, float scale, bool mirrorZ,
         o << "\t\t\t\t[\"" << inputs[c] << "\"] = Input {\n\t\t\t\t\tSourceOp = \"Camera3D1" << ch[c].op
           << "\",\n\t\t\t\t\tSource = \"Value\",\n\t\t\t\t},\n";
     }
-    o << "\t\t\t\t[\"Transform3DOp.Rotate.RotOrder\"] = Input { Value = FuID { \"XYZ\" }, },\n";
+    o << "\t\t\t\t[\"Transform3DOp.Rotate.RotOrder\"] = Input { Value = FuID { \"ZXY\" }, },\n";
     o << "\t\t\t\tFilmGate = Input { Value = FuID { \"BMD_URSA_4K_16x9\" }, },\n";
     o << "\t\t\t\tApertureW = Input { Value = " << kApertureW << ", },\n";
     o << "\t\t\t\tApertureH = Input { Value = " << kApertureH << ", },\n";
@@ -4620,6 +4651,24 @@ static void GizmoContinue() {
         }
         sRotPrevAngle = ang;
 
+        // The ROLL ring (blue) is not a spatial rotation: it banks the camera about its own view axis, which
+        // is a stored per-keyframe angle rather than a place in the world. Handle it before the group spin
+        // below - falling into that spin gave it the PITCH axis, so with several keyframes selected the blue
+        // ring turned the path exactly like the red one. With a group, every selected keyframe banks by the
+        // same amount, which keeps the shape and tilts the whole move.
+        if (sDragKind == 1 && sDragAxis == 2) {
+            float deg = d * (180.0f / kPi);
+            k.roll += deg;
+            if (SelectionCount() > 1) {
+                for (size_t i = 0; i < sIds.size(); i++) {
+                    if ((int)i != idx && IsSelected(sIds[i])) {
+                        sKeyframes[i].roll += deg;
+                    }
+                }
+            }
+            return;
+        }
+
         // Rotation axis: yaw around world up, pitch around the stable axis captured at drag start
         // (recomputing it each frame degenerates near vertical).
         float axis[3];
@@ -4691,8 +4740,6 @@ static void GizmoContinue() {
                 k.tangentIn[1] = rot[1];
                 k.tangentIn[2] = rot[2];
             }
-        } else if (sDragAxis == 2) {
-            k.roll += d * (180.0f / kPi); // aim roll in degrees
         } else {
             // Aim: rotate the look vector directly (full pitch range, no clamp, no gimbal).
             float fwd[3];
