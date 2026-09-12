@@ -5858,12 +5858,11 @@ s32 func_8083AD4C(PlayState* play, Player* this) {
         } else {
             camMode = CAM_MODE_AIM_BOOMERANG;
         }
+        // Check if aiming camera mode should be overridden due to player settings
+        GameInteractor_Should(VB_CHANGE_AIMING_CAMERA, true, &this->heldItemAction, &camMode);
     } else {
         camMode = CAM_MODE_FIRST_PERSON;
     }
-
-    // Check if aiming camera mode should be overridden due to player settings
-    GameInteractor_Should(VB_CHANGE_AIMING_CAMERA, true, &this->heldItemAction, &camMode);
 
     return Camera_RequestMode(Play_GetCamera(play, CAM_ID_MAIN), camMode);
 }
@@ -8953,10 +8952,10 @@ void Player_Action_80842180(Player* this, PlayState* play) {
         Player_GetMovementSpeedAndYaw(this, &speedTarget, &yawTarget, SPEED_MODE_CURVED, play);
 
         if (!func_8083C484(this, &speedTarget, &yawTarget)) {
-            GameInteractor_Should(VB_PLAYER_MODIFY_RUN_SPEED, true, this, &speedTarget);
-
-            func_8083DF68(this, speedTarget, yawTarget);
-            func_8083DDC8(this, play);
+            if (GameInteractor_Should(VB_PLAYER_MODIFY_RUN_SPEED, true, this, &speedTarget, &yawTarget)) {
+                func_8083DF68(this, speedTarget, yawTarget);
+                func_8083DDC8(this, play);
+            };
 
             if ((this->linearVelocity == 0.0f) && (speedTarget == 0.0f)) {
                 func_8083C0B8(this, play);
@@ -12744,8 +12743,9 @@ s16 func_8084ABD8(PlayState* play, Player* this, s32 arg2, s16 arg3) {
         f32 movementSpeed = LINK_IS_ADULT ? 9.0f : 8.25f;
         GameInteractor_Should(VB_PLAYER_MODIFY_FIRST_PERSON_SPEED, true, this, &movementSpeed);
 
-        f32 relX = (sControlInput->rel.stick_x / 10 * -invertXAxisMulti);
-        f32 relY = (sControlInput->rel.stick_y / 10);
+        f32 relX =
+            (sControlInput->rel.stick_x * (CVarGetInteger(CVAR_ENHANCEMENT("MirroredWorld"), 0) ? 1 : -1)) / 10.0f;
+        f32 relY = sControlInput->rel.stick_y / 10.0f;
 
         // Normalize so that diagonal movement isn't faster
         f32 relMag = sqrtf((relX * relX) + (relY * relY));

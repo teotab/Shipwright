@@ -1,20 +1,20 @@
+#include <libultraship/bridge/consolevariablebridge.h>
+
 #include "soh/Enhancements/game-interactor/GameInteractor.h"
 #include "../../OTRGlobals.h"
 #include "fishsanity.h"
 #include "draw.h"
-#include "soh/frame_interpolation.h"
-#include "variables.h"
-#include "functions.h"
-#include "macros.h"
-#include <libultraship/bridge/consolevariablebridge.h>
 #include "soh/Enhancements/randomizer/randomizer.h"
 #include "soh/Enhancements/randomizer/randomizerTypes.h"
 #include "soh/Enhancements/randomizer/RCToRandInf.h"
+#include "soh/frame_interpolation.h"
 
 extern "C" {
+#include "variables.h"
+#include "functions.h"
+#include "macros.h"
 #include "src/overlays/actors/ovl_Fishing/z_fishing.h"
 #include "src/overlays/actors/ovl_En_Fish/z_en_fish.h"
-
 extern SaveContext gSaveContext;
 extern PlayState* gPlayState;
 }
@@ -269,10 +269,7 @@ static CheckIdentity IdentifyFish(s32 sceneNum, s32 actorParams) {
     Rando::Location* location =
         OTRGlobals::Instance->gRandomizer->GetCheckObjectFromActor(ACTOR_EN_FISH, sceneNum, actorParams);
 
-    if (location->GetRandomizerCheck() != RC_UNKNOWN_CHECK) {
-        fishIdentity.randomizerInf = rcToRandomizerInf[location->GetRandomizerCheck()];
-        fishIdentity.randomizerCheck = location->GetRandomizerCheck();
-    }
+    IdentifyCheck(&fishIdentity, location);
 
     return fishIdentity;
 }

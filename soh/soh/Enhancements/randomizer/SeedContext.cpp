@@ -17,6 +17,7 @@
 #include "soh/Enhancements/randomizer/randomizer_check_tracker.h"
 #include "soh/Enhancements/randomizer/randomizer.h"
 
+#include <algorithm>
 #include <vector>
 
 #include <fstream>
@@ -276,14 +277,13 @@ void Context::AddExcludedOptions() {
             continue;
         }
         AddLocation(loc.GetRandomizerCheck(), &everyPossibleLocation);
-        bool alreadyAdded = false;
-        for (Option* location : Rando::Settings::GetInstance()->GetExcludeOptionsForArea(loc.GetArea())) {
-            if (location->GetName() == loc.GetExcludedOption()->GetName()) {
-                alreadyAdded = true;
-            }
-        }
+        Option* excludedOption = loc.GetExcludedOption();
+        auto& areaOptions = Settings::GetInstance()->GetExcludeOptionsForArea(loc.GetArea());
+        const bool alreadyAdded = std::any_of(areaOptions.begin(), areaOptions.end(), [&](const Option* option) {
+            return option->GetName() == excludedOption->GetName();
+        });
         if (!alreadyAdded) {
-            Rando::Settings::GetInstance()->GetExcludeOptionsForArea(loc.GetArea()).push_back(loc.GetExcludedOption());
+            areaOptions.push_back(excludedOption);
         }
     }
 }
@@ -342,7 +342,8 @@ void Context::CreateItemOverrides() {
         if (itemLoc->GetPlacedRandomizerGet() == RG_ICE_TRAP) {
             ItemOverride val(locKey, Traps::GetTrapTrickModel(&rando_state));
             iceTrapModels[locKey] = val.LooksLike();
-            Traps::TrickName trickName = Traps::GetTrapName(val.LooksLike(), &rando_state);
+            Traps::TrickName trickName = Traps::GetTrapName(
+                val.LooksLike(), static_cast<RandoIceTrapNames>(mOptions[RSK_ICE_TRAP_NAMES].Get()), &rando_state);
             val.SetTrickName(trickName.name);
             val.SetTrickArticle(trickName.article);
             // If this is ice trap is in a shop, change the name based on what the model will look like
@@ -419,7 +420,7 @@ void Context::ParseSpoiler(const char* spoilerFileName) {
         mTrials->ParseJson(spoilerFileJson);
         mSpoilerLoaded = true;
         mSeedGenerated = false;
-    } catch (...) { LUSLOG_ERROR("Failed to load Spoiler File: %s", spoilerFileName); }
+    } catch (...) { SPDLOG_ERROR("Failed to load Spoiler File: {}", spoilerFileName); }
 }
 
 void Context::ParseHashIconIndexesJson(const nlohmann::json& spoilerFileJson) {

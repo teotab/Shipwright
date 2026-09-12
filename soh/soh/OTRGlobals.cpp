@@ -23,7 +23,6 @@
 #include <ship/resource/File.h>
 #include <ship/window/Window.h>
 #include <soh/GameVersions.h>
-#include <spdlog/sinks/rotating_file_sink.h>
 
 #include "Enhancements/gameconsole.h"
 #ifdef _WIN32
@@ -31,7 +30,6 @@
 #else
 #include <time.h>
 #endif
-#include <ship/audio/AudioPlayer.h>
 #include <ship/resource/archive/O2rArchive.h>
 #include <ship/utils/binarytools/MemoryStream.h>
 #include "Enhancements/speechsynthesizer/SpeechSynthesizer.h"
@@ -95,9 +93,7 @@
 #include <fast/resource/ResourceType.h>
 
 // Resource Types/Factories
-#include <fast/resource/type/Matrix.h>
 #include "soh/resource/type/SohResourceType.h"
-#include "soh/resource/type/Animation.h"
 #include "soh/resource/type/Skeleton.h"
 #include <ship/resource/factory/BlobFactory.h>
 #include <fast/resource/factory/DisplayListFactory.h>
@@ -2718,6 +2714,14 @@ extern "C" void Randomizer_SetSpoilerLoaded(bool spoilerLoaded) {
 
 extern "C" uint8_t Randomizer_GenerateRandomizer() {
     return GenerateRandomizer() ? 1 : 0;
+}
+
+extern "C" bool Randomizer_IsGenerating() {
+    return IsRandoGenerating();
+}
+
+extern "C" void Randomizer_WaitForGeneration() {
+    WaitForRandoGeneration();
 }
 
 extern "C" void Randomizer_ShowRandomizerMenu() {
