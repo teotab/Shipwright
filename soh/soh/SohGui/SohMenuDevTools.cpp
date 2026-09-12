@@ -2,6 +2,7 @@
 #include <ship/Context.h>
 
 #include "SohMenu.h"
+#include "soh/OTRGlobals.h" // BTN_CUSTOM_MODIFIER1/2, for the cinematic freecam binds
 
 extern "C" {
 extern PlayState* gPlayState;
