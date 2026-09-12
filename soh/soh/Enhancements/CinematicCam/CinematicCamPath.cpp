@@ -3366,6 +3366,20 @@ static int sRenderSavedIfps = 20, sRenderSavedMatch = 0;
 static float sRenderSavedArX = 16.0f, sRenderSavedArY = 9.0f;
 
 extern "C" void CinematicCam_ReleaseFrameGrab(void);
+
+// How far the depth range has to reach, in game units. NOT simply the view's current far plane: the moment
+// playback starts, CinematicCam_Update pushes the far plane out to CinematicCam.FarPlane so distant geometry
+// is not clipped (z_camera.c). Reading the live value before the render begins therefore gives the SCENE's
+// far plane, which then disagrees with what the frames are actually drawn with - and every distance the
+// compositor reads back is wrong by that ratio. Ask for the value that will be in force instead.
+static float RenderDepthFar() {
+    float zNear = 10.0f, zFar = 12800.0f;
+    CinematicCam_GetDepthRange(&zNear, &zFar);
+    if (CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.DisableCulling"), 1)) {
+        zFar = CVarGetFloat(CVAR_ENHANCEMENT("CinematicCam.FarPlane"), 20000.0f);
+    }
+    return (zFar > 1.0f) ? zFar : 12800.0f;
+}
 extern "C" const char* CinematicCam_GrabFailReason(void);
 extern "C" void CinematicCam_GetViewportSize(int* w, int* h);
 extern "C" void CinematicCam_ResetGrabDiag(void);
@@ -3527,8 +3541,13 @@ static void RenderStop(bool finished) {
         if (sRenderDropped >= sRenderIdx && sRenderIdx > 0) {
             snprintf(sFileStatus, sizeof(sFileStatus), "Rendered NOTHING: %s", (why[0] != '\0') ? why : "unknown");
         } else {
-            snprintf(sFileStatus, sizeof(sFileStatus), "Rendered %d frames to %s%s%s", sRenderIdx, sRenderDir.c_str(),
-                     sRenderDropped > 0 ? " - some frames were duplicated" : "",
+            char depthNote[64] = "";
+            if (sRenderDepth) { // the one number the compositor needs, where you cannot miss it
+                snprintf(depthNote, sizeof(depthNote), " - depth x %.4g",
+                         sRenderDepthMax / ((sExScale > 1e-3f) ? sExScale : 100.0f));
+            }
+            snprintf(sFileStatus, sizeof(sFileStatus), "Rendered %d frames to %s%s%s%s", sRenderIdx, sRenderDir.c_str(),
+                     depthNote, sRenderDropped > 0 ? " - some frames were duplicated" : "",
                      failed > 0 ? " - SOME FRAMES FAILED TO WRITE" : "");
         }
     } else {
@@ -3592,12 +3611,12 @@ static void RenderStart() {
     if (sRenderDepth) {
         std::filesystem::create_directories(sRenderDir + "/depth", ec);
         // One scale for the whole take, so a value means the same distance in every frame of the sequence.
-        float zNear = 10.0f, zFar = 12800.0f;
-        CinematicCam_GetDepthRange(&zNear, &zFar);
-        sRenderDepthMax = (zFar > 1.0f) ? zFar : 12800.0f;
+        sRenderDepthMax = RenderDepthFar();
         std::ofstream note(sRenderDir + "/" + sRenderBase + ".depth.txt");
         if (note.good()) {
             note << "Depth pass for " << sRenderBase << "\n\n"
+                 << "   ---> IN FUSION, MULTIPLY THE GREYSCALE BY "
+                 << (sRenderDepthMax / ((sExScale > 1e-3f) ? sExScale : 100.0f)) << " <---\n\n"
                  << "depth/" << sRenderBase << ".NNNNNN.png - 16-bit greyscale, one per colour frame.\n"
                  << "White is far, black is at the camera. Each pixel holds the distance from the camera\n"
                  << "ALONG THE VIEW AXIS, scaled so that full white = " << sRenderDepthMax << " game units.\n\n"
@@ -9970,6 +9989,11 @@ void CinematicCamPathWindow::DrawElement() {
                                 "depth-of-field and distance fog for free.\n\n"
                                 "A .depth.txt beside the frames gives the exact number to multiply by. Roughly doubles "
                                 "the time and the disk space.");
+                }
+                if (sRenderDepth) {
+                    CineHint("Depth: multiply the greyscale by %.4g in Fusion for its units (full white = "
+                             "%.0f game units).",
+                             RenderDepthFar() / ((sExScale > 1e-3f) ? sExScale : 100.0f), RenderDepthFar());
                 }
                 CineHint("%d x %d at %.4g fps, about %d frames - drawn larger and averaged down.",
                          (int)((float)sRenderHeight / (float)(sRenderArY > 0 ? sRenderArY : 9) *
