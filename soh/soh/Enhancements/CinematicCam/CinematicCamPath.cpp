@@ -3267,8 +3267,12 @@ static bool ExportFusion(const char* name, float fps, float scale, bool mirrorZ,
         ch[2].v.push_back(zf * k.eye[2] / scale);
         ch[3].v.push_back(rx);
         ch[4].v.push_back(ry);
-        ch[5].v.push_back(-k.roll); // our roll is clockwise-positive about the view axis; Fusion's Z is the other way
-        ch[6].v.push_back(k.fov);   // vertical, both sides - see the AoV note above
+        // Roll goes across UNNEGATED, which reads oddly next to the negated Z above and is not a mistake:
+        // the Z flip that carries OOT's left-handed frame into Fusion's right-handed one already reverses
+        // the sense of a rotation about the view axis. Negating on top of that flipped it twice. Settled by
+        // rolling a take and watching which way the horizon went, not by deriving it.
+        ch[5].v.push_back(k.roll);
+        ch[6].v.push_back(k.fov); // vertical, both sides - see the AoV note above
     }
     sShakeIntensity = shakeSave; // it is live playback state; the export must not leave it moved
 
