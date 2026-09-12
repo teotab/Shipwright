@@ -505,6 +505,8 @@ static float sPlayU = 0.0f;      // linear play progress 0..1, eased into the pl
 // frame rather than inside the frame grab, which at that moment is still holding a mapped GPU texture.
 static bool sRenderFinished = false;
 static void RenderStop(bool finished);
+static bool RenderActive();         // an offline render is running
+static bool RenderDrewEverything(); // ... and it has handed over every frame it was asked for
 
 // Camera shake / handheld: smooth pseudo-noise applied to the played-back pose for organic motion.
 static bool sShakeEnabled = false;
@@ -2414,6 +2416,13 @@ static void PlaybackTick() {
         sRenderFinished = false;
         RenderStop(true);
     }
+    // A render is playback plus a capture, so anything that stops playback has to end the render too -
+    // otherwise it sits there with the resolution CVars still hijacked, waiting for frames that will never
+    // arrive. Guarding it here instead of at each site covers all of them: Space, the transport's Stop,
+    // leaving camera mode, Record, Clear, and whatever gets added next.
+    if (RenderActive() && !sPlaying) {
+        RenderStop(RenderDrewEverything());
+    }
     sLoopMarkerFrame = false; // only true for the single frame a loop restarts (set below)
 
     // Perf probe: this hook fires once per frame, so the gap to the previous call is the whole frame period
@@ -3162,7 +3171,7 @@ static void OpenFolder(const std::string& rel) {
 //
 // Coordinates: OOT is Y-up LEFT-handed (yaw measured from +Z toward +X); Fusion is Y-up right-handed with the
 // camera looking down its own -Z. So Z is negated on the way out, and the forward vector with it.
-static bool ExportFusion(const char* name, float fps, float scale, bool mirrorZ, char* status, size_t statusLen,
+static bool ExportFusion(const char* name, float fps, float scale, char* status, size_t statusLen,
                          const char* dir = nullptr, float aspectOverride = 0.0f) {
     if (sKeyframes.size() < 2) {
         snprintf(status, statusLen, "Need at least two keyframes to export.");
@@ -3175,7 +3184,6 @@ static bool ExportFusion(const char* name, float fps, float scale, bool mirrorZ,
         scale = 100.0f;
     }
     const float kPi = 3.14159265f;
-    const float zf = mirrorZ ? -1.0f : 1.0f;
     // FUSION'S AoV IS VERTICAL, not horizontal. Proof, from a Camera3D authored in Resolve: it carried
     // AoV = 19.2642683 with the BMD_URSA_4K_16x9 gate (0.831496 x 0.467717). Solve that angle against the
     // aperture HEIGHT and the focal length is 1.37789 in = 35.00 mm exactly; against the WIDTH it is 62.22 mm,
@@ -3255,7 +3263,7 @@ static bool ExportFusion(const char* name, float fps, float scale, bool mirrorZ,
             fwd[2] = 1.0f;
             l = 1.0f;
         }
-        float f[3] = { fwd[0] / l, fwd[1] / l, zf * fwd[2] / l }; // into Fusion's handedness
+        float f[3] = { fwd[0] / l, fwd[1] / l, fwd[2] / l };
         // Camera looks down -Z. The order written below is ZXY, i.e. Z is applied FIRST, in the camera's own
         // frame - that is what makes it a roll rather than a swing about the world axis. Z leaves the view
         // direction alone (Rz maps (0,0,-1) to itself), so pitch and pan still solve from the forward vector
@@ -3264,13 +3272,13 @@ static bool ExportFusion(const char* name, float fps, float scale, bool mirrorZ,
         float ry = std::atan2(-f[0], -f[2]) * 180.0f / kPi;
         ch[0].v.push_back(k.eye[0] / scale);
         ch[1].v.push_back(k.eye[1] / scale);
-        ch[2].v.push_back(zf * k.eye[2] / scale);
+        ch[2].v.push_back(k.eye[2] / scale);
         ch[3].v.push_back(rx);
         ch[4].v.push_back(ry);
-        // Roll goes across UNNEGATED, which reads oddly next to the negated Z above and is not a mistake:
-        // the Z flip that carries OOT's left-handed frame into Fusion's right-handed one already reverses
-        // the sense of a rotation about the view axis. Negating on top of that flipped it twice. Settled by
-        // rolling a take and watching which way the horizon went, not by deriving it.
+        // Positions, angles and roll all cross over with NO sign changes. There is no coordinate flip here
+        // at all: Fusion and OOT agree closely enough that the pair of negations inside ry above is the whole
+        // conversion. Each of these signs was settled by exporting a take and watching it, because the
+        // handedness arguments that predicted otherwise were wrong three times running - see the AoV note.
         ch[5].v.push_back(k.roll);
         ch[6].v.push_back(k.fov); // vertical, both sides - see the AoV note above
     }
@@ -3352,8 +3360,13 @@ static int sRenderDropped = 0;              // frames the renderer would not dra
 static std::atomic<int> sRenderFailed{ 0 }; // frames that would not write to disk
 static std::string sRenderDir, sRenderBase, sRenderLastPath;
 static float sExFps = 30.0f, sExScale = 100.0f;
-static bool sExMirrorZ = true;
 static int sRenderHeight = 1080, sRenderArX = 16, sRenderArY = 9;
+// Render only part of the take. The frames keep the numbers they would have had in a full render and the
+// camera still covers the whole take, so a partial render drops onto the timeline at its own first frame
+// number and lines up - and rendering the rest later fills the gap instead of clashing with it.
+static bool sRenderUseRange = false;
+static float sRenderFromT = 0.0f, sRenderToT = 0.0f; // seconds on the editor's timeline
+static int sRenderFrom = 0, sRenderTo = 0;           // ... resolved onto the frame grid, inclusive
 static bool sRenderDepth = true;
 static float sRenderDepthMax = 12800.0f; // game units the 16-bit depth range is stretched over, fixed per take
 static int sRenderSavedMsaa = 1;
@@ -3368,6 +3381,13 @@ static int sRenderW = 1920, sRenderH = 1080, sRenderSS = 2;
 static int sRenderSavedEnabled = 0, sRenderSavedVertToggle = 0, sRenderSavedPixels = 480;
 static int sRenderSavedIfps = 20, sRenderSavedMatch = 0;
 static float sRenderSavedArX = 16.0f, sRenderSavedArY = 9.0f;
+
+static bool RenderActive() {
+    return sRendering;
+}
+static bool RenderDrewEverything() {
+    return sRenderIdx > sRenderTo;
+}
 
 extern "C" void CinematicCam_ReleaseFrameGrab(void);
 
@@ -3540,9 +3560,10 @@ static void RenderStop(bool finished) {
     CVarSetInteger(CVAR_SETTING("MatchRefreshRate"), sRenderSavedMatch);
     CinematicCam_SetMsaa(sRenderSavedMsaa);
     int failed = sRenderFailed.load();
+    int wrote = sRenderIdx - sRenderFrom; // not sRenderIdx: a ranged render does not start numbering at zero
     if (finished) {
         const char* why = CinematicCam_GrabFailReason();
-        if (sRenderDropped >= sRenderIdx && sRenderIdx > 0) {
+        if (sRenderDropped >= wrote && wrote > 0) {
             snprintf(sFileStatus, sizeof(sFileStatus), "Rendered NOTHING: %s", (why[0] != '\0') ? why : "unknown");
         } else {
             char depthNote[64] = "";
@@ -3550,13 +3571,18 @@ static void RenderStop(bool finished) {
                 snprintf(depthNote, sizeof(depthNote), " - depth x %.4g",
                          sRenderDepthMax / ((sExScale > 1e-3f) ? sExScale : 100.0f));
             }
-            snprintf(sFileStatus, sizeof(sFileStatus), "Rendered %d frames to %s%s%s%s", sRenderIdx, sRenderDir.c_str(),
-                     depthNote, sRenderDropped > 0 ? " - some frames were duplicated" : "",
+            char rangeNote[96] = "";
+            if (sRenderFrom > 0 || sRenderTo < sRenderTotal - 1) {
+                snprintf(rangeNote, sizeof(rangeNote), " (frames %d-%d of %d - drop them at frame %d)", sRenderFrom,
+                         sRenderTo, sRenderTotal, sRenderFrom);
+            }
+            snprintf(sFileStatus, sizeof(sFileStatus), "Rendered %d frames to %s%s%s%s%s", wrote, sRenderDir.c_str(),
+                     rangeNote, depthNote, sRenderDropped > 0 ? " - some frames were duplicated" : "",
                      failed > 0 ? " - SOME FRAMES FAILED TO WRITE" : "");
         }
     } else {
-        snprintf(sFileStatus, sizeof(sFileStatus), "Render stopped at frame %d of %d (%s kept)", sRenderIdx,
-                 sRenderTotal, sRenderDir.c_str());
+        snprintf(sFileStatus, sizeof(sFileStatus), "Render stopped after %d frames - %d to %d kept in %s", wrote,
+                 sRenderFrom, (sRenderIdx > sRenderFrom) ? sRenderIdx - 1 : sRenderFrom, sRenderDir.c_str());
     }
 }
 
@@ -3608,6 +3634,34 @@ static void RenderStart() {
         snprintf(sFileStatus, sizeof(sFileStatus), "This take is too short to render.");
         return;
     }
+    // Which frames of that grid to actually draw. Resolved by walking the grid rather than by inverting the
+    // ease: frame i is at EasedProgress(i/fps * speed / total) * total, and landing exactly on grid points is
+    // what keeps a partial render interchangeable with the same frames out of a full one.
+    sRenderFrom = 0;
+    sRenderTo = sRenderTotal - 1;
+    if (sRenderUseRange) {
+        float tdenom = (total > 0.0f) ? total : 1.0f;
+        float t0 = std::min(std::max(sRenderFromT, 0.0f), total);
+        float t1 = std::min(std::max(sRenderToT, t0), total);
+        int from = -1, to = -1;
+        for (int i = 0; i < sRenderTotal; i++) {
+            float ti = EasedProgress(std::min(((float)i / fps) * pspeed / tdenom, 1.0f)) * total;
+            if (from < 0 && ti >= t0) {
+                from = i;
+            }
+            if (ti <= t1) {
+                to = i;
+            }
+        }
+        if (from < 0) {
+            from = sRenderTotal - 1;
+        }
+        if (to < from) {
+            to = from; // a range thinner than one frame still renders the frame it lands on
+        }
+        sRenderFrom = from;
+        sRenderTo = to;
+    }
     sRenderBase = sFilename;
     sRenderDir = std::string("cinematics/renders/") + sRenderBase;
     std::error_code ec;
@@ -3635,7 +3689,7 @@ static void RenderStart() {
     }
     // The camera that belongs to these frames goes in the same folder, on the same clock and the same gate -
     // a sequence and a .setting that were made apart are exactly how a match drifts.
-    ExportFusion(sFilename, fps, sExScale, sExMirrorZ, sFileStatus, sizeof(sFileStatus), sRenderDir.c_str(),
+    ExportFusion(sFilename, fps, sExScale, sFileStatus, sizeof(sFileStatus), sRenderDir.c_str(),
                  (float)sRenderArX / (float)sRenderArY);
 
     sRenderSavedEnabled = CVarGetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".Enabled", 0);
@@ -3661,8 +3715,10 @@ static void RenderStart() {
     CVarSetInteger(CVAR_SETTING("MatchRefreshRate"), 0);
     CVarSetInteger(CVAR_SETTING("InterpolationFPS"), (int)std::lround(fps));
 
-    sPlayhead = 0.0f;
-    sPlayU = 0.0f;
+    // Seek to the first frame of the range on the same grid the frames are numbered on.
+    float tdenom0 = (total > 0.0f) ? total : 1.0f;
+    sPlayU = std::min(((float)sRenderFrom / fps) * pspeed / tdenom0, 1.0f);
+    sPlayhead = EasedProgress(sPlayU) * total;
     sPlayDir = 1;
     sPreview = false;
     CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
@@ -3671,7 +3727,7 @@ static void RenderStart() {
     }
     sPlaying = true;
 
-    sRenderIdx = 0;
+    sRenderIdx = sRenderFrom; // frame numbers stay on the full take's grid
     sRenderDropped = 0;
     sRenderFailed = 0;
     sRenderLastPath.clear();
@@ -3681,8 +3737,13 @@ static void RenderStart() {
     sRenderWriterStop = false;
     sRenderWriter = std::thread(RenderWriterMain);
     sRendering = true;
-    snprintf(sFileStatus, sizeof(sFileStatus), "Rendering %d frames at %dx%d (drawn at %dx)...", sRenderTotal, sRenderW,
-             sRenderH, sRenderSS);
+    if (sRenderFrom > 0 || sRenderTo < sRenderTotal - 1) {
+        snprintf(sFileStatus, sizeof(sFileStatus), "Rendering frames %d-%d of %d at %dx%d (drawn at %dx)...",
+                 sRenderFrom, sRenderTo, sRenderTotal, sRenderW, sRenderH, sRenderSS);
+    } else {
+        snprintf(sFileStatus, sizeof(sFileStatus), "Rendering %d frames at %dx%d (drawn at %dx)...", sRenderTotal,
+                 sRenderW, sRenderH, sRenderSS);
+    }
 }
 
 static void RenderQueue(CineRenderJob&& job) {
@@ -3703,7 +3764,7 @@ extern "C" void CinematicCam_SubmitRenderedFrame(const void* pixels, uint32_t w,
     if (!sRendering || pixels == nullptr || w == 0 || h == 0) {
         return;
     }
-    if (sRenderIdx >= sRenderTotal) {
+    if (sRenderIdx > sRenderTo) {
         sRenderFinished = true;
         return;
     }
@@ -3712,7 +3773,7 @@ extern "C" void CinematicCam_SubmitRenderedFrame(const void* pixels, uint32_t w,
     if (w != (uint32_t)(sRenderW * sRenderSS) || h != (uint32_t)(sRenderH * sRenderSS)) {
         snprintf(sFileStatus, sizeof(sFileStatus), "Render stopped: the game is drawing %ux%u, not %dx%d.", w, h,
                  sRenderW * sRenderSS, sRenderH * sRenderSS);
-        sRenderIdx = sRenderTotal; // stop asking for frames; the teardown happens on the next game frame
+        sRenderIdx = sRenderTo + 1; // stop asking for frames; the teardown happens on the next game frame
         sRenderFinished = true;
         return;
     }
@@ -3745,7 +3806,7 @@ extern "C" void CinematicCam_SubmitRenderedFrame(const void* pixels, uint32_t w,
         }
     }
     RenderQueue(std::move(job));
-    if (sRenderIdx >= sRenderTotal) {
+    if (sRenderIdx > sRenderTo) {
         sRenderFinished = true;
     }
 }
@@ -3829,7 +3890,7 @@ extern "C" void CinematicCam_NoteDroppedFrame(void) {
     if (!sRendering) {
         return;
     }
-    if (sRenderIdx >= sRenderTotal) {
+    if (sRenderIdx > sRenderTo) {
         sRenderFinished = true;
         return;
     }
@@ -9893,7 +9954,7 @@ void CinematicCamPathWindow::DrawElement() {
         ImGui::Separator();
         {
             if (ImGui::Button("Export to Fusion")) {
-                ExportFusion(sFilename, sExFps, sExScale, sExMirrorZ, sFileStatus, sizeof(sFileStatus));
+                ExportFusion(sFilename, sExFps, sExScale, sFileStatus, sizeof(sFileStatus));
             }
             if (ImGui::IsItemHovered()) {
                 CineTooltip("Write this move as a Fusion Camera3D, to cinematics/<name>.setting.\n\n"
@@ -9919,13 +9980,6 @@ void CinematicCamPathWindow::DrawElement() {
                 CineTooltip("Game units per Fusion unit. Link is about 60 units tall, and Fusion's 3D space "
                             "likes numbers near 1, so 100 puts a room at a comfortable size. Only the scale "
                             "changes - the move is identical.");
-            }
-            ImGui::SameLine();
-            ImGui::Checkbox("Mirror Z", &sExMirrorZ);
-            if (ImGui::IsItemHovered()) {
-                CineTooltip("OOT measures its world left-handed and Fusion is right-handed, so Z is negated "
-                            "on the way out. Leave this on. If the exported move comes out MIRRORED - turning "
-                            "left where the game turns right - this is the switch to try.");
             }
             CineHint("The camera alone puts your 3D elements in the right PLACE, but in front of everything. "
                      "To have the world occlude them, render the take with the depth pass ticked below.");
@@ -9994,28 +10048,95 @@ void CinematicCamPathWindow::DrawElement() {
                                 "A .depth.txt beside the frames gives the exact number to multiply by. Roughly doubles "
                                 "the time and the disk space.");
                 }
+                ImGui::Checkbox("Range", &sRenderUseRange);
+                if (ImGui::IsItemHovered()) {
+                    CineTooltip("Render only part of the take instead of all of it.\n\n"
+                                "The frames keep the numbers they would have had in a full render, and the Fusion "
+                                "camera still covers the whole move - so a part drops onto the timeline at its own "
+                                "first frame number and lines up, and rendering another part later fills in the gap "
+                                "rather than clashing with it.");
+                }
+                if (sRenderUseRange) {
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(70.0f);
+                    ImGui::InputFloat("##rnfrom", &sRenderFromT, 0.0f, 0.0f, "%.2f");
+                    ImGui::SameLine(0.0f, 4.0f);
+                    ImGui::TextUnformatted("to");
+                    ImGui::SameLine(0.0f, 4.0f);
+                    ImGui::SetNextItemWidth(70.0f);
+                    ImGui::InputFloat("s##rnto", &sRenderToT, 0.0f, 0.0f, "%.2f");
+                    if (ImGui::IsItemHovered()) {
+                        CineTooltip("Seconds on this editor's timeline - the same numbers the ruler shows.");
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Selection##rnsel")) {
+                        // Whatever is selected is almost always the bit being worked on. ToolRange already
+                        // falls back to the whole path when fewer than two keyframes are selected.
+                        int lo = 0, hi = 0;
+                        if (ToolRange(lo, hi)) {
+                            sRenderFromT = sKeyframes[lo].time;
+                            sRenderToT = sKeyframes[hi].time;
+                        }
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        CineTooltip("Set the range to the selected keyframes (the whole take if none are "
+                                    "selected).");
+                    }
+                }
                 if (sRenderDepth) {
                     CineHint("Depth: multiply the greyscale by %.4g in Fusion for its units (full white = "
                              "%.0f game units).",
                              RenderDepthFar() / ((sExScale > 1e-3f) ? sExScale : 100.0f), RenderDepthFar());
                 }
-                CineHint("%d x %d at %.4g fps, about %d frames - drawn larger and averaged down.",
-                         (int)((float)sRenderHeight / (float)(sRenderArY > 0 ? sRenderArY : 9) *
-                               (float)(sRenderArX > 0 ? sRenderArX : 16)),
-                         sRenderHeight, sExFps,
-                         (int)std::floor((EffectiveTotal() / ((sPlaySpeed > 1e-3f) ? sPlaySpeed : 1.0f)) *
-                                             ((sExFps >= 1.0f) ? sExFps : 30.0f) +
-                                         0.5f) +
-                             1);
+                {
+                    float totalT = EffectiveTotal();
+                    float pspd = (sPlaySpeed > 1e-3f) ? sPlaySpeed : 1.0f;
+                    float efps = (sExFps >= 1.0f) ? sExFps : 30.0f;
+                    int gridN = (int)std::floor((totalT / pspd) * efps + 0.5f) + 1;
+                    int outW = (int)((float)sRenderHeight / (float)(sRenderArY > 0 ? sRenderArY : 9) *
+                                     (float)(sRenderArX > 0 ? sRenderArX : 16));
+                    if (sRenderUseRange) {
+                        // Same walk RenderStart does, so the number quoted here is the number rendered.
+                        float tden = (totalT > 0.0f) ? totalT : 1.0f;
+                        float t0 = std::min(std::max(sRenderFromT, 0.0f), totalT);
+                        float t1 = std::min(std::max(sRenderToT, t0), totalT);
+                        int from = -1, to = -1;
+                        for (int i = 0; i < gridN; i++) {
+                            float ti = EasedProgress(std::min(((float)i / efps) * pspd / tden, 1.0f)) * totalT;
+                            if (from < 0 && ti >= t0) {
+                                from = i;
+                            }
+                            if (ti <= t1) {
+                                to = i;
+                            }
+                        }
+                        if (from < 0) {
+                            from = gridN - 1;
+                        }
+                        if (to < from) {
+                            to = from;
+                        }
+                        CineHint("%d x %d at %.4g fps, frames %d-%d of %d (%d to render).", outW, sRenderHeight, sExFps,
+                                 from, to, gridN, to - from + 1);
+                    } else {
+                        CineHint("%d x %d at %.4g fps, about %d frames - drawn larger and averaged down.", outW,
+                                 sRenderHeight, sExFps, gridN);
+                    }
+                }
             } else {
                 if (ImGui::Button("Stop render")) {
                     RenderStop(false);
                 }
                 ImGui::SameLine();
-                ImGui::ProgressBar(sRenderTotal > 0 ? (float)sRenderIdx / (float)sRenderTotal : 0.0f,
+                int span = sRenderTo - sRenderFrom + 1;
+                ImGui::ProgressBar(span > 0 ? (float)(sRenderIdx - sRenderFrom) / (float)span : 0.0f,
                                    ImVec2(160.0f, 0.0f));
                 ImGui::SameLine();
-                ImGui::Text("%d / %d", sRenderIdx, sRenderTotal);
+                ImGui::Text("%d / %d", sRenderIdx - sRenderFrom, span);
+                if (sRenderFrom > 0 || sRenderTo < sRenderTotal - 1) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(frames %d-%d)", sRenderFrom, sRenderTo);
+                }
                 if (sRenderDropped > 0) {
                     CineHint("%d frame(s) the renderer would not draw were filled with the frame before, so "
                              "everything after them stays on its own number.",
