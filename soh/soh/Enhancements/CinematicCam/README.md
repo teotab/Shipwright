@@ -9,13 +9,17 @@ This is a full **cinematic camera toolkit** for [Ship of Harkinian](https://gith
 - An easy to use, proper freecam mode
 - A full-fledged keyframe and path system, editable in 3D or via the UI
 - A timeline, a curve editor and a god damn speed graph
+- An offline frame renderer, so a take comes out as clean PNGs instead of screen capture
+- A **depth pass** and a one-click **DaVinci Resolve / Fusion camera export**, so your 3D text and models
+  can live inside the scene and get occluded by the world
 
 
 Fly anywhere, frame the shot, drop keyframes, and play back a move that actually looks like it was shot on a
 crane rather than snapped between poses.
 
-> **Status : release candidate for 1.0.** The free camera, path editor, curve editor and presentation tools are
-> all in and stable. A scripted multi-path **cutscene system** (sequencing + triggers) is the next milestone.
+> **Status : release candidate for 1.0.** The free camera, path editor, curve editor, presentation tools,
+> offline renderer, depth pass and Fusion export are all in and stable. A scripted multi-path **cutscene
+> system** (sequencing + triggers) is the next milestone.
 
 > **📷 Image slot : `docs/media/hero.gif`**
 > A 10–15 s loop of a finished move: a slow push-in through a landmark scene, letterbox on, HUD hidden.
@@ -149,6 +153,64 @@ Anything i've been used to in other editing softwares and felt the lack of in my
 
 ---
 
+## 🎬 Taking it into an editor
+
+Framing the shot in-game is only half of it. This part gets the move *out* of the game with everything a
+compositor needs, so you can put 3D text, models or effects into the scene and have the world pass in front
+of them.
+
+### Render frames
+
+**Render frames** plays the take and saves every frame as a PNG in `cinematics/renders/<name>/`.
+
+This is deliberately **not** screen capture. A recorder samples the screen on a wall clock, so any hitch costs
+you a duplicated frame and a stretched take. Here the playhead advances once per frame actually *drawn*, so
+the timing is exact however slowly it renders : you can render 4K at three frames a second and it is still
+perfectly in time. It reads the game's own buffer, so the editor is never in the shot, and no letterbox is
+baked in - bars are a framing guide, and a plate you're going to composite on should arrive clean.
+
+Each frame is drawn at twice the output size and averaged down, which is the anti-aliasing the N64 never had.
+
+- **Range** renders only part of the take. Frames keep the numbers they'd have had in a full render, so a part
+  drops onto your timeline at its own first frame number and lines up - and rendering another part later fills
+  the gap instead of clashing with it.
+- There is **no sound**, and this is **Windows only** for now (it reads the DirectX 11 back buffer).
+
+### Export to Fusion
+
+**Export to Fusion** writes the move as a `Camera3D` you can paste straight into Fusion, inside Resolve. Drop
+the file into Resolve's `Fusion/Settings` folder and it appears in the Settings menu, or just paste its text
+into the node graph.
+
+It bakes **one keyframe per frame** by sampling real playback, so the speed curve, the easing and every aim
+mode arrive exactly as they play in-game - rather than trying to redraw our curves as Bezier splines, which
+could never match them. A render writes its matching camera into the same folder automatically, on the same
+frame rate and the same film gate, so the two can't drift apart.
+
+Two fields worth understanding :
+
+- **fps** is *your comp's* frame rate, not the game's. It has to match the timeline you drop the footage on.
+- **units** is how many game units make one Fusion unit (default 100). It's a pure scale - the move is
+  identical at any value - and it exists because Fusion's 3D space likes numbers near 1 while OOT positions
+  run into the thousands. At 100, Link is about 0.6 units tall and a room is a comfortable 20. Just keep
+  everything in the comp on the same value.
+
+### The depth pass
+
+Tick **Depth** and the render also writes 16-bit greyscale frames into a `depth/` folder, one per frame, each
+pixel holding its distance from the camera. That's what lets something you add sit *behind* the world instead
+of always on top : compare your element's Z against the depth and cut it where the world is nearer. It also
+drives depth-of-field and distance fog for free.
+
+A `.depth.txt` lands beside the frames with the exact number to multiply the greyscale by, since the scale
+depends on the scene's far plane. The editor prints the same number under the Depth checkbox. Roughly doubles
+render time and disk space.
+
+> **📷 Image slot - `docs/media/depth.png`**
+> A frame and its depth pass side by side, then the same frame with 3D text half-hidden behind a tree.
+
+---
+
 ## Getting started 
 ![frog](docs/media/FROG3.gif)
 1. Open the menu → **Dev Tools** → **Cinematic Cam**.
@@ -168,6 +230,7 @@ Anything i've been used to in other editing softwares and felt the lack of in my
 5. **Play.** Retime on the timeline, shape the acceleration on the **speed graph**, add **easing** and **loop**.
 6. Turn on **letterbox**, **hide HUD** and the **composition grid** for the final framing, then capture.
 7. **Save** it by name, it lands in `cinematics/<name>.json`.
+8. To take it further : **Render frames** with **Depth** ticked, then **Export to Fusion** and composite.
 
 ---
 
@@ -251,6 +314,10 @@ Everything lives under **Dev Tools → Cinematic Cam** (CVars: `gEnhancements.Ci
   orientation, so head *tilt* won't always carry through.
 - Nothing in the editor auto-saves over your work: edits live in memory until you press **Save**, and the
   once-a-minute autosave writes to a separate `<name>_autosave.json`.
+- **Rendering is Windows only** for now - it reads the DirectX 11 back buffer directly. Everything else in
+  the toolkit works on every platform SoH does.
+- **Rendering has no audio**, and it is slow : expect around a second per 1080p frame. The PNG encoding runs
+  on one thread, which is most of it. Speeding that up is on the list.
 
 ---
 
