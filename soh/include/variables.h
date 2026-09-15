@@ -72,6 +72,8 @@ extern "C"
 	extern EffectSsOverlay gEffectSsOverlayTable[EFFECT_SS_TYPE_MAX];
 	extern Gfx D_80116280[];
 	extern s32 gDbgCamEnabled;
+	extern s32 gCinematicCamActive;     // SOH [Enhancement] Cinematic free camera is active this frame
+	extern s32 gCineCamDisableCulling;  // SOH [Enhancement] Cinematic free camera is forcing actors to draw
 	extern GameStateOverlay gGameStateOverlayTable[6];
 	extern u8 gWeatherMode;
 	extern u8 D_8011FB34;
