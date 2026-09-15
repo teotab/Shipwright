@@ -516,6 +516,76 @@ static bool SeedTrackFromKeyframes(CineParamTrack& t) {
     return true;
 }
 
+// --- Carrying the parameter tracks through a retime ------------------------------------------------------
+// A track key means "this value at this point in the shot", not "this value at 1.4 seconds". So when the
+// keyframes are retimed, the keys have to travel with them or the whole point of keying against a move is
+// lost - a dolly zoom whose FOV no longer lines up with the dolly is just wrong, and a key pushed past the
+// new end of the timeline becomes invisible AND unreachable while still dragging the tail of the curve
+// toward itself (EvalParamTrack interpolates toward it to the very last frame).
+//
+// The map is piecewise linear through the keyframe times themselves: a key sitting a third of the way between
+// two keyframes stays a third of the way between them wherever they move to. Keys outside the path shift
+// rigidly with the nearest end rather than being squashed, so a lead-in key keeps its lead-in.
+static float RemapTime(const std::vector<float>& oldT, const std::vector<float>& newT, float t) {
+    size_t n = std::min(oldT.size(), newT.size());
+    if (n == 0) {
+        return t;
+    }
+    if (t <= oldT[0]) {
+        return t + (newT[0] - oldT[0]);
+    }
+    if (t >= oldT[n - 1]) {
+        return t + (newT[n - 1] - oldT[n - 1]);
+    }
+    for (size_t i = 0; i + 1 < n; i++) {
+        if (t <= oldT[i + 1]) {
+            float span = oldT[i + 1] - oldT[i];
+            float u = (span > 1e-6f) ? (t - oldT[i]) / span : 0.0f;
+            return newT[i] + u * (newT[i + 1] - newT[i]);
+        }
+    }
+    return t;
+}
+
+// Every track's key times, in lane order. Taken BEFORE a retime and handed back afterwards, so the remap
+// always reads originals - applying it to already-moved keys would compound on every frame of a drag.
+static std::vector<std::vector<float>> TrackTimesSnapshot() {
+    std::vector<std::vector<float>> out;
+    for (const TrackDef& d : AllTrackDefs()) {
+        std::vector<float> ts;
+        ts.reserve(d.track->keys.size());
+        for (const CineParamKey& k : d.track->keys) {
+            ts.push_back(k.time);
+        }
+        out.push_back(std::move(ts));
+    }
+    return out;
+}
+
+// No re-sort afterwards: the map is monotonic whenever the keyframe times are, so the keys cannot cross.
+static void RetimeTracks(const std::vector<float>& oldT, const std::vector<float>& newT,
+                         const std::vector<std::vector<float>>& src) {
+    size_t lane = 0;
+    for (const TrackDef& d : AllTrackDefs()) {
+        if (lane < src.size()) {
+            for (size_t i = 0; i < d.track->keys.size() && i < src[lane].size(); i++) {
+                d.track->keys[i].time = RemapTime(oldT, newT, src[lane][i]);
+            }
+        }
+        lane++;
+    }
+}
+
+// The keyframe times as they stand, for one side of the map above.
+static std::vector<float> KeyframeTimes() {
+    std::vector<float> out;
+    out.reserve(sKeyframes.size());
+    for (const CineKeyframe& k : sKeyframes) {
+        out.push_back(k.time);
+    }
+    return out;
+}
+
 static int sEaseMode = 1;        // playback timing easing: 0 none, 1 in/out, 2 in, 3 out
 static float sEaseAmount = 0.5f; // 0 = linear, 1 = full ease
 static float sPlayU = 0.0f;      // linear play progress 0..1, eased into the playhead
@@ -4514,6 +4584,8 @@ static void NormalizeSpeed() {
     if (!ToolRange(lo, hi) || hi - lo < 2) {
         return; // need at least 3 keyframes in the range (2 segments) for re-timing to mean anything
     }
+    std::vector<float> nsOldT = KeyframeTimes();
+    std::vector<std::vector<float>> nsTrackT = TrackTimesSnapshot();
     float base = sKeyframes[lo].time;
     float totalTime = sKeyframes[hi].time - base;
     if (totalTime <= 1e-4f) {
@@ -4571,6 +4643,7 @@ static void NormalizeSpeed() {
         sKeyframes[i].speedAccelOut = 0.0f;
         sKeyframes[i].speedBroken = 0;
     }
+    RetimeTracks(nsOldT, KeyframeTimes(), nsTrackT); // the keys ride the new spacing
     // A cyclic path's return leg is a real segment carrying real distance: give it the same speed as the rest,
     // otherwise the seam plays at whatever the old return time happened to be (fast or crawling).
     if (LoopCyclic() && lo == 0 && hi == (int)sKeyframes.size() - 1) {
@@ -4598,11 +4671,14 @@ static void ScaleSelection(int lo, int hi, float newDur) {
         return;
     }
     PushUndo();
+    std::vector<float> oldT = KeyframeTimes();
+    std::vector<std::vector<float>> trackT = TrackTimesSnapshot();
     float s = newDur / old;
     float base = sKeyframes[lo].time;
     for (int i = lo + 1; i <= hi; i++) {
         sKeyframes[i].time = base + (sKeyframes[i].time - base) * s;
     }
+    RetimeTracks(oldT, KeyframeTimes(), trackT);
     // Absolute speeds follow the stretch (see SetTotalDuration) - but only for keyframes STRICTLY inside the
     // range. A speed belongs to the keyframe, shared by the segment either side of it, and the range's two
     // end keyframes each keep one segment that wasn't scaled at all. Rescaling those would be right for the
@@ -4632,10 +4708,13 @@ static void SetTotalDuration(float newTotal) {
         return;
     }
     PushUndo();
+    std::vector<float> oldT = KeyframeTimes();
+    std::vector<std::vector<float>> trackT = TrackTimesSnapshot();
     float s = newTotal / old;
     for (auto& k : sKeyframes) {
         k.time = base + (k.time - base) * s;
     }
+    RetimeTracks(oldT, KeyframeTimes(), trackT);
     // The loop-return leg is part of the path's duration, so it scales with it. Leaving it fixed meant
     // stretching a looping path changed its pacing everywhere EXCEPT the seam, which then only caught up when
     // you happened to hit Normalize - the retime appeared to happen in two goes.
@@ -5915,15 +5994,18 @@ static void DrawTimeline() {
     static float sTlScaleAnchorT = 0.0f; // scale drag: time of the selection's OPPOSITE end (the fixed point)
     static std::vector<int> sTlDragIds;  // snapshot of all ids at drag start...
     static std::vector<float> sTlDragT0; // ...and their original times
-    static bool sTlNoDrag = false;       // true for a ctrl-click (toggle select, don't move)
-    static float sTlViewDur = 0.0f;      // displayed ruler length in seconds (decoupled from content)
-    static bool sTlAutoFit = true;       // keep the ruler fit to the path when not zoomed manually
-    static int sTlTrackDrag = -1;        // automation lane whose key is being dragged (-1 = none)
-    static int sTlKeyDrag = -1;          // key index within that track
-    static float sTlKeyGrabT0 = 0.0f;    // that key's time when the drag began, and the cursor's - this lane
-    static float sTlKeyGrabCur = 0.0f;   // moves by the cursor's DELTA like everything else (grabbing != editing)
-    static bool sTlBand = false;         // Ctrl+drag on empty space: select every keyframe in the time range
-    static float sTlBandX = 0.0f;        // its anchor, in pixels
+    // ...and every parameter-track key time, so the tracks can be re-derived from the ORIGINALS on each frame
+    // of the drag. Remapping already-remapped keys would compound the move a hundred times a second.
+    static std::vector<std::vector<float>> sTlDragTrackT0;
+    static bool sTlNoDrag = false;     // true for a ctrl-click (toggle select, don't move)
+    static float sTlViewDur = 0.0f;    // displayed ruler length in seconds (decoupled from content)
+    static bool sTlAutoFit = true;     // keep the ruler fit to the path when not zoomed manually
+    static int sTlTrackDrag = -1;      // automation lane whose key is being dragged (-1 = none)
+    static int sTlKeyDrag = -1;        // key index within that track
+    static float sTlKeyGrabT0 = 0.0f;  // that key's time when the drag began, and the cursor's - this lane
+    static float sTlKeyGrabCur = 0.0f; // moves by the cursor's DELTA like everything else (grabbing != editing)
+    static bool sTlBand = false;       // Ctrl+drag on empty space: select every keyframe in the time range
+    static float sTlBandX = 0.0f;      // its anchor, in pixels
     bool interacting = (sTlDragMode != 0) || sTlScrub || (sTlTrackDrag >= 0);
 
     float content = EffectiveTotal(); // actual path length (for labels + playhead clamp)
@@ -6145,6 +6227,7 @@ static void DrawTimeline() {
                     for (int i = 0; i < n; i++) {
                         sTlDragT0[i] = sKeyframes[i].time;
                     }
+                    sTlDragTrackT0 = TrackTimesSnapshot();
                 };
                 if (io.KeyShift && io.KeyCtrl) {
                     // Ctrl+Shift+click: select every keyframe between the primary and this one. (Range select
@@ -6331,6 +6414,25 @@ static void DrawTimeline() {
                 }
             }
             SortByTime();
+            // Drag the parameter keys along with the move. Paired by ID rather than by index, because
+            // SortByTime above may have just reordered the keyframes; and always remapped from the drag-start
+            // snapshot, so a drag of any length applies exactly one transform instead of accumulating one per
+            // frame.
+            {
+                std::vector<float> dragOldT, dragNewT;
+                dragOldT.reserve(sTlDragIds.size());
+                dragNewT.reserve(sTlDragIds.size());
+                for (size_t di = 0; di < sTlDragIds.size(); di++) {
+                    for (int i = 0; i < (int)sIds.size(); i++) {
+                        if (sIds[i] == sTlDragIds[di]) {
+                            dragOldT.push_back(sTlDragT0[di]);
+                            dragNewT.push_back(sKeyframes[i].time);
+                            break;
+                        }
+                    }
+                }
+                RetimeTracks(dragOldT, dragNewT, sTlDragTrackT0);
+            }
         } else if (sTlTrackDrag >= 0 && sTlTrackDrag < (int)autoLanes.size()) {
             CineParamTrack* tr = autoLanes[sTlTrackDrag]->track;
             if (sTlKeyDrag >= 0 && sTlKeyDrag < (int)tr->keys.size()) {
