@@ -121,13 +121,9 @@ time of day, shake intensity, green screen.
 - **Camera shake** : smooth handheld jitter, deterministic so it looks the same on every replay, with a
   keyframable intensity you can ramp across a shot.
 
-> **📷 Image slot — `docs/media/presentation.png`**
-> One frame with letterbox, the thirds grid and the HUD hidden — ideally a shot you'd actually keep.
+> ![grid](docs/media/Beauty_04.png)
 
-> **📷 Image slot — `docs/media/greenscreen.png`**
-> A before/after pair, or just the green-screen frame with the sky keyed flat.
-
----
+> ![green](docs/media/green_after.png)
 
 ## Quality of life
 
@@ -207,8 +203,6 @@ A `.depth.txt` lands beside the frames with the exact number to multiply the gre
 depends on the scene's far plane. The editor prints the same number under the Depth checkbox. Roughly doubles
 render time and disk space.
 
-> **📷 Image slot - `docs/media/depth.png`**
-> A frame and its depth pass side by side, then the same frame with 3D text half-hidden behind a tree.
 
 ---
 
