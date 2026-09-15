@@ -21,9 +21,9 @@ crane rather than snapped between poses.
 > offline renderer, depth pass and Fusion export are all in and stable. A scripted multi-path **cutscene
 > system** (sequencing + triggers) is the next milestone.
 
-> **📷 Image slot : `docs/media/hero.gif`**
-> A 10–15 s loop of a finished move: a slow push-in through a landmark scene, letterbox on, HUD hidden.
-> This is the "why you'd want this" shot : it should look like footage, not like a tool.
+[![Watch the trailer](https://img.youtube.com/vi/sdi8TfHfrFA/maxresdefault.jpg)](https://www.youtube.com/watch?v=sdi8TfHfrFA)
+
+**▶ [Watch the trailer](https://www.youtube.com/watch?v=sdi8TfHfrFA)**
 
 ---
 

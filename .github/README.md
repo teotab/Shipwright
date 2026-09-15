@@ -2,8 +2,9 @@
 
 A full **cinematic camera toolkit** built into a fork of [Ship of Harkinian](https://github.com/HarbourMasters/Shipwright) — free camera, keyframed paths, a real timeline and curve editor, and everything needed to get a shot out of the game and into an editor.
 
-> **📷 Image slot — `soh/soh/Enhancements/CinematicCam/docs/media/hero.gif`**
-> A 10–15 s loop of a finished move: a slow push-in through a landmark scene, letterbox on, HUD hidden.
+[![Watch the trailer](https://img.youtube.com/vi/sdi8TfHfrFA/maxresdefault.jpg)](https://www.youtube.com/watch?v=sdi8TfHfrFA)
+
+**▶ [Watch the trailer](https://www.youtube.com/watch?v=sdi8TfHfrFA)**
 
 ---
 
