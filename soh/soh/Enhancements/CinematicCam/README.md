@@ -109,7 +109,8 @@ time of day, shake intensity, green screen.
 - **Hands-off mode** : the controller plays Link normally while the camera rides the followed actor and keeps
   Link in frame automatically.
 
-> ![follow](docs/media/ActorfollowCheap.mp4)
+> **📷 Image slot - `docs/media/follow.gif`**
+> The free camera locked to a moving actor, holding its framing as the actor crosses the scene.
 
 ### Presentation
 

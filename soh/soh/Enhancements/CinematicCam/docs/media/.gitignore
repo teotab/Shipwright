@@ -1,0 +1,3 @@
+# soh/.gitignore excludes *.png repo-wide for generated assets. These are documentation screenshots the
+# README links to, so they have to be tracked or the docs render with broken images.
+!*.png
