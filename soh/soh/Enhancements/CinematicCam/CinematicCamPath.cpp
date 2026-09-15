@@ -4399,6 +4399,26 @@ static void FacingHandleWorld(const CineKeyframe& k, float out[3]) {
     out[2] = k.eye[2] + (k.at[2] - k.eye[2]) * 0.4f;
 }
 
+// The same handle, but from the aim the camera will ACTUALLY use - resolving an actor, Link, the shared
+// target or the rail. The raw `at` field is only meaningful for a free/point keyframe: one that aims at an
+// actor never has it written, so it sits at the world origin, and drawing from it sent a green line clear
+// across the map to 0,0,0. Returns false when the aim cannot be resolved to anywhere real, so the caller can
+// draw nothing rather than draw a lie.
+static bool FacingHandleWorldIdx(int idx, float out[3]) {
+    float tgt[3];
+    EffectiveAt(idx, tgt);
+    const CineKeyframe& k = sKeyframes[idx];
+    // Exactly the origin means the fallback at the end of EffectiveAt handed back an `at` that was never
+    // authored. No OOT scene puts anything worth framing on 0,0,0, so this is a miss, not a target.
+    if (k.aimMode != CINE_AIM_FREE && tgt[0] == 0.0f && tgt[1] == 0.0f && tgt[2] == 0.0f) {
+        return false;
+    }
+    out[0] = k.eye[0] + (tgt[0] - k.eye[0]) * 0.4f;
+    out[1] = k.eye[1] + (tgt[1] - k.eye[1]) * 0.4f;
+    out[2] = k.eye[2] + (tgt[2] - k.eye[2]) * 0.4f;
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Small float[3] vector helpers + the transform gizmo
 // ---------------------------------------------------------------------------
@@ -5877,6 +5897,7 @@ static void DrawWorldOverlay() {
     }
 
     // Keyframe markers (numbered) with a short facing indicator.
+    float ovNearW = OverlayNearW();
     for (int i = 0; i < (int)sKeyframes.size(); i++) {
         ImVec2 sp;
         if (!WorldToScreen(sKeyframes[i].eye, sp)) {
@@ -5893,10 +5914,8 @@ static void DrawWorldOverlay() {
 
         // Facing indicator: a short line toward the look-at point (drawn for every keyframe).
         float facing[3];
-        FacingHandleWorld(sKeyframes[i], facing);
-        ImVec2 fp;
-        if (WorldToScreen(facing, fp)) {
-            dl->AddLine(sp, fp, IM_COL32(120, 255, 120, 150), 1.5f);
+        if (FacingHandleWorldIdx(i, facing)) {
+            DrawWorldLineClipped(dl, sKeyframes[i].eye, facing, IM_COL32(120, 255, 120, 150), 1.5f, ovNearW);
         }
         // The selected keyframe gets the transform gizmo (move axes or rotate rings).
         if (selected) {
@@ -5908,7 +5927,7 @@ static void DrawWorldOverlay() {
             if (sKeyframes[i].aimMode != CINE_AIM_FREE) {
                 ImVec2 tp;
                 if (WorldToScreen(tgt, tp)) {
-                    dl->AddLine(sp, tp, IM_COL32(255, 170, 60, 160), 1.5f);
+                    DrawWorldLineClipped(dl, sKeyframes[i].eye, tgt, IM_COL32(255, 170, 60, 160), 1.5f, ovNearW);
                     if (sKeyframes[i].aimMode == CINE_AIM_POINT) {
                         dl->AddLine(ImVec2(tp.x - 9, tp.y), ImVec2(tp.x + 9, tp.y), IM_COL32(255, 255, 255, 220), 1.0f);
                         dl->AddLine(ImVec2(tp.x, tp.y - 9), ImVec2(tp.x, tp.y + 9), IM_COL32(255, 255, 255, 220), 1.0f);
