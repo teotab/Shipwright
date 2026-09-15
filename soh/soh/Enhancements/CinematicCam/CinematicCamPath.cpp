@@ -609,9 +609,7 @@ static std::vector<float> KeyframeTimes() {
     return out;
 }
 
-static int sEaseMode = 1;        // playback timing easing: 0 none, 1 in/out, 2 in, 3 out
-static float sEaseAmount = 0.5f; // 0 = linear, 1 = full ease
-static float sPlayU = 0.0f;      // linear play progress 0..1, eased into the playhead
+static float sPlayU = 0.0f; // linear play progress 0..1, eased into the playhead
 // Set when the offline render has handed over its last frame. The teardown then happens on the next game
 // frame rather than inside the frame grab, which at that moment is still holding a mapped GPU texture.
 static bool sRenderFinished = false;
@@ -2364,53 +2362,6 @@ static uint32_t PathShapeHash() {
 }
 
 // Playback timing easing applied to the 0..1 progress.
-static float ApplyEase(float u, int mode) {
-    if (u < 0.0f) {
-        u = 0.0f;
-    }
-    if (u > 1.0f) {
-        u = 1.0f;
-    }
-    switch (mode) {
-        case 1:
-            return u * u * (3.0f - 2.0f * u); // smoothstep (ease in + out)
-        case 2:
-            return u * u; // ease in
-        case 3:
-            return 1.0f - (1.0f - u) * (1.0f - u); // ease out
-        default:
-            return u; // none
-    }
-}
-
-// The eased progress the playhead actually uses (ApplyEase blended toward linear by sEaseAmount).
-static float EasedProgress(float u) {
-    float e = ApplyEase(u, sEaseMode);
-    return u + (e - u) * sEaseAmount;
-}
-
-// Inverse of EasedProgress: given the eased progress (playhead / total), find the linear progress u that maps
-// to it. The mapping is monotonic, so bisection converges. Used so Play resumes EXACTLY at the playhead
-// instead of jumping (seeding the linear progress straight from the eased playhead double-applies the ease).
-static float InvertEasedProgress(float target) {
-    if (target <= 0.0f) {
-        return 0.0f;
-    }
-    if (target >= 1.0f) {
-        return 1.0f;
-    }
-    float lo = 0.0f, hi = 1.0f;
-    for (int it = 0; it < 24; it++) {
-        float mid = (lo + hi) * 0.5f;
-        if (EasedProgress(mid) < target) {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    return (lo + hi) * 0.5f;
-}
-
 // Start/stop playback from the current playhead (shared by the Space shortcut and the shooting bar's Play).
 static void TogglePlay() {
     if (sKeyframes.size() < 2) {
@@ -2424,7 +2375,7 @@ static void TogglePlay() {
     if (sPlayhead >= pt) {
         sPlayhead = 0.0f;
     }
-    sPlayU = InvertEasedProgress((pt > 0.0f) ? (sPlayhead / pt) : 0.0f); // resume exactly at the playhead
+    sPlayU = (pt > 0.0f) ? (sPlayhead / pt) : 0.0f; // resume exactly at the playhead
     sPlayDir = 1;
     if (sPlayhead == 0.0f && CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.SyncIdleAnim"), 0)) {
         CinematicCam_SyncLinkIdleAnim(); // anchor Link's idle anim when starting from the top
@@ -2618,7 +2569,7 @@ static void PlaybackTick() {
                     }
                 }
             }
-            sPlayhead = EasedProgress(sPlayU) * total;
+            sPlayhead = sPlayU * total;
         }
     }
 
@@ -3314,11 +3265,10 @@ static bool ExportFusion(const char* name, float fps, float scale, char* status,
     const bool gate16x9 = std::fabs(aspect - 16.0f / 9.0f) < 0.005f;
 
     float total = EffectiveTotal();
-    // Bake against the WALL CLOCK of playback, not the authored timeline. Playback advances a linear progress
-    // u at sPlaySpeed and puts the playhead at EasedProgress(u) * total, so with the global ease on, a take
-    // spends its first and last seconds moving slowly. Sampling authored time uniformly would export the same
-    // path at a constant rate - identical shape, wrong timing against footage already recorded. Frame i here
-    // is the pose playback shows i/fps seconds after Play, which is what the capture recorded.
+    // Bake against the WALL CLOCK of playback. Frame i is the pose playback shows i/fps seconds after Play,
+    // which is what a capture records. Since the global ease was retired the playhead is linear in u, so this
+    // is a plain uniform sampling of the authored timeline - but it stays written in terms of the play clock
+    // rather than the timeline, because sPlaySpeed still separates the two.
     float pspeed = (sPlaySpeed > 1e-3f) ? sPlaySpeed : 1.0f;
     float tdenom = (total > 0.0f) ? total : 1.0f;
     int frames = (int)std::floor((total / pspeed) * fps + 0.5f);
@@ -3346,7 +3296,7 @@ static bool ExportFusion(const char* name, float fps, float scale, char* status,
     float shakeSave = sShakeIntensity;
     for (int i = 0; i <= frames; i++) {
         float u = std::min(((float)i / fps) * pspeed / tdenom, 1.0f); // linear play progress
-        float t = EasedProgress(u) * total;                           // ... where the playhead actually is
+        float t = u * total;                                          // ... which IS the playhead
         CineKeyframe k = SampleAt(t);
         // Everything playback layers on top of the sampled pose, in the order Update() applies it: the roll /
         // FOV automation tracks override the keyframes, then shake jitters what is left. Path follow is
@@ -3745,9 +3695,9 @@ static void RenderStart() {
         snprintf(sFileStatus, sizeof(sFileStatus), "This take is too short to render.");
         return;
     }
-    // Which frames of that grid to actually draw. Resolved by walking the grid rather than by inverting the
-    // ease: frame i is at EasedProgress(i/fps * speed / total) * total, and landing exactly on grid points is
-    // what keeps a partial render interchangeable with the same frames out of a full one.
+    // Which frames of that grid to actually draw. Resolved by walking the grid: frame i is at
+    // (i/fps * speed / total) * total, and landing exactly on grid points is what keeps a partial render
+    // interchangeable with the same frames out of a full one.
     sRenderFrom = 0;
     sRenderTo = sRenderTotal - 1;
     if (sRenderUseRange) {
@@ -3756,7 +3706,7 @@ static void RenderStart() {
         float t1 = std::min(std::max(sRenderToT, t0), total);
         int from = -1, to = -1;
         for (int i = 0; i < sRenderTotal; i++) {
-            float ti = EasedProgress(std::min(((float)i / fps) * pspeed / tdenom, 1.0f)) * total;
+            float ti = std::min(((float)i / fps) * pspeed / tdenom, 1.0f) * total;
             if (from < 0 && ti >= t0) {
                 from = i;
             }
@@ -3829,7 +3779,7 @@ static void RenderStart() {
     // Seek to the first frame of the range on the same grid the frames are numbered on.
     float tdenom0 = (total > 0.0f) ? total : 1.0f;
     sPlayU = std::min(((float)sRenderFrom / fps) * pspeed / tdenom0, 1.0f);
-    sPlayhead = EasedProgress(sPlayU) * total;
+    sPlayhead = sPlayU * total;
     sPlayDir = 1;
     sPreview = false;
     CVarSetInteger(CVAR_ENHANCEMENT("CinematicCam.Enabled"), 1);
@@ -4061,8 +4011,6 @@ static void SavePathTo(const char* base, bool bindEntrance) {
     j["playback"] = { { "loop", sLoop },
                       { "loopMode", sLoopMode },
                       { "loopReturn", sLoopReturnTime },
-                      { "easeMode", sEaseMode },
-                      { "easeAmount", sEaseAmount },
                       { "speed", sPlaySpeed },
                       { "aimOverride", sAimOverride },
                       { "aimOverrideActorId", sAimOverrideActorId },
@@ -4121,8 +4069,9 @@ static void LoadPath() {
             sLoop = p.value("loop", sLoop);
             sLoopMode = p.value("loopMode", sLoopMode);
             sLoopReturnTime = p.value("loopReturn", sLoopReturnTime);
-            sEaseMode = p.value("easeMode", sEaseMode);
-            sEaseAmount = p.value("easeAmount", sEaseAmount);
+            // easeMode / easeAmount may be present in a file written before the global ease was retired.
+            // They are deliberately not read: the playhead is linear now, and an old path simply plays at an
+            // even rate. Shaping a move is the speed graph's job.
             sPlaySpeed = p.value("speed", sPlaySpeed);
             sAimOverride = p.value("aimOverride", sAimOverride);
             sAimOverrideActorId = p.value("aimOverrideActorId", sAimOverrideActorId);
@@ -9883,7 +9832,7 @@ void CinematicCamPathWindow::DrawElement() {
             if (sPlayhead >= pt) {
                 sPlayhead = 0.0f;
             }
-            sPlayU = InvertEasedProgress((pt > 0.0f) ? (sPlayhead / pt) : 0.0f); // resume exactly at the playhead
+            sPlayU = (pt > 0.0f) ? (sPlayhead / pt) : 0.0f; // resume exactly at the playhead
             sPlayDir = 1;
             if (sPlayhead == 0.0f && CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.SyncIdleAnim"), 0)) {
                 CinematicCam_SyncLinkIdleAnim(); // anchor Link's idle anim when starting from the top
@@ -9976,21 +9925,6 @@ void CinematicCamPathWindow::DrawElement() {
     }
 
     ImGui::SliderFloat("Speed", &sPlaySpeed, 0.1f, 4.0f, "%.2fx");
-    const char* easeModes[] = { "None", "Ease in/out", "Ease in", "Ease out" };
-    ImGui::SetNextItemWidth(160.0f);
-    ImGui::Combo("Easing", &sEaseMode, easeModes, 4);
-    if (ImGui::IsItemHovered()) {
-        CineTooltip("Playback timing: accelerate/decelerate the whole move instead of moving at a "
-                    "constant rate. Affects Play only, not scrubbing.");
-    }
-    if (sEaseMode != 0) {
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(140.0f);
-        ImGui::SliderFloat("Amount##ease", &sEaseAmount, 0.0f, 1.0f, "%.2f");
-        if (ImGui::IsItemHovered()) {
-            CineTooltip("How strong the easing is (0 = linear, 1 = full).");
-        }
-    }
 
     // Camera shake / handheld: organic jitter layered on top of playback.
     ImGui::Checkbox("Camera shake", &sShakeEnabled);
@@ -10319,7 +10253,7 @@ void CinematicCamPathWindow::DrawElement() {
                         float t1 = std::min(std::max(sRenderToT, t0), totalT);
                         int from = -1, to = -1;
                         for (int i = 0; i < gridN; i++) {
-                            float ti = EasedProgress(std::min(((float)i / efps) * pspd / tden, 1.0f)) * totalT;
+                            float ti = std::min(((float)i / efps) * pspd / tden, 1.0f) * totalT;
                             if (from < 0 && ti >= t0) {
                                 from = i;
                             }
