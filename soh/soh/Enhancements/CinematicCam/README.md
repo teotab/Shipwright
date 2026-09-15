@@ -324,7 +324,7 @@ Everything lives under **Dev Tools → Cinematic Cam** (CVars: `gEnhancements.Ci
 
 ## 🧱 Building
 
-This ships as part of the SoH fork : build SoH normally (see [`docs/BUILDING.md`](../../../docs/BUILDING.md))
+This ships as part of the SoH fork : build SoH normally (see [`docs/BUILDING.md`](../../../../docs/BUILDING.md))
 and the cinematic camera is compiled in automatically.
 
 *Built for the Ship of Harkinian community. 🚢*
