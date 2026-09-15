@@ -126,8 +126,8 @@ void SetupGuiElements() {
     mStatsWindow = std::make_shared<SohStatsWindow>(CVAR_WINDOW("SohStats"), "Stats##Soh", ImVec2(400, 100));
     gui->AddGuiWindow(mStatsWindow);
 
-    gui->AddGuiWindow(std::make_shared<CinematicCamPathWindow>(CVAR_WINDOW("CinematicCamPath"),
-                                                              "Cinematic Camera Path", ImVec2(440, 600)));
+    gui->AddGuiWindow(std::make_shared<CinematicCamPathWindow>(CVAR_WINDOW("CinematicCamPath"), "Cinematic Camera Path",
+                                                               ImVec2(440, 600)));
 
     /*mInputEditorWindow = gui->GetGuiWindow("Controller Configuration");
     if (mInputEditorWindow == nullptr) {

@@ -22,7 +22,7 @@ s32 Camera_UpdateWater(Camera* camera);
 #define RELOAD_PARAMS \
     (camera->animState == 0 || camera->animState == 0xA || camera->animState == 0x14 || R_RELOAD_CAM_PARAMS)
 
-#define PCT(x) ((x) * 0.01f)
+#define PCT(x) ((x)*0.01f)
 #define NEXTSETTING ((values++)->val)
 #define NEXTPCT PCT(NEXTSETTING)
 
@@ -8181,8 +8181,7 @@ static void CinematicCam_Update(Camera* camera) {
 
     // "Follow + control Link": the controller drives Link (input not isolated this frame), so the camera goes
     // hands-off - it auto-follows the actor and auto-aims at Link instead of reading the sticks.
-    s32 followCtrlLink =
-        (sCineFollowId != 0) && CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.FollowControlsLink"), 0);
+    s32 followCtrlLink = (sCineFollowId != 0) && CVarGetInteger(CVAR_ENHANCEMENT("CinematicCam.FollowControlsLink"), 0);
 
     // Precision modifier: slow movement and look for fine framing.
     if (CHECK_BTN_ALL(cur->button, btnPrecision)) {

@@ -145,7 +145,7 @@ struct CineParamKey {
 class CinematicCamPathWindow final : public Ship::GuiWindow {
   public:
     using GuiWindow::GuiWindow;
-    ~CinematicCamPathWindow() {};
+    ~CinematicCamPathWindow(){};
 
   protected:
     void InitElement() override;
