@@ -498,6 +498,24 @@ static const std::vector<TrackDef>& AllTrackDefs() {
     return defs;
 }
 
+// Roll and FOV exist in two places: on every camera keyframe, and as a track. Turning the track on hands it
+// the parameter outright - so seeding it with one value at the playhead silently threw away the roll and FOV
+// the keyframes had already been given, which is the natural way to author them. Seed from the keyframes
+// instead: a key per keyframe, carrying that keyframe's own value. The track then STARTS as an exact copy of
+// what was already playing and becomes editable from there, the same bargain SeedBezierHandles strikes when a
+// key switches to Bezier. Returns false for tracks with no keyframe-level counterpart.
+static bool SeedTrackFromKeyframes(CineParamTrack& t) {
+    const bool isRoll = (&t == &sRollTrack);
+    const bool isFov = (&t == &sFovTrack);
+    if ((!isRoll && !isFov) || sKeyframes.empty()) {
+        return false;
+    }
+    for (const CineKeyframe& k : sKeyframes) {
+        TrackAddKey(t, k.time, isRoll ? k.roll : k.fov);
+    }
+    return true;
+}
+
 static int sEaseMode = 1;        // playback timing easing: 0 none, 1 in/out, 2 in, 3 out
 static float sEaseAmount = 0.5f; // 0 = linear, 1 = full ease
 static float sPlayU = 0.0f;      // linear play progress 0..1, eased into the playhead
@@ -6509,7 +6527,7 @@ static bool DrawParamKeyNav(CineParamTrack& t, float value) {
     if (ImGui::SmallButton(wasEnabled ? "Key on" : "Key")) {
         PushUndo(); // the enabled flag is part of the undo state (snapshotted with the keys)
         t.enabled = !t.enabled;
-        if (t.enabled && t.keys.empty()) {
+        if (t.enabled && t.keys.empty() && !SeedTrackFromKeyframes(t)) {
             TrackAddKey(t, sPlayhead, value); // seed a key so it holds the current value
         }
     }

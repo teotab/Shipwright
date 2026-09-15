@@ -8375,7 +8375,11 @@ s32 CinematicCam_GetLinkYaw(void) {
     if (player == NULL) {
         return -1;
     }
-    return (s32)(((f32)(u16)player->actor.shape.rot.y / 65536.0f) * 360.0f);
+    // ROUND, do not truncate. Degrees and binary angles do not divide evenly (one degree is 182.04 units),
+    // so truncating here and again in SetLinkYaw compounded: 352 of the 360 headings came back one degree
+    // lower than they went in. The dial's "+" therefore set yaw+1, read back yaw, and looked dead, while "-"
+    // set yaw-1 and read back yaw-2 and looked like it worked.
+    return (s32)(((f32)(u16)player->actor.shape.rot.y / 65536.0f) * 360.0f + 0.5f) % 360;
 }
 
 // Snap Link to face the given absolute heading (degrees, any range; wrapped). No-op outside gameplay.
@@ -8393,7 +8397,7 @@ void CinematicCam_SetLinkYaw(s32 degrees) {
     if (degrees < 0) {
         degrees += 360;
     }
-    CinematicCam_ApplyLinkYaw(player, (s16)(s32)(((f32)degrees / 360.0f) * 65536.0f));
+    CinematicCam_ApplyLinkYaw(player, (s16)(s32)(((f32)degrees / 360.0f) * 65536.0f + 0.5f));
 }
 
 // Snap Link to face the active camera (or directly away from it when `away` is set). Great for "look at lens" shots.
