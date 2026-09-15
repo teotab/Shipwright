@@ -275,6 +275,29 @@ static float EvalTrackSegment(const CineParamTrack& t, size_t i, float time) {
     return a.value + (b.value - a.value) * s; // linear
 }
 
+static const char* TrackModeName(int mode) {
+    switch (mode) {
+        case CINE_TRACK_STEP:
+            return "step";
+        case CINE_TRACK_LINEAR:
+            return "linear";
+        case CINE_TRACK_BEZIER:
+            return "bezier";
+        default:
+            return "smooth";
+    }
+}
+
+// What to print next to a lane's name: its mode, or "mixed" when a key overrides it with something else.
+static const char* TrackModeLabel(const CineParamTrack& t) {
+    for (const CineParamKey& k : t.keys) {
+        if (k.interp >= 0 && k.interp != t.interp) {
+            return "mixed";
+        }
+    }
+    return TrackModeName(t.interp);
+}
+
 // Evaluate a track at a time. Returns false (no value) when the track is disabled or empty. Clamps before the
 // first / after the last key. The segment uses the LEFT key's interpolation.
 static bool EvalParamTrack(const CineParamTrack& t, float time, float& out) {
@@ -4309,6 +4332,66 @@ static bool WorldToScreen(const float* world, ImVec2& out) {
     return true;
 }
 
+// The scene's near plane, which is the closest a point can be and still have a meaningful projection.
+static float OverlayNearW() {
+    float zNear = 10.0f, zFar = 12800.0f;
+    CinematicCam_GetDepthRange(&zNear, &zFar);
+    return (zNear > 1.0f) ? zNear : 1.0f;
+}
+
+// Project, and report how far in front of the lens the point was. `out` is only meaningful when w > 0.
+static bool WorldToScreenW(const float* world, ImVec2& out, float& w) {
+    float ndcX = 0.0f, ndcY = 0.0f;
+    int ok = CinematicCam_WorldToNdcW((float*)world, &ndcX, &ndcY, &w);
+    if (!ok) {
+        return false;
+    }
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    float aspect = (vp->Size.y > 0.0f) ? (vp->Size.x / vp->Size.y) : (4.0f / 3.0f);
+    ndcX *= (4.0f / 3.0f) / aspect;
+    out.x = vp->Pos.x + (ndcX * 0.5f + 0.5f) * vp->Size.x;
+    out.y = vp->Pos.y + (1.0f - (ndcY * 0.5f + 0.5f)) * vp->Size.y;
+    return true;
+}
+
+// Draw a world-space segment, cut at the near plane rather than projected through it.
+//
+// w is affine along a straight segment, so the crossing point is a plain lerp - and the endpoint that lands
+// exactly on the near plane projects to a finite, stable screen position. Without this, a point a hair in
+// front of the lens divides by a w near zero and lands thousands of pixels away, so the line whipped around
+// the screen every frame the camera flew along its own path. Two keyframes in the same spot made it worse
+// because the tessellation piles many points into that one spot, and each one scatters differently.
+static void DrawWorldLineClipped(ImDrawList* dl, const float* a, const float* b, ImU32 col, float thick, float nearW) {
+    ImVec2 sa, sb;
+    float wa = 0.0f, wb = 0.0f;
+    bool va = WorldToScreenW(a, sa, wa) && wa >= nearW;
+    bool vb = WorldToScreenW(b, sb, wb) && wb >= nearW;
+    if (va && vb) {
+        dl->AddLine(sa, sb, col, thick);
+        return;
+    }
+    if (!va && !vb) {
+        return; // the whole segment is in or behind the lens
+    }
+    const float* good = va ? a : b;
+    const float* bad = va ? b : a;
+    float wGood = va ? wa : wb, wBad = va ? wb : wa;
+    float denom = wGood - wBad;
+    if (std::fabs(denom) < 1e-6f) {
+        return;
+    }
+    float t = (nearW - wBad) / denom; // 0 at the bad end, 1 at the good one
+    t = std::min(std::max(t, 0.0f), 1.0f);
+    float cut[3] = { bad[0] + (good[0] - bad[0]) * t, bad[1] + (good[1] - bad[1]) * t,
+                     bad[2] + (good[2] - bad[2]) * t };
+    ImVec2 sc;
+    float wc = 0.0f;
+    if (!WorldToScreenW(cut, sc, wc)) {
+        return;
+    }
+    dl->AddLine(va ? sa : sb, sc, col, thick);
+}
+
 // World position of a keyframe's aim handle (a point a short way along its look direction).
 static void FacingHandleWorld(const CineKeyframe& k, float out[3]) {
     out[0] = k.eye[0] + (k.at[0] - k.eye[0]) * 0.4f;
@@ -5776,19 +5859,10 @@ static void DrawWorldOverlay() {
                 sSplineCache[(size_t)i * 3 + 2] = s.eye[2];
             }
         }
-        ImVec2 prev;
-        bool prevValid = false;
-        for (int i = 0; i <= steps; i++) {
-            ImVec2 sp;
-            if (WorldToScreen(&sSplineCache[(size_t)i * 3], sp)) {
-                if (prevValid) {
-                    dl->AddLine(prev, sp, IM_COL32(255, 220, 40, 200), 2.0f);
-                }
-                prev = sp;
-                prevValid = true;
-            } else {
-                prevValid = false;
-            }
+        float nearW = OverlayNearW();
+        for (int i = 1; i <= steps; i++) {
+            DrawWorldLineClipped(dl, &sSplineCache[(size_t)(i - 1) * 3], &sSplineCache[(size_t)i * 3],
+                                 IM_COL32(255, 220, 40, 200), 2.0f, nearW);
         }
 
         // Orientation ticks: the interpolated facing sampled along the path, so rotating a keyframe
@@ -5798,10 +5872,7 @@ static void DrawWorldOverlay() {
             CineKeyframe s = SampleAt(total * (float)i / (float)ticks);
             float tip[3] = { s.eye[0] + (s.at[0] - s.eye[0]) * 0.15f, s.eye[1] + (s.at[1] - s.eye[1]) * 0.15f,
                              s.eye[2] + (s.at[2] - s.eye[2]) * 0.15f };
-            ImVec2 a, b;
-            if (WorldToScreen(s.eye, a) && WorldToScreen(tip, b)) {
-                dl->AddLine(a, b, IM_COL32(120, 200, 255, 130), 1.0f);
-            }
+            DrawWorldLineClipped(dl, s.eye, tip, IM_COL32(120, 200, 255, 130), 1.0f, nearW);
         }
     }
 
@@ -6096,6 +6167,13 @@ static void DrawTimeline() {
     dl->AddText(ImVec2(p0.x + 6.0f, laneMid(0) - 7.0f), IM_COL32(215, 215, 220, 255), "Camera");
     for (int li = 0; li < (int)autoLanes.size(); li++) {
         dl->AddText(ImVec2(p0.x + 6.0f, laneMid(1 + li) - 7.0f), IM_COL32(215, 215, 220, 255), autoLanes[li]->name);
+        // ... and how it interpolates. Each track carries its own mode, set independently of the path's spline
+        // setting, so this is the only place the two can be compared at a glance.
+        {
+            const char* mode = TrackModeLabel(*autoLanes[li]->track);
+            float nameW = ImGui::CalcTextSize(autoLanes[li]->name).x;
+            dl->AddText(ImVec2(p0.x + 12.0f + nameW, laneMid(1 + li) - 7.0f), IM_COL32(150, 150, 160, 255), mode);
+        }
     }
     for (int lane = 1; lane < laneCount; lane++) {
         float y = laneTop(lane);

@@ -8021,6 +8021,33 @@ s32 CinematicCam_GetCurrentEntrance(void) {
 
 // Project a world point to normalized device coords (-1..1, +Y up) for the path editor's in-world overlay.
 // Returns 0 if there is no active play state or the point is behind the camera.
+// As CinematicCam_WorldToNdc, but it also hands back the clip-space w - how far in front of the lens the
+// point is. A caller drawing a LINE needs that: projecting a point that sits almost exactly in the near plane
+// divides by a w near zero and throws the result thousands of pixels away, which is why the path overlay
+// whipped around the screen whenever the camera flew along its own path. With w in hand the caller can cut
+// the segment at the near plane instead. Returns 0 (and still fills outW) for points at or behind the lens.
+s32 CinematicCam_WorldToNdcW(f32* world, f32* outNdcX, f32* outNdcY, f32* outW) {
+    Vec3f w;
+    Vec3f proj;
+    f32 clipW;
+
+    *outW = 0.0f;
+    if (gPlayState == NULL) {
+        return 0;
+    }
+    w.x = world[0];
+    w.y = world[1];
+    w.z = world[2];
+    SkinMatrix_Vec3fMtxFMultXYZW(&gPlayState->viewProjectionMtxF, &w, &proj, &clipW);
+    *outW = clipW;
+    if (clipW <= 0.0f) {
+        return 0;
+    }
+    *outNdcX = proj.x / clipW;
+    *outNdcY = proj.y / clipW;
+    return 1;
+}
+
 s32 CinematicCam_WorldToNdc(f32* world, f32* outNdcX, f32* outNdcY) {
     Vec3f w;
     Vec3f proj;
